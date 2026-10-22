@@ -118,7 +118,10 @@ pub struct SerenaArgs {
     tree: PathBuf,
     /// The Serena executable (the arm starts it on a loopback port against the
     /// tree copy and stops it at the end), or `http://127.0.0.1:<port>` of a
-    /// server you started on the copy given by `--tree-copy`. Falls back to
+    /// server you started on the copy given by `--tree-copy`. The URL form
+    /// attaches to a server the operator started: the arm cannot verify which
+    /// tree it serves, and the tree hash taken after the run only detects an
+    /// in-place run on the frozen tree, it does not prevent one. Falls back to
     /// the environment variable LCI_BASELINE_SERENA.
     #[arg(long)]
     serena: Option<String>,
@@ -148,12 +151,20 @@ pub struct SerenaArgs {
     /// Longest one MCP request may take, seconds; a slower call fails its item.
     #[arg(long, default_value_t = 300)]
     call_timeout_s: u64,
+    /// `--rule pattern`: matched lines kept per file, in line order, like the
+    /// rg arm's `--max-per-file` (`rg --max-count`). Paths with a `.`-prefixed
+    /// component are dropped like rg's hidden-file default.
+    #[arg(long, default_value_t = 50)]
+    max_per_file: usize,
     /// `max_answer_chars` sent with every call (Serena shortens longer answers,
     /// which the arm then counts as an unknown shape).
     #[arg(long, default_value_t = 1_000_000)]
     max_answer_chars: i64,
     /// An extra argument for `serena start-mcp-server` (repeatable), appended
-    /// after the arm's own so that it wins.
+    /// after the arm's own so that it wins. The safety flags are refused
+    /// (`--project`, `--project-file`, `--project-from-cwd`, `--host`, `--port`,
+    /// `--transport`, `--enable-web-dashboard`, `--open-web-dashboard`,
+    /// `--enable-gui-log-window`), also as `--flag=value`.
     #[arg(long = "serena-arg", allow_hyphen_values = true)]
     serena_args: Vec<String>,
     /// Where the run dir is written.
@@ -210,6 +221,28 @@ struct Tools<P: Peer> {
     calls: u32,
     unknown: u32,
     used: BTreeMap<String, u32>,
+    pattern: PatternStats,
+}
+
+/// The pattern rule's rg-pairing limits and what they dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PatternStats {
+    /// Matched lines kept per file, like `rg --max-count`.
+    max_per_file: usize,
+    /// Lines dropped because a path component starts with `.` (rg skips hidden paths).
+    hidden_dropped: u32,
+    /// Lines dropped beyond `max_per_file` in a file.
+    truncated: u32,
+}
+
+impl Default for PatternStats {
+    fn default() -> Self {
+        Self {
+            max_per_file: 50,
+            hidden_dropped: 0,
+            truncated: 0,
+        }
+    }
 }
 
 impl<P: Peer> Tools<P> {
@@ -478,7 +511,39 @@ async fn pattern_lines<P: Peer>(
     // only the root): the whole tree is searched and the files are kept by the
     // rg arm's globs, so the two arms see the same files.
     lines.retain(|l| in_adapter_globs(&l.path));
+    // rg skips hidden paths and stops a file at `--max-count`: the same here.
+    let before = lines.len();
+    lines.retain(|l| !is_hidden_path(&l.path));
+    tools.pattern.hidden_dropped += (before - lines.len()) as u32;
+    let before = lines.len();
+    let lines = keep_first_per_file(lines, tools.pattern.max_per_file);
+    tools.pattern.truncated += (before - lines.len()) as u32;
     Ok(pattern_rg_lines(&lines, needles, case_sensitive))
+}
+
+/// A path component starts with `.` (rg skips hidden files and directories by
+/// default).
+fn is_hidden_path(path: &str) -> bool {
+    path.split('/').any(|part| part.starts_with('.'))
+}
+
+/// The first `max` lines of every file in line order, like `rg --max-count`
+/// (which counts matched lines per file). The result is ordered by path, line.
+fn keep_first_per_file(mut lines: Vec<PatternLine>, max: usize) -> Vec<PatternLine> {
+    lines.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    let mut kept: Vec<PatternLine> = Vec::with_capacity(lines.len());
+    let mut in_file = 0usize;
+    for line in lines {
+        if kept.last().is_some_and(|last| last.path == line.path) {
+            in_file += 1;
+        } else {
+            in_file = 1;
+        }
+        if in_file <= max {
+            kept.push(line);
+        }
+    }
+    kept
 }
 
 async fn find_symbols<P: Peer>(
@@ -717,15 +782,55 @@ struct CopyInfo {
     hash: TreeHash,
 }
 
+/// The canonical form of a path that may not exist yet: the nearest existing
+/// ancestor canonicalized, the missing components appended (a `..` among them is
+/// refused). Nothing is created, so a containment check can run before any
+/// directory exists.
+fn resolve_planned(path: &Path) -> Result<PathBuf> {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut at = path.to_owned();
+    loop {
+        if at.exists() {
+            let mut resolved = std::fs::canonicalize(&at)?;
+            resolved.extend(missing.iter().rev());
+            return Ok(resolved);
+        }
+        if at.components().next_back() == Some(std::path::Component::ParentDir) {
+            bail!(
+                "{} goes through `..` below a missing directory",
+                path.display()
+            );
+        }
+        let name = at
+            .file_name()
+            .with_context(|| format!("{} has no existing ancestor", path.display()))?
+            .to_owned();
+        missing.push(name);
+        at = match at.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_owned(),
+            _ => std::env::current_dir()?,
+        };
+    }
+}
+
+/// Bails when `dir` (which may not exist) and the tree contain one another.
+fn check_not_inside(tree_abs: &Path, dir: &Path, what: &str) -> Result<()> {
+    let dir_abs = resolve_planned(dir)?;
+    if dir_abs.starts_with(tree_abs) || tree_abs.starts_with(&dir_abs) {
+        bail!(
+            "{what} {} and --tree may not contain one another",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Makes (or reuses) the copy of `tree` at `dir`. A `dir` that exists is reused
 /// only when its marker names this tree's hash; nothing is ever deleted.
 fn prepare_copy(tree: &Path, dir: &Path, source: &TreeHash) -> Result<CopyInfo> {
     let tree_abs = std::fs::canonicalize(tree)?;
+    check_not_inside(&tree_abs, dir, "the tree copy")?;
     std::fs::create_dir_all(dir)?;
-    let dir_abs = std::fs::canonicalize(dir)?;
-    if dir_abs.starts_with(&tree_abs) || tree_abs.starts_with(&dir_abs) {
-        bail!("the tree copy and --tree may not contain one another");
-    }
     let marker = dir.join(COPY_MARKER);
     let occupied = std::fs::read_dir(dir)?.next().is_some();
     if occupied {
@@ -861,10 +966,51 @@ fn launch_args(copy: &Path, port: u16, extra: &[String]) -> Vec<String> {
     args
 }
 
-/// A Serena process the arm started.
+/// The `start-mcp-server` flags that carry the arm's safety: the project (the
+/// tree copy, never the frozen tree), the loopback listener and the transport,
+/// no dashboard or window. `--serena-arg` may not set them.
+const PROTECTED_FLAGS: &[&str] = &[
+    "--project",
+    "--project-file",
+    "--project-from-cwd",
+    "--host",
+    "--port",
+    "--transport",
+    "--enable-web-dashboard",
+    "--open-web-dashboard",
+    "--enable-gui-log-window",
+];
+
+/// Refuses an extra Serena argument that names a protected flag, in the
+/// `--flag value` and the `--flag=value` form (the value of a protected flag
+/// given as its own `--serena-arg` is only reached after the flag itself).
+fn check_serena_args(extra: &[String]) -> Result<()> {
+    for arg in extra {
+        let flag = arg
+            .split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        if PROTECTED_FLAGS.contains(&flag) {
+            bail!(
+                "--serena-arg {arg:?} would override a safety flag of the arm ({}); the arm sets the project to its tree copy and the listener to loopback itself",
+                PROTECTED_FLAGS.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A Serena process the arm started. Dropping it kills the whole process tree
+/// (a panic or an early return must not leave python or rust-analyzer behind).
 struct ServerChild {
     child: Child,
     pid: u32,
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
 }
 
 /// What stopping the server left behind.
@@ -874,9 +1020,9 @@ struct Stopped {
 }
 
 impl ServerChild {
-    /// Kills every descendant, then the process; reports whether it exited and
-    /// how many descendants are still alive.
-    async fn kill_tree(&mut self) -> Stopped {
+    /// Kills every descendant (children first), then the process, without
+    /// waiting; returns the descendants it found.
+    fn kill_now(&mut self) -> Vec<u32> {
         let mut system = System::new_all();
         system.refresh_all();
         let descendants = ManagedServer::descendants_of(&system, self.pid);
@@ -884,6 +1030,13 @@ impl ServerChild {
             ManagedServer::kill_process(*pid);
         }
         let _ = self.child.start_kill();
+        descendants
+    }
+
+    /// Kills every descendant, then the process; reports whether it exited and
+    /// how many descendants are still alive.
+    async fn kill_tree(&mut self) -> Stopped {
+        let descendants = self.kill_now();
         let _ = timeout(Duration::from_secs(10), self.child.wait()).await;
         let mut system = System::new_all();
         system.refresh_all();
@@ -955,6 +1108,7 @@ struct Driven {
     none: usize,
     pattern_fallbacks: usize,
     unknown: u32,
+    pattern: PatternStats,
     failures: usize,
     first_failure: Option<String>,
     expansion_failures: usize,
@@ -975,12 +1129,15 @@ fn plan(args: &SerenaArgs, target: &Target) -> Result<Plan> {
     if args.rule == SerenaRule::Pattern && set == Set::Impact {
         bail!("--rule pattern answers the traits and where-to sets only");
     }
+    check_serena_args(&args.serena_args)?;
     check_tree(&args.tree)?;
     let tree_abs = std::fs::canonicalize(&args.tree)?;
-    std::fs::create_dir_all(&args.out_dir)?;
-    if std::fs::canonicalize(&args.out_dir)?.starts_with(&tree_abs) {
+    // Checked before anything is created: a refused path leaves no directory
+    // inside the frozen tree.
+    if resolve_planned(&args.out_dir)?.starts_with(&tree_abs) {
         bail!("--out-dir may not lie inside --tree (the frozen tree stays unchanged)");
     }
+    std::fs::create_dir_all(&args.out_dir)?;
     let wave = args.wave.clone().unwrap_or_else(|| {
         match args.rule {
             SerenaRule::Symbol => "baseline-serena",
@@ -1056,6 +1213,10 @@ async fn drive<P: Peer>(
         calls: 0,
         unknown: 0,
         used: BTreeMap::new(),
+        pattern: PatternStats {
+            max_per_file: args.max_per_file.max(1),
+            ..PatternStats::default()
+        },
     };
     let mut out = Driven {
         version,
@@ -1070,6 +1231,7 @@ async fn drive<P: Peer>(
         none: 0,
         pattern_fallbacks: 0,
         unknown: 0,
+        pattern: PatternStats::default(),
         failures: 0,
         first_failure: None,
         expansion_failures: 0,
@@ -1118,6 +1280,7 @@ async fn drive<P: Peer>(
         }
     }
     out.unknown = tools.unknown;
+    out.pattern = tools.pattern;
     out.used = tools.used;
     Ok(out)
 }
@@ -1186,6 +1349,13 @@ fn finish(plan: &Plan, args: &SerenaArgs, driven: Driven, closing: Closing) -> R
         "needles": { "backticked": driven.backticked, "fallback": driven.fallback, "none": driven.none },
         "calls": { "total": driven.calls.iter().map(|c| u64::from(*c)).sum::<u64>(), "per_item": driven.calls },
         "unknown_fields": driven.unknown,
+        "pattern_limits": {
+            "max_per_file": driven.pattern.max_per_file,
+            "hidden_paths_skipped": true,
+            "lines_dropped_hidden": driven.pattern.hidden_dropped,
+            "lines_dropped_over_max_per_file": driven.pattern.truncated,
+            "note": "as the rg arm: files by the language globs, hidden paths skipped, rg --max-count per file; only the pattern rule applies them",
+        },
         "pattern_fallback_items": driven.pattern_fallbacks,
         "failures": driven.failures,
         "first_failure": driven.first_failure,
@@ -1403,6 +1573,7 @@ mod tests {
             calls: 0,
             unknown: 0,
             used: BTreeMap::new(),
+            pattern: PatternStats::default(),
         }
     }
 
@@ -1824,6 +1995,205 @@ mod tests {
         assert_eq!(sent["multiline"], false);
     }
 
+    #[test]
+    fn serena_arg_may_not_override_a_safety_flag() {
+        for bad in [
+            "--project",
+            "--project=C:/frozen",
+            "--project-file",
+            "--project-from-cwd",
+            "--host",
+            "--host=0.0.0.0",
+            "--host 0.0.0.0",
+            "--port",
+            "--port=8766",
+            "--transport=sse",
+            "--enable-web-dashboard",
+            "--open-web-dashboard=true",
+            "--enable-gui-log-window",
+        ] {
+            let error = check_serena_args(&[bad.to_owned()])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("safety flag"), "{bad}: {error}");
+        }
+        // other flags (and a value that merely looks like one of ours) pass
+        check_serena_args(&[
+            "--log-level".into(),
+            "DEBUG".into(),
+            "--tool-timeout=30".into(),
+            "--context=ide".into(),
+            "--hostname-note".into(),
+        ])
+        .unwrap();
+        check_serena_args(&[]).unwrap();
+
+        // plan() refuses before it creates anything
+        let root = temp_dir("unsafe-args");
+        let (mut args, _) = fixture(&root, "q?");
+        args.serena_args = vec!["--port=8766".into()];
+        args.out_dir = root.join("never-made");
+        let target = Target::Launch(PathBuf::from("serena"));
+        assert!(plan(&args, &target).is_err());
+        assert!(!args.out_dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_pattern_rule_pairs_with_rg_on_hidden_paths_and_max_count() {
+        // 60 hits in one file, one hit in a hidden directory, one in a hidden file
+        let many: Vec<String> = (0..60)
+            .map(|n| format!("  > {:>3}:Shape {n}", n * 2))
+            .collect();
+        let pattern = json!({
+            "src\\big.rs": many,
+            "src\\.cache\\gen.rs": ["  >   1:Shape hidden dir"],
+            ".hidden\\x.rs": ["  >   2:Shape hidden root"],
+            "src\\.eslintrc.js": ["  >   3:Shape hidden file"],
+            "src\\ok.rs": ["  >   4:Shape kept"],
+        })
+        .to_string();
+        let mut tools = tools_of(Stub::new(
+            ALL_TOOLS,
+            &[("search_for_pattern", &[pattern.as_str()])],
+        ));
+        tools.pattern.max_per_file = 50;
+        let lines = pattern_lines(&mut tools, &["Shape".to_owned()], true)
+            .await
+            .unwrap();
+        let big: Vec<u64> = lines
+            .iter()
+            .filter(|l| l.path == "src/big.rs")
+            .map(|l| l.line)
+            .collect();
+        // the first 50 matched lines in line order (1-based: 1, 3, .., 99)
+        assert_eq!(big.len(), 50);
+        assert_eq!((big[0], big[49]), (1, 99));
+        let paths: BTreeSet<&str> = lines.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, BTreeSet::from(["src/big.rs", "src/ok.rs"]));
+        assert_eq!(tools.pattern.hidden_dropped, 3);
+        assert_eq!(tools.pattern.truncated, 10);
+
+        // keep_first_per_file orders by line before it cuts, per file
+        let line = |path: &str, line: u64| PatternLine {
+            path: path.into(),
+            line,
+            text: String::new(),
+        };
+        let kept = keep_first_per_file(
+            vec![
+                line("a.rs", 9),
+                line("b.rs", 1),
+                line("a.rs", 2),
+                line("a.rs", 5),
+            ],
+            2,
+        );
+        let kept: Vec<(&str, u64)> = kept.iter().map(|l| (l.path.as_str(), l.line)).collect();
+        assert_eq!(kept, [("a.rs", 2), ("a.rs", 5), ("b.rs", 1)]);
+        assert!(
+            is_hidden_path(".git/x.rs") && is_hidden_path("a/.b/c.rs") && is_hidden_path("a/.c.rs")
+        );
+        assert!(!is_hidden_path("a/b.rs") && !is_hidden_path("a.b/c.rs"));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_server_child_kills_its_whole_process_tree() {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "ping -n 300 127.0.0.1 >NUL"])
+        } else {
+            ("sh", &["-c", "sleep 300; true"])
+        };
+        let spawned = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = spawned.id().unwrap();
+        let child = ServerChild {
+            child: spawned,
+            pid,
+        };
+        // a grandchild of the test process must exist before the drop
+        let mut descendants = Vec::new();
+        for _ in 0..100 {
+            let mut system = System::new_all();
+            system.refresh_all();
+            descendants = ManagedServer::descendants_of(&system, pid);
+            if !descendants.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !descendants.is_empty(),
+            "the stand-in server started no child"
+        );
+        drop(child);
+        let alive = |pids: &[u32]| {
+            let mut system = System::new_all();
+            system.refresh_all();
+            pids.iter()
+                .filter(|p| {
+                    system.process(Pid::from_u32(**p)).is_some_and(|proc| {
+                        !matches!(proc.status(), sysinfo::ProcessStatus::Zombie)
+                    })
+                })
+                .count()
+        };
+        let mut all = descendants.clone();
+        all.push(pid);
+        // a surviving tree would live for minutes: bound the wait by the clock
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while alive(&all) > 0 && Instant::now() < deadline {
+            sleep(Duration::from_millis(200)).await;
+        }
+        let survivors = alive(&all);
+        if survivors > 0 {
+            // clean up before failing so that no stand-in process is left
+            for p in &all {
+                ManagedServer::kill_process(*p);
+            }
+        }
+        assert_eq!(
+            survivors, 0,
+            "a process of the dropped server tree survived"
+        );
+    }
+
+    #[test]
+    fn a_refused_tree_copy_or_out_dir_creates_nothing_inside_the_tree() {
+        let root = temp_dir("no-dirs");
+        let (mut args, _) = fixture(&root, "q?");
+        let tree = args.tree.clone();
+        let before = tree_hash(&tree).unwrap();
+        // a copy that does not exist yet, inside the tree (also below a missing parent)
+        for planned in [tree.join("copy"), tree.join("deep/er/copy")] {
+            let error = prepare_copy(&tree, &planned, &before)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("may not contain one another"), "{error}");
+        }
+        assert!(!tree.join("copy").exists() && !tree.join("deep").exists());
+        // `..` below a missing directory cannot smuggle the path in
+        let sneaky = tree.join("nope/../copy");
+        assert!(prepare_copy(&tree, &sneaky, &before).is_err());
+        assert!(!tree.join("nope").exists() && !tree.join("copy").exists());
+        // the same for --out-dir in plan()
+        args.out_dir = args.tree.join("out");
+        let target = Target::Launch(PathBuf::from("serena"));
+        let error = plan(&args, &target).map(|_| ()).unwrap_err().to_string();
+        assert!(error.contains("--out-dir"), "{error}");
+        assert!(!args.tree.join("out").exists());
+        assert_eq!(tree_hash(&tree).unwrap(), before);
+        // a fresh, outside, not-yet-existing copy still works
+        let ok = prepare_copy(&tree, &root.join("fresh/copy"), &before).unwrap();
+        assert!(ok.created);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn traits_item() -> Value {
         let span =
             |file: &str, a: i64, b: i64| json!({"file": file, "begin_line": a, "end_line": b});
@@ -1860,6 +2230,7 @@ mod tests {
             call_timeout_s: 1,
             max_answer_chars: 1000,
             serena_args: Vec::new(),
+            max_per_file: 50,
             out_dir: root.join("out"),
         };
         let plan = plan(&args, &Target::Launch(PathBuf::from("serena"))).unwrap();
@@ -2029,6 +2400,7 @@ mod tests {
             calls: 0,
             unknown: 0,
             used: BTreeMap::new(),
+            pattern: PatternStats::default(),
         };
         let done = answer_item(
             &mut tools,
