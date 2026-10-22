@@ -1123,6 +1123,34 @@ fn init_json_reports_what_it_set_found_and_noted() {
     assert_eq!(report["warnings"], json!([]));
 }
 
+/// N116: `serve` binds a free port for `port = 0`, so `init` has nothing to
+/// probe: it reports the port as ephemeral, never as free or busy, and never
+/// writes a port.
+#[test]
+fn init_does_not_probe_a_configured_port_of_zero() {
+    let init = InitBox::on_port(0, "");
+    let output = init.run(&["init", "--no-probe", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["probes"]["port"]["value"], 0);
+    assert_eq!(report["probes"]["port"]["state"], "ephemeral");
+    assert!(report["probes"]["port"]["lci_serving"].is_null());
+    let note = report["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|comment| comment.as_str())
+        .find(|comment| comment.starts_with("port:"))
+        .expect("a port comment");
+    assert!(
+        note.contains("port: 0 asks the OS for a free port at every start"),
+        "{note}"
+    );
+    assert!(!note.contains("is free on"), "{note}");
+    assert_eq!(report["valid"], true);
+    assert!(!report["overlay"].as_str().unwrap().contains("\nport = "));
+}
+
 #[test]
 fn init_never_replaces_an_existing_overlay_without_force_and_dry_run_writes_nothing() {
     let init = InitBox::new("");

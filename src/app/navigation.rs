@@ -218,7 +218,9 @@ impl App {
         );
         let file = dunce::canonicalize(workspace.path.join(relative_file_path))?;
         ensure!(
-            file.starts_with(&workspace.path),
+            // `dunce` keeps the `\\?\` prefix of a path of 260 characters or
+            // more while the workspace root has none (N48).
+            lci_core::path::is_within(&file, &workspace.path),
             "source file must be inside the workspace"
         );
         ensure!(file.is_file(), "source path must be a file");
@@ -379,6 +381,41 @@ mod tests {
         order_symbols(&mut other);
         assert_eq!(one, other);
         assert_eq!(one, [first, early, late]);
+    }
+
+    /// N48: a source file at 260 characters or more canonicalizes to a
+    /// `\\?\` path while the workspace root has none; it is still inside.
+    #[cfg(windows)]
+    #[test]
+    fn a_source_file_with_a_long_path_is_inside_the_workspace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let mut relative = std::path::PathBuf::new();
+        while root.join(&relative).as_os_str().len() < 300 {
+            relative.push("d".repeat(40));
+        }
+        std::fs::create_dir_all(root.join(&relative)).unwrap();
+        relative.push("a.rs");
+        std::fs::write(root.join(&relative), "fn main() {}\n").unwrap();
+        let workspace = Workspace {
+            id: "w".to_owned(),
+            path: root.clone(),
+        };
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let file = App::source_path(&workspace, &name).unwrap();
+        // The premise: the canonical file keeps the prefix the root lacks.
+        assert!(file.to_string_lossy().starts_with(r"\\?\"), "{file:?}");
+        assert!(file.strip_prefix(&workspace.path).is_err());
+        assert!(file.is_file());
+        // A file outside the workspace is still refused.
+        let outside = tempfile::TempDir::new().unwrap();
+        let escape = outside.path().join("b.rs");
+        std::fs::write(&escape, "").unwrap();
+        let error = App::source_path(&workspace, &escape.to_string_lossy()).unwrap_err();
+        assert!(
+            error.to_string().contains("inside the workspace"),
+            "{error}"
+        );
     }
 
     fn report(notes: Vec<String>) -> NavigationReport {

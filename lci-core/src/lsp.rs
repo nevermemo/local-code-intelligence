@@ -2677,9 +2677,8 @@ fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<
         else {
             continue;
         };
-        let relative_file_path = file_path
-            .strip_prefix(&workspace.path)
-            .ok()
+        let relative_file_path = crate::path::strip_root(&file_path, &workspace.path)
+            .as_deref()
             .and_then(Path::to_str)
             .map(crate::path::normalize_path_separators);
         let Some(relative_file_path) = relative_file_path else {
