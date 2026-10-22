@@ -300,10 +300,15 @@ impl Diagnostics {
 
     /// Whether a publication for `key` after the reading `seen_before` answers
     /// the open of `version`: one has arrived, and the latest does not carry
-    /// an older version.
-    fn answers(&self, key: &str, seen_before: u64, version: i64) -> bool {
+    /// an older version. With `versioned` the latest must also carry a version
+    /// (see [`Self::wait_after_in`]).
+    fn answers(&self, key: &str, seen_before: u64, version: i64, versioned: bool) -> bool {
         let published = self.published(key);
-        published.count > seen_before && published.version.is_none_or(|sent| sent >= version)
+        published.count > seen_before
+            && match published.version {
+                Some(sent) => sent >= version,
+                None => !versioned,
+            }
     }
 
     /// Waits until a publication for `uri` has arrived after the reading
@@ -320,6 +325,26 @@ impl Diagnostics {
         version: i64,
         cap: Duration,
     ) -> bool {
+        self.wait_after_in(uri, seen_before, version, cap, false)
+            .await
+    }
+
+    /// [`Self::wait_after`] that, with `versioned`, is not answered by a
+    /// publication that carries no `version`. For the open of a document the
+    /// session closed before: a server that publishes empty diagnostics when
+    /// it closes a document (pyright, clangd) sends that publication without
+    /// the version of any open, possibly after the new `didOpen` was written,
+    /// and it must not end the wait for the re-open's own publication. A
+    /// server that never states a version waits such a re-open out to its cap
+    /// (counted in [`Self::wait_timeouts`]).
+    pub async fn wait_after_in(
+        &self,
+        uri: &str,
+        seen_before: u64,
+        version: i64,
+        cap: Duration,
+        versioned: bool,
+    ) -> bool {
         let key = canonical_uri(uri);
         let published = async {
             loop {
@@ -328,13 +353,13 @@ impl Diagnostics {
                 let notified = self.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.answers(&key, seen_before, version) {
+                if self.answers(&key, seen_before, version, versioned) {
                     return;
                 }
                 notified.await;
             }
         };
-        if self.answers(&key, seen_before, version) {
+        if self.answers(&key, seen_before, version, versioned) {
             return true;
         }
         if tokio::time::timeout(cap, published).await.is_ok() {
@@ -579,6 +604,21 @@ impl JsonRpcClient {
     ) -> bool {
         self.diagnostics
             .wait_after(uri, seen_before, version, cap)
+            .await
+    }
+
+    /// [`Self::wait_diagnostics`] for the open of a document the session
+    /// closed before: a publication without a `version` does not answer it
+    /// ([`Diagnostics::wait_after_in`]).
+    pub async fn wait_diagnostics_reopened(
+        &self,
+        uri: &str,
+        seen_before: u64,
+        version: i64,
+        cap: Duration,
+    ) -> bool {
+        self.diagnostics
+            .wait_after_in(uri, seen_before, version, cap, true)
             .await
     }
 

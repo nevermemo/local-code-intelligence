@@ -513,6 +513,41 @@ fn with_fake_documents_server(
     config
 }
 
+/// [`with_fake_documents_server`] with the documents fake configured as the
+/// `language` server (`"python"`) instead of csharp-ls, so a hook that opens
+/// documents is exercised against the fake that answers from the text it was
+/// sent. csharp-ls and rust-analyzer send no document at all. The workspace
+/// keeps its `.cs` files (the fake's scanner reads those, the adapter checks
+/// no extension) and the manager is called with the adapter directly.
+fn with_fake_documents_server_as(
+    mut config: Config,
+    language: &str,
+    state_dir: &Path,
+    extra_args: &[&str],
+    timeout_seconds: u64,
+) -> Config {
+    config.lsp_timeout_seconds = timeout_seconds;
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
+    let path = Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned());
+    let args = ["--mode", "documents", "--state"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([state_dir.to_string_lossy().into_owned()])
+        .chain(extra_args.iter().map(|arg| (*arg).to_owned()))
+        .collect();
+    match language {
+        "python" => {
+            config.python = local_code_intelligence::config::PythonLspConfig {
+                path,
+                args,
+                disabled: false,
+            };
+        }
+        other => panic!("no documents fake as {other}"),
+    }
+    config
+}
+
 /// `config` with rust-analyzer replaced by a copy of the fake language server in
 /// `documents` mode with rust-analyzer's status notifications
 /// (`--status-cycle --status-shape rust`: `experimental/serverStatus` with

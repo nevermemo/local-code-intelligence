@@ -136,16 +136,15 @@ impl LspAdapter for TypeScriptServer {
         Box::new(|_| false)
     }
 
-    // typescript-language-server refuses a didOpen for a document it already
-    // has open ("Can't open already open document"), so after the first
-    // request the server keeps the text it was first sent: not synced.
+    // typescript-language-server refuses a second didOpen for a document it
+    // already has open ("Can't open already open document"). The session
+    // sends a changed text as a didChange with the whole text instead (the
+    // server advertises change sync), so it holds the current text whatever
+    // it does with a repeated didOpen.
     fn opens_documents(&self) -> bool {
-        false
+        true
     }
 
-    // A file whose text changed since this session sent it is sent again and
-    // refused by the server as today, so an edit is not synced until
-    // `didChange` is sent (roadmap K7c).
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
