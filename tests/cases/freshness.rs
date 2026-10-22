@@ -2196,10 +2196,19 @@ async fn with_sync_on_the_session_is_told_about_the_edit_and_the_barrier_replace
         calculator(1, false).lines().count() as u64,
         "the store holds the edited text"
     );
-    let status = world
-        .app
-        .language_servers()
-        .sync_status(&world.workspace_id())
+    // The replacement session started a new sync, whose start walk runs on
+    // its own task after `start` returns: wait for it on the sync's own
+    // progress signal (`synced` with no paths waits for the first walk), as
+    // `write_generation` does, instead of reading the counters at once.
+    let servers = world.app.language_servers();
+    let id = world.workspace_id();
+    assert!(
+        servers.synced(&id, &[], LOADED_BUDGET).await,
+        "the replacement session's sync walked the tree: {:?}",
+        servers.sync_status(&id)
+    );
+    let status = servers
+        .sync_status(&id)
         .expect("the session's workspace is synced");
     assert_eq!((status.walks, status.rescans), (1, 0), "{status:?}");
     // The replacement session started after the edit and walked the disk, so
