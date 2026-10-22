@@ -263,3 +263,129 @@ async fn the_search_channel_restarts_a_kept_server_after_an_edit() {
     app.shutdown_language_servers().await;
     service.models_task.abort();
 }
+
+/// The service of the watching-server test: a Rust workspace indexed and aged,
+/// whose rust-analyzer is a copy of the fake (`with_fake_rust_analyzer`).
+struct RustService {
+    app: App,
+    workspace: Workspace,
+    state: std::path::PathBuf,
+    _temp: tempfile::TempDir,
+    _fake: Arc<FakeModels>,
+    models_task: tokio::task::JoinHandle<()>,
+}
+
+async fn rust_service() -> RustService {
+    let (temp, config, fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let path = temp.path().join("workspace");
+    write(
+        &path,
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        &path,
+        "src/lib.rs",
+        "pub mod call_site;\npub fn calculate_total(a: i32, b: i32) -> i32 { a + b }\n",
+    );
+    write(
+        &path,
+        "src/call_site.rs",
+        "pub fn run() -> i32 { crate::calculate_total(1, 2) }\n",
+    );
+    let mut config = with_fake_rust_analyzer(config, temp.path(), &state, &[]);
+    config.traverse.enabled = false;
+    // A start lands inside the search channel's budget: keep the budget out of
+    // the way of a slow start under load.
+    config.lsp_search_budget_ms = LOADED_BUDGET.as_millis() as u64;
+    let app = App::open(config).await.unwrap();
+    let workspace = app.index(&path).await.unwrap().workspace;
+    age_tree(&workspace.path);
+    RustService {
+        app,
+        workspace,
+        state,
+        _temp: temp,
+        _fake: fake,
+        models_task,
+    }
+}
+
+const RUST_KEPT_AFTER_EDIT: &str = "lsp: rust-analyzer kept session; the tree changed since its last call (kept: it watches its workspace)";
+const RUST_RESTARTED: &str = "lsp: rust-analyzer restarted: the tree changed since its last call";
+
+/// N108: an edit restarted rust-analyzer and the next searches lost the LSP
+/// channel. The search channel keeps a server that watches its workspace
+/// through a changed stamp and says so; it records no stamp for it, so
+/// navigation (N104) restarts it as before, and the search after that finds
+/// the new session unchanged. The C# test above is the non-watching control:
+/// the same edit restarts the server.
+#[tokio::test]
+async fn the_search_channel_keeps_a_watching_server_after_an_edit_and_navigation_restarts_it() {
+    let service = rust_service().await;
+    let (app, workspace, state) = (&service.app, &service.workspace, &service.state);
+    let notes_with_kept_unchanged = |notes: &[String]| {
+        notes.iter().any(|note| {
+            note.starts_with("lsp: rust-analyzer kept session; tree stamp unchanged since ")
+        })
+    };
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let first = app.search(&workspace.path, "calculate_total", Some(3)).await.unwrap();
+        assert!(
+            !first.notes.iter().any(|note| note.starts_with("lsp:")),
+            "a server the search started adds no note: {:?}",
+            first.notes
+        );
+        assert!(first.lsp_over_budget.is_empty(), "{:?}", first.notes);
+        assert_eq!(spawns_started(state), 1, "{first:?}");
+
+        let second = app.search(&workspace.path, "calculate_total", Some(3)).await.unwrap();
+        assert!(
+            notes_with_kept_unchanged(&second.notes),
+            "{:?}",
+            second.notes
+        );
+        assert_eq!(spawns_started(state), 1);
+
+        write(
+            &workspace.path,
+            "src/call_site.rs",
+            "pub fn run() -> i32 { crate::calculate_total(1, 2) }\npub fn run_again() -> i32 { crate::calculate_total(3, 4) }\n",
+        );
+        let third = app.search(&workspace.path, "calculate_total", Some(3)).await.unwrap();
+        let lsp_notes: Vec<&String> = third
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("lsp:"))
+            .collect();
+        assert_eq!(lsp_notes, [RUST_KEPT_AFTER_EDIT], "{:?}", third.notes);
+        assert!(no_lsp_warning(&third), "{:?}", third.warning);
+        assert!(third.lsp_over_budget.is_empty(), "{:?}", third.notes);
+        assert_eq!(spawns_started(state), 1, "the watcher kept its session");
+
+        // Navigation keeps the N104 barrier: the search recorded no stamp for
+        // the session it kept, so the server is restarted now.
+        let symbols = app.symbols(&workspace.path, "calculate_total").await.unwrap();
+        assert_eq!(symbols.notes, [RUST_RESTARTED], "{:?}", symbols.notes);
+        assert_eq!(spawns_started(state), 2);
+
+        // The restarted session carries the current stamp.
+        let fourth = app.search(&workspace.path, "calculate_total", Some(3)).await.unwrap();
+        assert!(
+            notes_with_kept_unchanged(&fourth.notes),
+            "{:?}",
+            fourth.notes
+        );
+        assert!(
+            !fourth.notes.iter().any(|note| note.contains("(kept: it")),
+            "{:?}",
+            fourth.notes
+        );
+        assert_eq!(spawns_started(state), 2);
+    })
+    .await
+    .expect("the test finishes within the loaded budget");
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
+}

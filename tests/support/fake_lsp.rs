@@ -237,8 +237,33 @@ impl InjectedError {
     }
 }
 
+/// The arguments of this run: the command line, or, when the fake is started
+/// with none (rust-analyzer takes no arguments, so a copy of the fake that
+/// stands in for it cannot be told its mode on the command line and the
+/// process-wide environment would leak across tests), the lines of the file
+/// beside its own executable named `<exe file stem>.args`, one argument per
+/// line. An absent or unreadable file is no arguments; a command line with any
+/// argument never reads it (the version probe's `--version` is such a run).
+fn cli_from_command_line_or_sidecar() -> Vec<String> {
+    let mut cli: Vec<String> = env::args().collect();
+    if cli.len() == 1 {
+        let sidecar = env::current_exe().ok().and_then(|exe| {
+            Some(exe.with_file_name(format!("{}.args", exe.file_stem()?.to_str()?)))
+        });
+        if let Some(lines) = sidecar.and_then(|path| fs::read_to_string(path).ok()) {
+            cli.extend(
+                lines
+                    .lines()
+                    .map(str::to_owned)
+                    .filter(|line| !line.is_empty()),
+            );
+        }
+    }
+    cli
+}
+
 pub fn run_from_env() -> io::Result<()> {
-    let cli: Vec<String> = env::args().collect();
+    let cli = cli_from_command_line_or_sidecar();
     // Sleeper mode is not a language server at all: see `spawn_sleeper`.
     if let Some(path) = cli_arg(&cli, "--sleeper") {
         run_sleeper(Path::new(&path));

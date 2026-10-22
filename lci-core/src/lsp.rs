@@ -760,9 +760,10 @@ tokio::task_local! {
 /// says it ([`Restart::note`]): a restart is not always a changed tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartReason {
-    /// The stamp differs from the recorded one, or none was recorded for the
-    /// session (its age is unknown).
+    /// The stamp differs from the one recorded for the session.
     TreeChanged,
+    /// No stamp was recorded for the session (its age is unknown).
+    Unrecorded,
     /// The index has no file list, so nothing can be stamped.
     NoFileList,
     /// The stamp could not be taken; the cause, shortened.
@@ -790,6 +791,7 @@ impl std::fmt::Display for RestartReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TreeChanged => formatter.write_str("the tree changed since its last call"),
+            Self::Unrecorded => formatter.write_str("no tree stamp was recorded for it"),
             Self::NoFileList => formatter.write_str("the index has no file list to stamp"),
             Self::StampFailed(cause) => write!(formatter, "the tree stamp failed ({cause})"),
         }
@@ -810,6 +812,35 @@ impl Restart {
     pub fn note(&self, prefix: &str) -> String {
         format!("{prefix}: {} restarted: {}", self.provider, self.reason)
     }
+}
+
+/// A kept session [`Manager::search_barrier`] did not stop although the barrier
+/// would have: the server watches its workspace. `reason` is why the barrier
+/// would have restarted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub provider: &'static str,
+    pub reason: RestartReason,
+}
+
+impl Kept {
+    /// `<prefix>: <provider> kept session; <reason> (kept: it watches its
+    /// workspace)`, the note of a search whose answer came from a session the
+    /// stamp said was stale.
+    pub fn note(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}: {} kept session; {} (kept: it watches its workspace)",
+            self.provider, self.reason
+        )
+    }
+}
+
+/// What a tree barrier did: the sessions it stopped, and (for the search
+/// channel only) the watching sessions it kept through a changed stamp.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Barrier {
+    pub restarted: Vec<Restart>,
+    pub kept: Vec<Kept>,
 }
 
 /// Which sessions one walk used, and whether it started each or found it
@@ -889,6 +920,8 @@ pub const LSP_DOWN_WINDOW: Duration = Duration::from_secs(30);
 /// dead server costs one probe or start per window instead of one per call. A
 /// start that merely timed out (a slow `initialize`) opens nothing, a started
 /// server is never refused, and a successful probe or start closes the window.
+/// A probe that found no binary or timed out opens nothing either (see
+/// [`Manager::probe_once`]): only evidence of a dead server opens a window.
 /// Shared by `Arc` between the managers of one service (see
 /// [`Manager::with_breakers`]), so a traversal's per-call manager reads the
 /// windows the service's manager opened. Time is read from the clock, with
@@ -1279,7 +1312,16 @@ impl Manager {
     /// provider's window (see [`LspBreakers`]) and a caller that finds it open
     /// gets an error that says so, without a probe; a probe that passes closes
     /// it. A provider whose probe has passed is answered from memory before
-    /// the window is read.
+    /// the window is read. A probe that found no binary
+    /// ([`adapter::ProbeFailure::Missing`]) or did not answer in time
+    /// ([`adapter::ProbeFailure::TimedOut`]) opens no window: a window opens on
+    /// evidence of a dead server, never on absence or silence. A missing binary
+    /// costs under a millisecond per probe and its note is byte-identical across
+    /// walks; a timed-out probe may be a loaded machine (`--version` took 2.6 s
+    /// at p50 under load, d450), and a window would refuse a healthy server. A
+    /// probe that failed otherwise (the binary started and crashed or exited
+    /// non-zero), and an adapter whose own `probe_readiness` fails without a
+    /// typed cause, still open it.
     pub async fn probe_once(&self, adapter: &Arc<dyn LspAdapter>, timeout: Duration) -> Result<()> {
         let provider = adapter.provider();
         if self.probed.lock().unwrap().contains(provider) {
@@ -1296,6 +1338,17 @@ impl Manager {
         if let Some(breakers) = &self.breakers {
             match &probe {
                 Ok(()) => breakers.clear(provider),
+                // Absence and silence open nothing; `Failed`, and an error with
+                // no typed cause (an adapter's own readiness probe), do.
+                Err(error)
+                    if error.chain().any(|cause| {
+                        matches!(
+                            cause
+                                .downcast_ref::<adapter::ProbeError>()
+                                .map(|e| e.failure),
+                            Some(adapter::ProbeFailure::Missing | adapter::ProbeFailure::TimedOut)
+                        )
+                    }) => {}
                 Err(_) => breakers.trip(provider),
             }
         }
@@ -1464,9 +1517,41 @@ impl Manager {
         workspace: &Workspace,
         adapters: &[&Arc<dyn LspAdapter>],
     ) -> Vec<Restart> {
+        self.barrier(workspace, adapters, false).await.restarted
+    }
+
+    /// [`Self::tree_barrier`] for the search channel: a server that watches its
+    /// workspace ([`LspAdapter::watches_workspace`]: rust-analyzer) keeps its
+    /// running session through a changed (or unrecorded, or unstampable) tree
+    /// and is returned in [`Barrier::kept`] with the reason the barrier would
+    /// have restarted it, so the caller labels the answer.
+    ///
+    /// Why: every edit restarted rust-analyzer and the next ~30 s of searches
+    /// lost the LSP channel (N108: 30 of 40 post-edit searches timed out,
+    /// control 0 of 10). rust-analyzer runs its own file watcher, so on a
+    /// search a kept session is as fresh as that watcher. The stamp is not
+    /// recorded for a kept session, so the next navigation call or traverse
+    /// walk (which call [`Self::tree_barrier`]) restarts it exactly as if the
+    /// search had not happened. A server that does not watch, and a watcher
+    /// with no running session, are handled as [`Self::tree_barrier`] does.
+    pub async fn search_barrier(
+        &self,
+        workspace: &Workspace,
+        adapters: &[&Arc<dyn LspAdapter>],
+    ) -> Barrier {
+        self.barrier(workspace, adapters, true).await
+    }
+
+    async fn barrier(
+        &self,
+        workspace: &Workspace,
+        adapters: &[&Arc<dyn LspAdapter>],
+        keep_watchers: bool,
+    ) -> Barrier {
         let mut restarted = Vec::new();
+        let mut kept = Vec::new();
         if adapters.is_empty() {
-            return restarted;
+            return Barrier { restarted, kept };
         }
         let lock = Arc::clone(
             self.barriers
@@ -1514,18 +1599,29 @@ impl Manager {
         };
         for (adapter, stamp) in adapters.iter().zip(stamps) {
             let key = Self::session_key(adapter, workspace);
-            let same = {
+            let (same, has_record) = {
                 let recorded = self.stamps.lock().unwrap();
-                matches!((recorded.get(&key), stamp), (Some((before, _)), Some(now)) if *before == now)
+                let before = recorded.get(&key);
+                (
+                    matches!((before, stamp), (Some((before, _)), Some(now)) if *before == now),
+                    before.is_some(),
+                )
             };
             if same {
                 continue;
             }
-            let reason = if stamp.is_some() {
-                RestartReason::TreeChanged
-            } else {
-                unstamped.clone()
+            let reason = match (stamp.is_some(), has_record) {
+                (true, true) => RestartReason::TreeChanged,
+                (true, false) => RestartReason::Unrecorded,
+                (false, _) => unstamped.clone(),
             };
+            if keep_watchers && adapter.watches_workspace() && self.has_session(&key).await {
+                kept.push(Kept {
+                    provider: adapter.provider(),
+                    reason,
+                });
+                continue;
+            }
             // The only await between the decision and the record is the
             // registry lock, which comes before the session is removed: a
             // caller dropped there has changed nothing, and one that got
@@ -1545,7 +1641,12 @@ impl Manager {
                 });
             }
         }
-        restarted
+        Barrier { restarted, kept }
+    }
+
+    /// Whether a session is registered under `key`.
+    async fn has_session(&self, key: &SessionKey) -> bool {
+        self.sessions.lock().await.contains_key(key)
     }
 
     /// Removes the session under `key` and stops its server on a task of its
@@ -3028,6 +3129,10 @@ mod tests {
             note(RestartReason::NoFileList),
             "lsp: csharp-ls restarted: the index has no file list to stamp"
         );
+        assert_eq!(
+            note(RestartReason::Unrecorded),
+            "lsp: csharp-ls restarted: no tree stamp was recorded for it"
+        );
         let error = anyhow!("a very long cause\nsecond line").context("stamping /w");
         assert_eq!(
             note(RestartReason::stamp_failed(&error)),
@@ -3039,6 +3144,31 @@ mod tests {
         };
         assert_eq!(cause.chars().count(), RestartReason::CAUSE_LIMIT + 3);
         assert!(cause.ends_with("..."));
+    }
+
+    /// The note of a watcher the search kept through the barrier says why the
+    /// barrier would have stopped it, and that the keeping is deliberate.
+    #[test]
+    fn a_kept_note_names_the_reason_and_the_watcher() {
+        let note = |reason| {
+            Kept {
+                provider: "rust-analyzer",
+                reason,
+            }
+            .note("lsp")
+        };
+        assert_eq!(
+            note(RestartReason::TreeChanged),
+            "lsp: rust-analyzer kept session; the tree changed since its last call (kept: it watches its workspace)"
+        );
+        assert_eq!(
+            note(RestartReason::NoFileList),
+            "lsp: rust-analyzer kept session; the index has no file list to stamp (kept: it watches its workspace)"
+        );
+        assert_eq!(
+            note(RestartReason::Unrecorded),
+            "lsp: rust-analyzer kept session; no tree stamp was recorded for it (kept: it watches its workspace)"
+        );
     }
 
     /// The table of real adapters: only rust-analyzer sees an edit on its own
@@ -3178,6 +3308,99 @@ mod tests {
         }
     }
 
+    /// An index file list that has none on its first call (no snapshot yet) and
+    /// lists `src/lib.rs` on every later one.
+    struct NoneThenListed(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl stamp::IndexedFiles for NoneThenListed {
+        async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
+            (self.0.fetch_add(1, Ordering::SeqCst) > 0)
+                .then(|| Arc::new(vec!["src/lib.rs".to_owned()]))
+        }
+    }
+
+    /// A manager whose index lists nothing at first, its rust-analyzer a path
+    /// that does not exist (a session registers and its start fails, so no
+    /// real server is reached), and a session for `workspace` that began under
+    /// the first, stampless barrier: that barrier removed the record, so the
+    /// stamp of the next call finds none (N114).
+    async fn manager_with_an_unrecorded_session(
+        workspace: &Workspace,
+    ) -> (Manager, Arc<dyn LspAdapter>) {
+        let config = Config {
+            rust_analyzer_path: "definitely-missing-rust-analyzer".into(),
+            ..Config::default()
+        };
+        let manager = Manager::new(&config).with_indexed_files(Arc::new(NoneThenListed(
+            std::sync::atomic::AtomicUsize::new(0),
+        ))
+            as Arc<dyn stamp::IndexedFiles>);
+        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
+        assert!(
+            manager.tree_barrier(workspace, &[&rust]).await.is_empty(),
+            "no session yet: nothing to stop"
+        );
+        manager.session(&rust, workspace).await.unwrap();
+        assert!(
+            manager
+                .has_session(&Manager::session_key(&rust, workspace))
+                .await
+        );
+        (manager, rust)
+    }
+
+    /// A session that began while the barrier had no stamp has no record, so
+    /// the next barrier that does stamp the tree calls it `Unrecorded`, not
+    /// `TreeChanged`: `tree_barrier` restarts it with that reason, and
+    /// `search_barrier` keeps a watcher with it and records nothing, so the
+    /// next `tree_barrier` still restarts it.
+    #[tokio::test]
+    async fn a_session_started_under_a_stampless_barrier_is_unrecorded_at_the_next_stamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let ws = Workspace {
+            id: crate::workspace::hash(&path.to_string_lossy()),
+            path,
+        };
+
+        let (manager, rust) = manager_with_an_unrecorded_session(&ws).await;
+        let restarted = manager.tree_barrier(&ws, &[&rust]).await;
+        assert_eq!(
+            restarted,
+            [Restart {
+                provider: "rust-analyzer",
+                reason: RestartReason::Unrecorded,
+            }]
+        );
+
+        let (manager, rust) = manager_with_an_unrecorded_session(&ws).await;
+        let barrier = manager.search_barrier(&ws, &[&rust]).await;
+        assert!(barrier.restarted.is_empty(), "{barrier:?}");
+        assert_eq!(
+            barrier.kept,
+            [Kept {
+                provider: "rust-analyzer",
+                reason: RestartReason::Unrecorded,
+            }]
+        );
+        assert_eq!(
+            barrier.kept[0].note("lsp"),
+            "lsp: rust-analyzer kept session; no tree stamp was recorded for it (kept: it watches its workspace)"
+        );
+        // The search recorded nothing for the session it kept.
+        let restarted = manager.tree_barrier(&ws, &[&rust]).await;
+        assert_eq!(
+            restarted,
+            [Restart {
+                provider: "rust-analyzer",
+                reason: RestartReason::Unrecorded,
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn a_probe_is_run_once_per_provider_until_it_fails() {
         let timeout = Duration::from_secs(1);
@@ -3244,6 +3467,84 @@ mod tests {
         assert!(breakers.remaining("probing-server").is_none());
         manager.probe_once(&dyn_adapter, timeout).await.unwrap();
         assert_eq!(asked(), 2);
+    }
+
+    /// An adapter whose version probe fails from a list of typed causes (the
+    /// last repeats), as `probe_subprocess_version` reports them, counting how
+    /// often it was asked.
+    struct FailingProbe {
+        causes: Vec<adapter::ProbeFailure>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LspAdapter for FailingProbe {
+        fn provider(&self) -> &'static str {
+            "failing-probe-server"
+        }
+        fn languages(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn configured_command(&self) -> Option<String> {
+            None
+        }
+        fn readiness_component_name(&self) -> &'static str {
+            "failing_probe_server_available"
+        }
+        async fn probe_readiness(&self, _timeout: Duration) -> Result<()> {
+            let n = self.asked.fetch_add(1, Ordering::SeqCst);
+            let cause = self.causes[n.min(self.causes.len() - 1)];
+            Err(adapter::ProbeError::error(
+                cause,
+                "start failing-probe-server",
+            ))
+        }
+        fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
+            None
+        }
+        fn initialize_params(&self, _root: &std::path::Path) -> Option<Value> {
+            None
+        }
+        fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+            Box::new(|_| false)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absent_binary_or_a_probe_timeout_opens_no_window() {
+        use adapter::ProbeFailure::{Failed, Missing, TimedOut};
+        let timeout = Duration::from_secs(1);
+        let adapter = Arc::new(FailingProbe {
+            causes: vec![Missing, TimedOut, Failed],
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let asked = || adapter.asked.load(Ordering::SeqCst);
+        let dyn_adapter: Arc<dyn LspAdapter> = Arc::clone(&adapter) as Arc<dyn LspAdapter>;
+        let breakers = long_window();
+        let manager = Manager::new(&Config::default()).with_breakers(Some(Arc::clone(&breakers)));
+        // No binary: probed, failed, no window, and the next caller probes
+        // again.
+        assert!(manager.probe_once(&dyn_adapter, timeout).await.is_err());
+        assert_eq!(asked(), 1);
+        assert!(breakers.remaining("failing-probe-server").is_none());
+        // No answer in time: likewise.
+        let timed_out = manager.probe_once(&dyn_adapter, timeout).await;
+        assert!(timed_out.is_err());
+        assert_eq!(asked(), 2);
+        assert!(breakers.remaining("failing-probe-server").is_none());
+        // A binary that started and failed is evidence of a dead server.
+        assert!(manager.probe_once(&dyn_adapter, timeout).await.is_err());
+        assert_eq!(asked(), 3);
+        assert!(breakers.remaining("failing-probe-server").is_some());
+        let refused = manager.probe_once(&dyn_adapter, timeout).await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("lsp breaker"),
+            "{refused:#}"
+        );
+        assert_eq!(asked(), 3);
     }
 
     /// An adapter whose version probe passes and whose server cannot start (it
