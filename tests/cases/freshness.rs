@@ -140,7 +140,7 @@ fn tree_hashes(root: &Path) -> BTreeMap<String, String> {
 
 pub(super) const COMBINE: &str = "sym:rust:Calculator.cs::Combine/fn";
 pub(super) const RUN: &str = "sym:rust:CallSite.cs::Run/fn";
-const SPEAK: &str = "sym:rust:shapes::Speak/trait";
+pub(super) const SPEAK: &str = "sym:rust:shapes::Speak/trait";
 const RATE_KEY: &str = "cfg:toml:rate";
 
 /// A function found on a line of the tree: `(zero-based line, name, column,

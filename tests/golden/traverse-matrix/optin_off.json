@@ -34,6 +34,7 @@
     "seeds.bm25 is off ([run_profile.seeds] bm25 = false): the map gives no start nodes",
     "seeds.literal is off ([run_profile.seeds] literal = false): the map gives no start nodes",
     "seeds.repo_map is off ([run_profile.seeds] repo_map = false): the map gives no start nodes",
+    "grep.structural is off ([run_profile.grep] structural = false): the map gives no edges",
     "no start node: the hybrid search and the symbol names in the question found nothing in the SCIP graph, and no seeds were given; name a function or method the code defines"
   ],
   "question": "Combine",

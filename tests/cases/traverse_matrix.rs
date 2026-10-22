@@ -6,18 +6,25 @@
 //! notes that say so, the order the maps register in, the errors a bad call
 //! gets (with the map lists they print), and the walk each map set produces.
 //!
-//! Normalised before the comparison, and only these: the handle (a hash of a
-//! snapshot that carries timings and the temp paths), the trace file's path,
-//! the timings (`elapsed_ms`, every `ms`), the "expand p50" notes (a measured
-//! cost) and the temp root (`<tmp>`). Everything else is exact. The actual text
-//! of every cell goes to `test-results/traverse-matrix/` for diffing; set
-//! `BLESS_GOLDEN=1` to rewrite the goldens (only the commit that changes an
-//! output may do so, and its message names why).
+//! Normalised before the comparison, and only these: the handles (`handle`,
+//! `checkpoint.handle`, the `resume` event's `handle`: hashes of a snapshot
+//! that carries timings and temp paths), `trace.file`, the handle file's
+//! `identity`, the timings (every `elapsed_ms` and `ms`, and the build time in
+//! the `config.key` note), the "expand p50"
+//! notes (a measured cost), git's error text in the `exact.pickaxe` note (it
+//! differs between git versions), `trace.hash` of a resumed response (its trace
+//! names the handle it resumed; its lines are pinned instead) and the temp
+//! root (`<tmp>`). Everything else is exact. The actual text of every cell
+//! goes to `test-results/traverse-matrix/` for diffing; set `BLESS_GOLDEN=1`
+//! to rewrite the goldens (only the commit that changes an output may do so,
+//! and its message names why).
 //!
 //! No model service and no `App`: `seed_search` is `None`, so the start nodes
 //! come from explicit seeds or from the stand-in that matches symbol names.
-//! The language server of the `lsp.live` cells is the documents fake.
-use super::freshness::{COMBINE, RUN, write_scip, write_tree};
+//! `lsp_ready` uses the documents fake language server; `lsp_down` uses
+//! binaries that do not exist (every other server's path is missing too, so
+//! the cells do not depend on what is installed).
+use super::freshness::{COMBINE, RUN, SPEAK, write_scip, write_tree};
 use super::*;
 use local_code_intelligence::{
     app::traverse::{self, BudgetArgs, Call, Dirs, SteerArgs},
@@ -160,6 +167,22 @@ fn scrub(value: &mut Value, roots: &[String]) {
             }
             if changed {
                 *text = text.replace('\\', "/");
+            }
+            // `config.key: ... built in 1172 ms`: a measured time.
+            if text.starts_with("config.key: ")
+                && let Some(at) = text.find("built in ")
+                && let Some(end) = text[at..].find(" ms")
+            {
+                text.replace_range(at + "built in ".len()..at + end, "<n>");
+            }
+            // `exact.pickaxe: ... git exited with ...)`: git's own error text,
+            // which differs between git versions and platforms.
+            if text.starts_with("exact.pickaxe: ")
+                && let Some(at) = text.find("git exited with ")
+                && text.ends_with(')')
+            {
+                let end = text.len() - 1;
+                text.replace_range(at + "git exited with ".len()..end, "<git error>");
             }
         }
         Value::Array(items) => {
@@ -370,8 +393,9 @@ async fn trajectory() {
     pin("trajectory", &cell, &report);
 }
 
-/// `seeds.bm25`, `seeds.literal` and `seeds.repo_map` named while their keys
-/// are off: one note each, in this order, and none of them registers.
+/// `seeds.bm25`, `seeds.literal`, `seeds.repo_map` and `grep.structural` named
+/// while their keys are off: one note each, in this order, and none of them
+/// registers (no ripgrep is needed).
 #[tokio::test]
 async fn optin_off() {
     let cell = cell();
@@ -382,13 +406,19 @@ async fn optin_off() {
             "seeds.bm25",
             "seeds.literal",
             "seeds.repo_map",
+            "grep.structural",
         ]),
         pops: Some(2),
         ..Default::default()
     };
     let report = ask(&cell, &spec, &profile()).await.unwrap();
     let text = notes(&report);
-    for map in ["seeds.bm25", "seeds.literal", "seeds.repo_map"] {
+    for map in [
+        "seeds.bm25",
+        "seeds.literal",
+        "seeds.repo_map",
+        "grep.structural",
+    ] {
         assert!(text.contains(&format!("{map} is off")), "{text}");
     }
     pin("optin_off", &cell, &report);
@@ -499,21 +529,101 @@ async fn policy_without_root() {
     pin("policy_without_root", &cell, &report);
 }
 
-/// A trait in the question joins the start nodes (`scip.implements` on): the
+/// A trait the question names by a path (`shapes::Speak`; a one-segment name
+/// matches nothing) joins the start nodes with `scip.implements` on: the
 /// implements note comes before the trait-seed note.
 #[tokio::test]
 async fn trait_seed() {
     let cell = cell();
     let spec = Spec {
-        question: "`Speak`",
+        question: "`shapes::Speak`",
         maps: maps(&["graph.scip", "scip.implements"]),
         pops: Some(2),
         ..Default::default()
     };
     let report = ask(&cell, &spec, &profile()).await.unwrap();
-    let text = report.response.to_string();
-    assert!(text.contains("trait_seeds"), "{text}");
+    let seeds = report.response["trait_seeds"].as_u64();
+    assert!(seeds >= Some(1), "{}", report.response);
+    let notes = report.response["notes"].as_array().unwrap();
+    let position = |needle: &str| {
+        notes
+            .iter()
+            .position(|note| note.as_str().is_some_and(|text| text.contains(needle)))
+            .unwrap_or_else(|| panic!("no note with {needle:?}: {notes:?}"))
+    };
+    assert!(
+        position("scip.implements: ") < position("start nodes are the traits"),
+        "{notes:?}"
+    );
     pin("trait_seed", &cell, &report);
+}
+
+/// Given start nodes that are traits (`scip.implements` on): they are the
+/// `given_traits` the walk is told about, and no trait-seed note is added.
+#[tokio::test]
+async fn trait_seed_given() {
+    let cell = cell();
+    let spec = Spec {
+        question: "`shapes::Speak`",
+        seeds: seeds(&[SPEAK]),
+        maps: maps(&["graph.scip", "scip.implements"]),
+        pops: Some(2),
+        ..Default::default()
+    };
+    let report = ask(&cell, &spec, &profile()).await.unwrap();
+    assert_eq!(report.response["trait_seeds"], 0, "{}", report.response);
+    assert!(
+        !notes(&report).contains("start nodes are the traits"),
+        "{}",
+        notes(&report)
+    );
+    pin("trait_seed_given", &cell, &report);
+}
+
+/// Six maps that read the tree, the SCIP file and the TOML (no ripgrep, no
+/// model): the registration order in `effective_policy.maps` and the notes
+/// each one adds, in call order.
+#[tokio::test]
+async fn registration_order() {
+    let cell = cell();
+    // An empty repository of its own: `exact.pickaxe` asks git, which must not
+    // find a repository around the temp directory instead.
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "--initial-branch=matrix"])
+        .current_dir(&cell.workspace)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let spec = Spec {
+        question: "`Combine`",
+        seeds: seeds(&[COMBINE]),
+        maps: maps(&[
+            "graph.scip",
+            "config.key",
+            "scip.impact",
+            "tests.tested_by",
+            "exact.closure",
+            "exact.pickaxe",
+        ]),
+        pops: Some(2),
+        ..Default::default()
+    };
+    let report = ask(&cell, &spec, &profile()).await.unwrap();
+    pin("registration_order", &cell, &report);
+}
+
+/// A named policy and a root: the policy's extra maps join the default set.
+#[tokio::test]
+async fn policy_with_root() {
+    let cell = cell();
+    let spec = Spec {
+        question: "`Combine`",
+        seeds: seeds(&[COMBINE]),
+        policy: Some("impact"),
+        ..Default::default()
+    };
+    let report = ask(&cell, &spec, &profile()).await.unwrap();
+    pin("policy_with_root", &cell, &report);
 }
 
 /// The settings of the `lsp.live` cells: no other language server than the one
