@@ -16,9 +16,6 @@
 //! self loops. Only the graph's function and method nodes exist here: types,
 //! traits and modules are never ranked.
 
-// Wired by the next commit (K18a, commit 2).
-#![allow(dead_code)]
-
 use super::seeds::Bm25Seeds;
 use lci_core::node::NodeId;
 use lci_maps::scip_graph::{GraphEdgeKind, ScipMap};
@@ -85,6 +82,7 @@ impl RepoMap {
     }
 
     /// How many nodes the graph has.
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.ids.len()
     }

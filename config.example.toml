@@ -791,6 +791,22 @@ bm25 = false
 # the call says so and goes on. The recipes' seeds are given, so they are the
 # same under both values. Part of the run-profile hash.
 literal = false
+# repo_map = false (default): the opt-in map seeds.repo_map does not run; naming it
+# in `maps` gives a note and no seeds, it is not in the default set, and every
+# answer is as without the key. true: the map is in the default set of a call that
+# names no maps, and runs when named. It ranks the SCIP graph's functions and
+# methods by personalized PageRank over the call and containment edges (not
+# `implements`; damping 0.85, at most 30 iterations), with the random jump on the
+# top 64 seeds.bm25 matches for the question: a function that many matched
+# functions call becomes a start node even when its own name holds none of the
+# question's words. A question with no bm25 match gives no seeds. The top
+# [traverse] seed_k nodes the other sources did not give go after theirs
+# (seed_source "hybrid+repo_map", "hybrid+bm25+repo_map", "bm25+repo_map"), or are
+# the start nodes when those gave none ("repo_map"). Reads the SCIP graph only (no
+# tree needed) and builds its edge lists, and the bm25 index it needs, on the first
+# call that wants it. The recipes' seeds are given, so they are the same under
+# both values. Part of the run-profile hash.
+repo_map = false
 
 # [run_profile.grep]: switches of the grep-style maps.
 # structural = false (default): the opt-in map grep.structural does not run; naming
