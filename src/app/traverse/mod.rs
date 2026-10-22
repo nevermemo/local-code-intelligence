@@ -1338,11 +1338,20 @@ pub async fn run_with_trait_seeds(
                 let scip_places = ScipPlaces::from_scip(&loaded.scip);
                 // `outline`: the index's table first, the server's own outline
                 // for what it lacks (everything under `scip.mode = "off"`).
-                let places: Arc<dyn SymbolPlaces> = match profile.lsp.places {
-                    LspPlaces::Scip => Arc::new(scip_places),
-                    LspPlaces::Outline => {
-                        Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
-                    }
+                // `auto` (the default): the index's table when the graph read
+                // for this workspace has a node (then the walk is the `scip`
+                // walk), else the outline (no index is read under `scip.mode =
+                // off`, or under `cache` with no file: nothing else would
+                // place a symbol).
+                let outline = match profile.lsp.places {
+                    LspPlaces::Scip => false,
+                    LspPlaces::Outline => true,
+                    LspPlaces::Auto => loaded.scip.graph().nodes.is_empty(),
+                };
+                let places: Arc<dyn SymbolPlaces> = if outline {
+                    Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
+                } else {
+                    Arc::new(scip_places)
                 };
                 let map = Arc::new(
                     LspLive::new(Box::new(backend), places)

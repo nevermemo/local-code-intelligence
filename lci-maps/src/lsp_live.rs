@@ -64,8 +64,9 @@
 //! tree) the id of the declaration `sym.defs` would store, else a minted id with
 //! the file's real language, so under `scip.mode = "off"` (an empty index) every
 //! function, method, type, enum, module and constant of an outlined file has
-//! an id. Under `places = "scip"`, the default, no outline is asked for a
-//! symbol and a symbol the index lacks has no place.
+//! an id. Under `places = "scip"` no outline is asked for a
+//! symbol and a symbol the index lacks has no place. The default, `places =
+//! "auto"`, is `scip` where the graph has a node and `outline` where it has none.
 //! A server column is UTF-16, the index's a byte column; they differ only after
 //! non-ASCII text on the line.
 //!

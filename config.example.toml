@@ -369,7 +369,10 @@ max_depth = 6
 max_est_tokens = 20000
 # Longest the walk may run. The hybrid search for the start nodes does not
 # count against it (embedding_timeout_seconds and reranker_timeout_seconds
-# bound that search). Loading the index does count against it.
+# bound that search). Loading the index does count against it. With lsp.live
+# the version probe of its server (bounded by readiness_timeout_seconds) and the
+# tree barrier are credited back too, so a call's wall time can exceed
+# deadline_ms by that setup.
 deadline_ms = 5000
 max_stops = 4
 # Confidence a rung of the steering ladder needs to decide a stop. Only the
@@ -684,7 +687,10 @@ mode = "cache"
 # restarts a kept server after an edit whatever the sync did (the tree barrier
 # above), so for lsp.live the sync no longer avoids a restart. The recipes are the same
 # under both values.
-# places = "scip" (default): lsp.live places a symbol only where the SCIP index
+# places = "auto" (default): per walk, "scip" when the SCIP graph read for the
+# workspace has at least one node (that walk is the "scip" walk), else "outline",
+# so a tree with no index read (scip.mode = "off", or "cache" with no file) still
+# gets lsp.live cards. "scip": lsp.live places a symbol only where the SCIP index
 # has a node for it, so it asks nothing about a symbol the index lacks and,
 # under [run_profile.scip] mode = "off", nothing at all. "outline": the index's
 # table first, then the language server's own outline of a file
@@ -701,7 +707,7 @@ mode = "cache"
 # members, impl blocks and type parameters have no node. A seed that is a
 # symbol id of a file never outlined still has no place. Needs a server that
 # answers documentSymbol. The recipes never run lsp.live and are the same
-# under both values.
+# under all three values.
 # breaker = true (default): a provider whose version probe failed, or whose
 # server could not be started (it could not be spawned, exited, or broke the
 # protocol), is left alone for 30 seconds: the next probe or start of that
@@ -722,14 +728,19 @@ mode = "cache"
 # "traverse") also walks lsp.live, after the extra_maps of its policy (naming it
 # there is then a no-op). A language server that is not installed, will not start
 # or is refused costs the walk a note ("lsp.live is unavailable: ..") and the
-# map, never an error or a wait past the deadline; rust-analyzer is enabled with
+# map, never an error; rust-analyzer is enabled with
 # the bare path "rust-analyzer", the other servers need their [language] path.
+# [traverse] deadline_ms bounds the walk: the setup (the version probe, bounded
+# by its own readiness_timeout_seconds, the seed search and the tree barrier) is
+# credited back, so a call's wall time can exceed deadline_ms by that setup.
 # A service with [traverse] enabled = true also warms the servers at the first
 # touch of a workspace. `lci traverse` (the one-shot) and sessions = "per_call"
 # are not changed by it: a server that dies with the call cannot amortise its
 # start, so there the map runs only when --maps or a policy names it. A call
-# that names its maps is never changed. For a language the SCIP index has no
-# node for, set places = "outline": under "scip" the map then asks nothing.
+# that names its maps is never changed. With a SCIP index that has nodes the
+# walk places symbols by it (places = "auto"); with none read the map places
+# them by the server's own outline. For a language an index that has nodes
+# lacks, set places = "outline": under "scip" the map then asks nothing.
 # false: the map runs only when a call or a policy names it. The recipes never
 # run lsp.live and are the same under both values.
 # All eight keys are part of the run-profile hash.
@@ -739,7 +750,7 @@ outline_cache = false
 implementations = false
 call_hierarchy = false
 sync = "off"
-places = "scip"
+places = "auto"
 breaker = true
 live = true
 

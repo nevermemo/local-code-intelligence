@@ -5745,6 +5745,7 @@ async fn traverse_add_full(
         manager,
         (pops, handle),
         Some(&[lci_maps::lsp_live::LSP_LIVE_ID]),
+        ADD_SEED,
         tweak,
     )
     .await
@@ -5768,13 +5769,14 @@ async fn traverse_add_unnamed(
         manager,
         (None, None),
         None,
+        ADD_SEED,
         tweak,
     )
     .await
 }
 
 /// [`traverse_add_full`] with the call's `maps` set to `named` (`None`: the call
-/// names none, so the default set applies).
+/// names none, so the default set applies) and its one seed to `seed`.
 #[allow(clippy::too_many_arguments)]
 async fn traverse_add_maps(
     config: &Config,
@@ -5784,6 +5786,7 @@ async fn traverse_add_maps(
     manager: Option<&Arc<Manager>>,
     (pops, handle): (Option<u32>, Option<&str>),
     named: Option<&[&str]>,
+    seed: &str,
     tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
 ) -> Value {
     use local_code_intelligence::{
@@ -5816,7 +5819,7 @@ async fn traverse_add_maps(
     );
     let maps: Option<Vec<String>> =
         named.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
-    let seeds = ["sym:rust:Calculator.cs::Add/fn".to_owned()];
+    let seeds = [seed.to_owned()];
     let call = Call {
         scip_index: index,
         scip_root: Some(&workspace.path),
@@ -8625,6 +8628,7 @@ async fn lsp_live_runs_by_default_through_the_service_manager() {
         Some(&manager),
         (None, None),
         Some(&["graph.scip"]),
+        ADD_SEED,
         |_| {},
     )
     .await;
@@ -8643,6 +8647,118 @@ async fn lsp_live_runs_by_default_through_the_service_manager() {
     .await;
     assert!(!policy_lists_lsp_live(&per_call), "{per_call}");
     assert!(!reached_run_through_lsp_live(&per_call), "{per_call}");
+
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
+}
+
+/// The `sym:` nodes of an answer's cards whose evidence names `lsp.live`.
+fn lsp_live_symbol_cards(answer: &Value) -> Vec<String> {
+    let mut nodes: Vec<String> = answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|card| card.to_string().contains("lsp.live"))
+        .filter_map(|card| card["node"].as_str())
+        .filter(|node| node.starts_with("sym:"))
+        .map(str::to_owned)
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// K11b-3 (Sol 1): `[run_profile.lsp] places = "auto"` (the default) gives
+/// `lsp.live` its cards on a tree with no SCIP index read (`scip.mode = "off"`),
+/// where an explicit `"scip"` gives none and warms a server for nothing: the
+/// walk is the call a service makes (the shared manager, a tree), seeded at a
+/// file, and the server's own outline names the declarations. Where an index
+/// with nodes is read the default is the `"scip"` walk: the same cards and
+/// external calls, and no outline asked of the server.
+#[tokio::test]
+async fn lsp_live_default_places_follow_the_index() {
+    use local_code_intelligence::config::{LspPlaces, LspSessions, profile::ScipMode};
+    const FILE: &str = "file:src/Calculator.cs";
+    let service = indexed_warm_service(&[], |config| config.traverse.policies.clear()).await;
+    let (app, workspace, state) = (&service.app, &service.workspace, &service.state);
+    let index = csharp_scip_index(&service.temp, workspace);
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    let manager = app.language_servers();
+    let walk = |seed: &'static str, places: Option<LspPlaces>, mode: Option<ScipMode>| {
+        let (config, index, manager) = (&service.config, &index, &manager);
+        async move {
+            traverse_add_maps(
+                config,
+                workspace,
+                index,
+                LspSessions::Shared,
+                Some(manager),
+                (None, None),
+                None,
+                seed,
+                |profile| {
+                    if let Some(places) = places {
+                        profile.lsp.places = places;
+                    }
+                    if let Some(mode) = mode {
+                        profile.scip.mode = mode;
+                    }
+                },
+            )
+            .await
+        }
+    };
+
+    // No index read: the default outlines the file and reaches its
+    // declarations through `lsp.live`; the explicit `scip` places nothing.
+    assert_eq!(requests_of(state, "textDocument/documentSymbol"), 0);
+    let auto = walk(FILE, None, Some(ScipMode::Off)).await;
+    let by_auto = lsp_live_symbol_cards(&auto);
+    assert!(
+        by_auto
+            .iter()
+            .any(|node| node.starts_with("sym:csharp:Calculator.cs::")),
+        "{auto}"
+    );
+    assert!(
+        !notes_of(&auto).contains("lsp.live is unavailable"),
+        "{auto}"
+    );
+    let outlined = requests_of(state, "textDocument/documentSymbol");
+    assert!(outlined >= 1, "the default outlined the file: {outlined}");
+    let explicit = walk(FILE, Some(LspPlaces::Outline), Some(ScipMode::Off)).await;
+    assert_eq!(lsp_live_symbol_cards(&explicit), by_auto, "{explicit}");
+    let scip = walk(FILE, Some(LspPlaces::Scip), Some(ScipMode::Off)).await;
+    assert!(lsp_live_symbol_cards(&scip).is_empty(), "{scip}");
+
+    // An index with nodes: the default is the `scip` walk, byte for byte in
+    // what it reaches and pays, and in the outlines it asks (a file the walk
+    // reaches is outlined as it always was; an index symbol is not).
+    let outlines = || requests_of(state, "textDocument/documentSymbol");
+    let start = outlines();
+    let by_default = walk(ADD_SEED, None, None).await;
+    let default_outlines = outlines() - start;
+    let by_scip = walk(ADD_SEED, Some(LspPlaces::Scip), None).await;
+    let scip_outlines = outlines() - start - default_outlines;
+    assert!(reached_run_through_lsp_live(&by_default), "{by_default}");
+    assert_eq!(
+        lsp_live_symbol_cards(&by_default),
+        lsp_live_symbol_cards(&by_scip),
+        "{by_default}"
+    );
+    assert_eq!(
+        by_default["totals"]["external_calls"], by_scip["totals"]["external_calls"],
+        "{by_default}"
+    );
+    assert_eq!(default_outlines, scip_outlines, "{by_default}");
+    // The count measures something: `outline` over the same index asks more.
+    let by_outline = walk(ADD_SEED, Some(LspPlaces::Outline), None).await;
+    assert!(reached_run_through_lsp_live(&by_outline), "{by_outline}");
+    assert!(
+        outlines() - start - default_outlines - scip_outlines > scip_outlines,
+        "{by_outline}"
+    );
 
     app.shutdown_language_servers().await;
     service.models_task.abort();

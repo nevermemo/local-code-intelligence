@@ -432,10 +432,15 @@ impl std::str::FromStr for LspSync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LspPlaces {
+    /// Per walk: [`Scip`](Self::Scip) when the SCIP graph read for the
+    /// workspace has at least one node, else [`Outline`](Self::Outline) (no
+    /// index is read under `scip.mode = "off"`, or under `"cache"` with no
+    /// file, and an index of a tree with no symbols has none either). Where an
+    /// index has nodes the walk is the `"scip"` walk, byte for byte.
+    #[default]
+    Auto,
     /// The SCIP index's table alone: a symbol has a place only if the index
     /// has a node for it, so under `scip.mode = "off"` nothing has one.
-    /// Today's behaviour.
-    #[default]
     Scip,
     /// The index's table first, then the live outline of the language server
     /// (`textDocument/documentSymbol`) for what it lacks or misplaces: one
@@ -446,6 +451,7 @@ pub enum LspPlaces {
 impl LspPlaces {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Scip => "scip",
             Self::Outline => "outline",
         }
@@ -457,10 +463,11 @@ impl std::str::FromStr for LspPlaces {
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         match text {
+            "auto" => Ok(Self::Auto),
             "scip" => Ok(Self::Scip),
             "outline" => Ok(Self::Outline),
             other => Err(format!(
-                "places must be \"scip\" or \"outline\" (got {other:?})"
+                "places must be \"auto\", \"scip\" or \"outline\" (got {other:?})"
             )),
         }
     }
@@ -513,14 +520,16 @@ pub struct LspProfile {
     /// under `sessions = "per_call"` it changes nothing for `lsp.live`. The
     /// recipes walk no `lsp.live` and run the same under both values.
     pub sync: LspSync,
-    /// `"scip"` (default): `lsp.live` places a symbol only where the SCIP
-    /// index has a node for it, so it asks nothing about a symbol the index
-    /// lacks and, under `scip.mode = "off"`, nothing at all. `"outline"`: the
-    /// index's table first, then the server's live outline of a file
-    /// (`textDocument/documentSymbol`, one external call per distinct file it
-    /// places a symbol in or expands) for what the index lacks or misplaces
-    /// (see [`LspPlaces`]). The recipes walk no `lsp.live` and run the same
-    /// under both values.
+    /// `"auto"` (default): per walk, `"scip"` when the SCIP graph read for the
+    /// workspace has nodes, else `"outline"` (so `lsp.live` gives cards also
+    /// where no index is read). `"scip"`: `lsp.live` places a symbol only
+    /// where the SCIP index has a node for it, so it asks nothing about a
+    /// symbol the index lacks and, under `scip.mode = "off"`, nothing at all.
+    /// `"outline"`: the index's table first, then the server's live outline of
+    /// a file (`textDocument/documentSymbol`, one external call per distinct
+    /// file it places a symbol in or expands) for what the index lacks or
+    /// misplaces (see [`LspPlaces`]). The recipes walk no `lsp.live` and run
+    /// the same under all three values.
     pub places: LspPlaces,
     /// `true` (default): a provider whose version probe failed, or whose server
     /// could not be started (it could not be spawned, exited, or broke the
@@ -1726,17 +1735,21 @@ mode = \"sometimes\"
         assert_eq!("off".parse::<LspSync>(), Ok(LspSync::Off));
         assert!("on".parse::<LspSync>().is_err());
     }
-
     #[test]
-    fn lsp_places_is_scip_by_default_and_changes_the_profile_hash() {
-        let scip = Config::default();
+    fn lsp_places_is_auto_by_default_and_each_value_changes_the_profile_hash() {
+        let auto = Config::default();
+        assert_eq!(auto.run_profile.lsp.places, LspPlaces::Auto);
+        let with = |value: &str| -> Config {
+            let config: Config = toml::from_str(&format!(
+                "{}[run_profile.lsp]\nplaces = \"{value}\"\n",
+                base_toml()
+            ))
+            .unwrap();
+            config.validate().unwrap();
+            config
+        };
+        let (scip, outline) = (with("scip"), with("outline"));
         assert_eq!(scip.run_profile.lsp.places, LspPlaces::Scip);
-        let outline: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nplaces = \"outline\"\n",
-            base_toml()
-        ))
-        .unwrap();
-        outline.validate().unwrap();
         assert_eq!(outline.run_profile.lsp.places, LspPlaces::Outline);
         // Only the named leaf moves.
         assert_eq!(outline.run_profile.lsp.sessions, LspSessions::Shared);
@@ -1746,32 +1759,36 @@ mode = \"sometimes\"
             serde_json::to_value(&outline).unwrap()["run_profile"]["lsp"]["places"],
             "outline"
         );
-        let (scip, outline) = (scip.run_profile(), outline.run_profile());
+        let (auto, scip, outline) = (
+            auto.run_profile(),
+            scip.run_profile(),
+            outline.run_profile(),
+        );
+        assert_eq!(auto.value["run_profile"]["lsp"]["places"], "auto");
         assert_eq!(scip.value["run_profile"]["lsp"]["places"], "scip");
         assert_eq!(outline.value["run_profile"]["lsp"]["places"], "outline");
-        assert!(scip.keys.iter().any(|key| key == "run_profile.lsp.places"));
+        assert!(auto.keys.iter().any(|key| key == "run_profile.lsp.places"));
+        assert_ne!(auto.hash, scip.hash);
+        assert_ne!(auto.hash, outline.hash);
         assert_ne!(scip.hash, outline.hash);
         // Spelling out the default is the default.
-        let spelled: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nplaces = \"scip\"\n",
-            base_toml()
-        ))
-        .unwrap();
-        assert_eq!(spelled.run_profile().hash, scip.hash);
+        assert_eq!(with("auto").run_profile().hash, auto.hash);
         for bad in [
             "[run_profile.lsp]\nplaces = \"index\"\n",
             "[run_profile.lsp]\nplaces = \"Outline\"\n",
+            "[run_profile.lsp]\nplaces = \"Auto\"\n",
             "[run_profile.lsp]\nplaces = true\n",
             "[run_profile]\nplaces = \"outline\"\n",
         ] {
             let text = format!("{}{bad}", base_toml());
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
         }
+        assert_eq!(LspPlaces::Auto.as_str(), "auto");
         assert_eq!(LspPlaces::Outline.as_str(), "outline");
+        assert_eq!("auto".parse::<LspPlaces>(), Ok(LspPlaces::Auto));
         assert_eq!("scip".parse::<LspPlaces>(), Ok(LspPlaces::Scip));
         assert!("index".parse::<LspPlaces>().is_err());
     }
-
     #[test]
     fn lsp_breaker_is_on_by_default_and_off_changes_the_profile_hash() {
         let on = Config::default();
@@ -1786,7 +1803,7 @@ mode = \"sometimes\"
         // Only the named leaf moves.
         assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
         assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
-        assert_eq!(off.run_profile.lsp.places, LspPlaces::Scip);
+        assert_eq!(off.run_profile.lsp.places, LspPlaces::Auto);
         assert!(off.run_profile.lsp.live);
         assert!(!off.run_profile.lsp.implementations);
         assert!(!off.run_profile.lsp.call_hierarchy);
@@ -1827,7 +1844,7 @@ mode = \"sometimes\"
         // Only the named leaf moves.
         assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
         assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
-        assert_eq!(off.run_profile.lsp.places, LspPlaces::Scip);
+        assert_eq!(off.run_profile.lsp.places, LspPlaces::Auto);
         assert!(off.run_profile.lsp.breaker);
         assert!(!off.run_profile.lsp.implementations);
         assert_eq!(
