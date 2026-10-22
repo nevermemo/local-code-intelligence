@@ -460,6 +460,56 @@ async fn non_mcp_routes_reject_dns_rebinding_hosts_and_foreign_origins() {
     models_task.abort();
 }
 
+/// With `port = 0` configured (`serve --port 0`) the router is built with the
+/// port the listener got: `/openapi.json` and the Origin check name that port.
+#[tokio::test]
+async fn port_zero_config_uses_the_bound_port_in_openapi_and_the_origin_check() {
+    let (_temp, mut config, _fake, models_task) = fixture().await;
+    config.port = 0;
+    let app = Arc::new(App::open(config).await.unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let listener = loopback_tokio_listener();
+    let bound_port = listener.local_addr().unwrap().port();
+    assert_ne!(bound_port, 0);
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let document: Value = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        document["servers"][0]["url"],
+        format!("http://127.0.0.1:{bound_port}")
+    );
+    let same_origin = client
+        .get(format!("{base}/health"))
+        .header("Origin", format!("http://127.0.0.1:{bound_port}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_origin.status(), StatusCode::OK);
+    let port_zero_origin = client
+        .get(format!("{base}/health"))
+        .header("Origin", "http://127.0.0.1:0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(port_zero_origin.status(), StatusCode::FORBIDDEN);
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
 // ---------------------------------------------------------------------------
 // Search profiles: `/mcp/<name>` and `POST /v1/search_code?search_profile=<name>`
 // run `search_code` with a configured `[search_profiles.<name>]`. Nothing else

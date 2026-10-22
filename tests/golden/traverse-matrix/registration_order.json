@@ -1,0 +1,169 @@
+{
+  "effective_policy": {
+    "hash": "4f474d6837b500b9",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "structure.contains",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "config.key",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "scip.impact",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "tests.tested_by",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "exact.closure",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "exact.pickaxe",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "exact": [
+    {
+      "answered": true,
+      "cards": 1,
+      "map": "exact.closure"
+    },
+    {
+      "answered": false,
+      "cards": 0,
+      "git_calls": 3,
+      "map": "exact.pickaxe"
+    }
+  ],
+  "mode": "traverse",
+  "notes": [
+    "config.key: 1 keys, 1 exact and 0 text edges (text edges off), built in <n> ms",
+    "scip.impact: 9 definitions, 8 with a node id (5 those of graph.scip), cap 64 users per node",
+    "tests.tested_by: 0 test units in the impact index, cap 256 edges per node",
+    "exact.closure: names 1, anchored yes, closure 1, kept 1",
+    "exact.pickaxe: class H3, no commits (git calls 3, failed 3: git exited with <git error>)"
+  ],
+  "question": "`Combine`",
+  "results": [
+    {
+      "depth": 0,
+      "held": 1,
+      "maps": [
+        "exact.closure"
+      ],
+      "n_maps": 1,
+      "name": "Run",
+      "node": "sym:rust:CallSite.cs::Run/fn",
+      "origin": "exact",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "site": {
+        "col": 23,
+        "line": 4,
+        "path": "src/CallSite.cs"
+      },
+      "text": "sym:rust:CallSite.cs::Run/fn | exact.closure | p1.00 d0",
+      "via": "exact.closure",
+      "witness": null
+    },
+    {
+      "depth": 0,
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 16,
+        "line": 4,
+        "path": "src/Calculator.cs"
+      },
+      "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+      "via": null,
+      "witness": null
+    }
+  ],
+  "seed_hits": [],
+  "seed_sites": {
+    "sym:rust:Calculator.cs::Combine/fn": {
+      "col": 16,
+      "line": 4,
+      "path": "src/Calculator.cs"
+    }
+  },
+  "seed_source": "given",
+  "seeds": [
+    "sym:rust:Calculator.cs::Combine/fn"
+  ],
+  "status": "complete",
+  "steering": [],
+  "stop_reason": "complete",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "first_stage": {
+      "exact": 1,
+      "seeds": 1,
+      "walk": 0
+    },
+    "hops": 1,
+    "per_map": {
+      "config.key": {
+        "expands": 2
+      },
+      "graph.scip": {
+        "expands": 2
+      },
+      "scip.impact": {
+        "expands": 2
+      },
+      "tests.tested_by": {
+        "expands": 2
+      }
+    },
+    "physical_external_calls": 3,
+    "physical_map_calls": 8,
+    "pops": 2,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "trace": {
+    "events": 5,
+    "hash": "b786b24cb584db7c"
+  }
+}

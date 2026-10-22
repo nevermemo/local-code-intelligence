@@ -1,0 +1,183 @@
+{
+  "alts": [
+    [
+      0,
+      1
+    ]
+  ],
+  "boost": 0.1,
+  "cleared": [],
+  "deferred": [],
+  "expanded": [
+    0,
+    1
+  ],
+  "frontier": [
+    [
+      2,
+      0.5,
+      2
+    ],
+    [
+      3,
+      0.5,
+      3
+    ]
+  ],
+  "in_seen": [
+    [
+      "file:src/Calculator.cs",
+      1
+    ],
+    [
+      "file:src/CallSite.cs",
+      1
+    ],
+    [
+      "sym:rust:Calculator.cs::Combine/fn",
+      1
+    ]
+  ],
+  "last_stop_at": null,
+  "next_seq": 4,
+  "paid": [],
+  "pass_through": false,
+  "popped": [
+    0,
+    1
+  ],
+  "question": "Combine",
+  "rerank_floor": null,
+  "returned": "1c5a6ebd205cb69e",
+  "score_bound": true,
+  "scorer": "rules",
+  "states": [
+    {
+      "dependent": 1,
+      "depth": 0,
+      "fanout": 2,
+      "maps": [
+        "graph.scip"
+      ],
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "parent": null,
+      "potential": 1.0,
+      "via": null,
+      "witness": null,
+      "witnesses": [
+        "compiler"
+      ]
+    },
+    {
+      "dependent": 0,
+      "depth": 0,
+      "fanout": 2,
+      "maps": [],
+      "node": "sym:rust:CallSite.cs::Run/fn",
+      "parent": null,
+      "potential": 1.0,
+      "via": null,
+      "witness": null,
+      "witnesses": []
+    },
+    {
+      "dependent": 1,
+      "depth": 1,
+      "fanout": 1,
+      "maps": [
+        "structure.contains"
+      ],
+      "node": "file:src/Calculator.cs",
+      "parent": 0,
+      "potential": 0.5,
+      "via": "structure.contains",
+      "witness": "exact",
+      "witnesses": [
+        "exact"
+      ]
+    },
+    {
+      "dependent": 1,
+      "depth": 1,
+      "fanout": 2,
+      "maps": [
+        "structure.contains"
+      ],
+      "node": "file:src/CallSite.cs",
+      "parent": 1,
+      "potential": 0.5,
+      "via": "structure.contains",
+      "witness": "exact",
+      "witnesses": [
+        "exact"
+      ]
+    }
+  ],
+  "switches": [],
+  "tally": {
+    "complete_fired": false,
+    "disagreements": [],
+    "found": [
+      [
+        "graph.scip",
+        [
+          "sym:rust:Calculator.cs::Combine/fn"
+        ]
+      ],
+      [
+        "structure.contains",
+        [
+          "file:src/Calculator.cs",
+          "file:src/CallSite.cs"
+        ]
+      ]
+    ],
+    "kind_cost": [
+      [
+        "sym",
+        2,
+        24
+      ]
+    ],
+    "last_fresh_pop": 2,
+    "maps": [
+      [
+        "graph.scip",
+        2,
+        0,
+        0,
+        0
+      ],
+      [
+        "structure.contains",
+        2,
+        0,
+        2,
+        0
+      ]
+    ],
+    "raised_pops": 0,
+    "raised_tokens": 0
+  },
+  "targets": [],
+  "top_k": 10,
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "hops": 2,
+    "pass_through_pops": 0,
+    "physical_external_calls": 0,
+    "physical_map_calls": 4,
+    "pops": 2,
+    "rerank_calls": 0,
+    "rerank_docs": 0,
+    "rerank_failure_reasons": {},
+    "rerank_failures": 0,
+    "rerank_skipped": 0,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 24
+  },
+  "version": 10,
+  "weights": []
+}
