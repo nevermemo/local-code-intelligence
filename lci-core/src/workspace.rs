@@ -18,8 +18,9 @@ impl Workspace {
         let path = dunce::canonicalize(path)?;
         ensure!(path.is_dir(), "workspace must be a directory");
         let data = dunce::canonicalize(data_dir)?;
+        // Either path may keep a `\\?\` prefix the other lacks (N48).
         ensure!(
-            !data.starts_with(&path) && !path.starts_with(&data),
+            !crate::path::is_within(&data, &path) && !crate::path::is_within(&path, &data),
             "data directory and workspace must not contain one another"
         );
         let key = path
@@ -93,6 +94,37 @@ mod tests {
         };
         assert_eq!(workspace.table_name(), "ws_test");
         assert_eq!(workspace.legacy_table_name(), "ws_test");
+    }
+
+    /// N48: a workspace at 260 characters or more keeps the `\\?\` prefix that
+    /// `dunce` strips from the shorter data directory above it, so a plain
+    /// `starts_with` called them unrelated and the overlap check passed.
+    #[cfg(windows)]
+    #[test]
+    fn a_long_workspace_inside_the_data_directory_is_still_refused() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut deep = temp.path().to_path_buf();
+        while deep.as_os_str().len() < 300 {
+            deep.push("d".repeat(40));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        // The premise: the long path keeps its prefix, the short one has none.
+        assert!(
+            dunce::canonicalize(&deep)
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(r"\\?\")
+        );
+        assert!(
+            !dunce::canonicalize(temp.path())
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(r"\\?\")
+        );
+        let error = Workspace::resolve(&deep, temp.path()).unwrap_err();
+        assert!(error.to_string().contains("must not contain"), "{error}");
+        let error = Workspace::resolve(temp.path(), &deep).unwrap_err();
+        assert!(error.to_string().contains("must not contain"), "{error}");
     }
 
     #[test]

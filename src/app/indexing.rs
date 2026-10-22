@@ -929,7 +929,10 @@ impl App {
                 let absolute = std::path::absolute(path)?;
                 watchers
                     .values()
-                    .find(|(workspace, _)| workspace.path == absolute)
+                    .find(|(workspace, _)| {
+                        lci_core::path::without_verbatim(&workspace.path)
+                            == lci_core::path::without_verbatim(&absolute)
+                    })
                     .map(|(workspace, _)| workspace.clone())
                     .ok_or(error)?
             }
