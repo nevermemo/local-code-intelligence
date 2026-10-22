@@ -1031,7 +1031,7 @@ mod tests {
             .iter()
             .map(|(path, _)| Chunk {
                 relative_file_path: path.clone(),
-                language: if path.ends_with(".md") {
+                language: if lci_core::path::has_extension_ignore_case(path, "md") {
                     "markdown"
                 } else {
                     "rust"

@@ -352,6 +352,8 @@ fn rust_declarations_cover_items_modules_and_collisions() {
 fn module_paths_follow_the_file_path() {
     for (path, expected) in [
         ("src/app/search.rs", &["app", "search"][..]),
+        // The extension folds case (N94); the module name keeps its stem.
+        ("src/app/Search.RS", &["app", "Search"]),
         ("src/lib.rs", &[]),
         ("src/main.rs", &["main"]),
         ("src/app/lib.rs", &["app", "lib"]),

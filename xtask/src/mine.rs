@@ -349,7 +349,8 @@ fn has_supported_extension(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
         name.rsplit_once('.'),
-        Some((stem, extension)) if !stem.is_empty() && SUPPORTED_EXTENSIONS.contains(&extension)
+        Some((stem, extension)) if !stem.is_empty()
+            && SUPPORTED_EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(extension))
     )
 }
 
@@ -2206,16 +2207,17 @@ mod tests {
             "src/e.hxx",
             "README.md",
             "docs/guide.md",
+            // The extension folds case, like the indexer (N94).
+            "README.MD",
+            "src/a.RS",
         ] {
             assert!(is_eligible_path(path), "{path}");
         }
         for path in [
-            "README.MD",
             "notes.markdown",
             "Cargo.toml",
             "Makefile",
             ".rs",
-            "src/a.RS",
             "src/a.rs.bak",
             "src/a.inl",
             "src/Vendor/a.rs.orig",

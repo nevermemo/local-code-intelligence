@@ -193,6 +193,10 @@ impl BundleStore {
     /// extracted again by that producer's next sync). Only files named as
     /// this store names bundles are touched, plus temporary files of writes
     /// that did not finish within [`STALE_TEMPORARY`] (a killed writer).
+    #[allow(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "`.tmp` is the exact suffix this store gives its own temporary files"
+    )]
     pub fn retain(&self, keep: &HashSet<BundleKey>) -> Result<usize> {
         let keep: HashSet<PathBuf> = keep.iter().map(|key| self.path_of(key)).collect();
         let shards = match std::fs::read_dir(&self.root) {
