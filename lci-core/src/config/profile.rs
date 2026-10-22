@@ -436,7 +436,10 @@ pub enum LspPlaces {
     /// workspace has at least one node, else [`Outline`](Self::Outline) (no
     /// index is read under `scip.mode = "off"`, or under `"cache"` with no
     /// file, and an index of a tree with no symbols has none either). Where an
-    /// index has nodes the walk is the `"scip"` walk, byte for byte.
+    /// index has nodes the walk is the `"scip"` walk, byte for byte. The
+    /// choice is per workspace, not per language: an index with nodes that
+    /// lacks a language of the tree still takes `Scip` places, so that
+    /// language gets no `lsp.live` cards; set `"outline"` for such a tree.
     #[default]
     Auto,
     /// The SCIP index's table alone: a symbol has a place only if the index

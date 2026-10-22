@@ -2702,7 +2702,8 @@ mod tests {
 
     #[test]
     fn arm_config_is_unchanged_for_rust() {
-        // The text of the `base` arm as written before `--adapter` existed.
+        // The text of the `base` arm as written before `--adapter` existed,
+        // plus the explicit `places = "scip"` since `auto` became the default.
         let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
         let expected = format!(
             "data_dir = '{}'\n{}",
@@ -2716,7 +2717,7 @@ mod tests {
                 "\n[index]\nfreshness = \"manual\"\n",
                 "\n[traverse]\nenabled = true\nscip_index = '@SCIP@'\ndeadline_ms = 20000\n",
                 "\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n",
-                "\n[run_profile.lsp]\nsessions = \"per_call\"\n",
+                "\n[run_profile.lsp]\nsessions = \"per_call\"\nplaces = \"scip\"\n",
             )
         )
         .replace("@SCIP@", &toml_path(&ctx.scip_index));
