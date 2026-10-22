@@ -417,6 +417,44 @@ fn a_probe_that_cannot_get_the_gate_in_its_budget_gives_up_instead_of_parking_a_
 }
 
 #[test]
+fn the_gate_wait_ends_when_the_holder_is_done() {
+    // The deadline is only the outer bound: the holder's release is what ends
+    // the wait. The barrier starts the waiter; the sleep counter says it is
+    // parked before the release, so the release has to wake it.
+    let gate = Arc::new(Gate::new());
+    let held = gate.acquire(Instant::now() + WAIT).expect("a free gate");
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let waiter = {
+        let (gate, barrier) = (gate.clone(), barrier.clone());
+        std::thread::spawn(move || {
+            barrier.wait();
+            gate.acquire(Instant::now() + Duration::from_secs(10))
+                .is_some()
+        })
+    };
+    barrier.wait();
+    while gate.sleeps.load(Ordering::SeqCst) == 0 {
+        std::thread::yield_now();
+    }
+    drop(held);
+    assert!(
+        waiter.join().unwrap(),
+        "the waiter did not get the gate after the holder dropped it"
+    );
+    assert_eq!(
+        gate.timeouts.load(Ordering::SeqCst),
+        0,
+        "the waiter woke on its deadline, not on the release"
+    );
+    // A gate the holder keeps gives up at the deadline, here already passed.
+    let again = gate
+        .acquire(Instant::now() + WAIT)
+        .expect("the gate is free again");
+    assert!(gate.acquire(Instant::now()).is_none());
+    drop(again);
+}
+
+#[test]
 fn nodes_the_graph_does_not_hold_and_other_kinds_have_no_edges() {
     let fixture = Fixture::new();
     let canned = Canned::new(|_| Vec::new());
@@ -587,7 +625,11 @@ fn cargo_gets_only_the_budget_the_gate_wait_left() {
     // hold starts only once the probe thread runs, and the 1 s margin covers a
     // loaded machine delaying the probe between that signal and its deadline.
     let budget = Duration::from_millis(5000);
-    let held = lock(&map.inner.gate);
+    let held = map
+        .inner
+        .gate
+        .acquire(Instant::now() + WAIT)
+        .expect("the gate is free");
     let (started, running) = std::sync::mpsc::channel();
     let probe = {
         let (map, helper) = (map.clone(), helper.clone());
