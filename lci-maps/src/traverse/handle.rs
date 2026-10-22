@@ -26,8 +26,8 @@
 //! the ranking and the early stop depend on is kept and checked: the
 //! corroboration boost ([`Snapshot::check_boost`]), the score bound's `k`
 //! ([`Snapshot::check_top_k`]), the hop priors, the tie-break file, the
-//! reranker; a caller refuses a handle whose setting it does not
-//! repeat. The
+//! reranker, the confirm frontier ([`Snapshot::check_confirm`]); a caller
+//! refuses a handle whose setting it does not repeat. The
 //! budget is absolute for the whole traversal (`pops`, `est_tokens`,
 //! `external_calls` and the reranker calls count from the first call), with a
 //! fresh deadline; what the outer agent raised stays with
@@ -47,7 +47,8 @@
 //!   store and a 65-character one does not.
 //! - Content: `VERSION` 10; another version, and a `bandit` key, are `Corrupt`.
 //!   Written only when not the default: `fusion` (`rrf`, `log_odds`), `grouping`, `priors`,
-//!   `tie_break` and `rerank_identity`, and per state `groups` and `reach`; under
+//!   `tie_break`, `rerank_identity` and `confirm` (the confirm frontier's `top_k`
+//!   and identity, with its `confirm_*` totals), and per state `groups` and `reach`; under
 //!   `card_paths` (the call's switch, [`Traversal::card_paths`]) `"card_paths": true`
 //!   and per state the `kind` of the edge that found it (not for a start node); an
 //!   absent key loads as the default, so older handles keep their text. Object
@@ -145,6 +146,14 @@ pub enum HandleError {
         found: String,
         expected: String,
     },
+    /// The handle was made with another confirm frontier setting than the
+    /// caller gives (see [`Snapshot::check_confirm`]); each side is the `top_k`
+    /// and the confirmer's identity, or `off`.
+    WrongConfirm {
+        handle: String,
+        found: String,
+        expected: String,
+    },
     /// The handle ranked with another corroboration boost than the caller
     /// gives (see [`Snapshot::check_boost`]).
     WrongBoost {
@@ -211,6 +220,16 @@ impl fmt::Display for HandleError {
                 "handle {handle} was made with the reranker frontier {found}, this call has \
                  {expected}; give the same rerank_frontier, rerank_floor, rerank_scores and \
                  reranker, or start a new traversal"
+            ),
+            Self::WrongConfirm {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} was made with the confirm frontier {found}, this call has \
+                 {expected}; give the same walk.confirm, top_k and maps (grep.live and lsp.live), \
+                 or start a new traversal"
             ),
             Self::WrongBoost {
                 handle,
@@ -308,6 +327,11 @@ pub struct Snapshot {
     /// The identity of the rescorer the first call ran with
     /// ([`identity`](super::rescore::FrontierRescorer::identity)); some exactly when `rerank_floor` is.
     pub rerank_identity: Option<String>,
+    /// The confirm frontier the first call ran with: its `top_k` and the
+    /// confirmer's [`identity`](super::confirm::FrontierConfirmer::identity)
+    /// (none: it was off). Written to the handle only when on; the caller
+    /// passes the confirmer again and checks it with [`Snapshot::check_confirm`].
+    pub confirm: Option<(usize, String)>,
     /// Whether the score bound could end the walk; a resume keeps it.
     pub score_bound: bool,
     /// The `k` of the score bound the first call ran with (0: it had none).
@@ -368,6 +392,32 @@ impl Snapshot {
             }
             if self.card_paths {
                 object.insert("card_paths".into(), json!(true));
+            }
+            // The confirm frontier's counters are written only with the
+            // setting, so a handle made without it is what it was.
+            if let Some((top_k, identity)) = &self.confirm {
+                object.insert(
+                    "confirm".into(),
+                    json!({"top_k": top_k, "identity": identity}),
+                );
+                if let Some(totals) = object.get_mut("totals").and_then(Value::as_object_mut) {
+                    totals.insert("confirm_calls".into(), json!(self.totals.confirm_calls));
+                    totals.insert(
+                        "confirm_proposals".into(),
+                        json!(self.totals.confirm_proposals),
+                    );
+                    totals.insert(
+                        "confirm_confirmed".into(),
+                        json!(self.totals.confirm_confirmed),
+                    );
+                    totals.insert("confirm_refuted".into(), json!(self.totals.confirm_refuted));
+                    totals.insert("confirm_unknown".into(), json!(self.totals.confirm_unknown));
+                    totals.insert("confirm_skipped".into(), json!(self.totals.confirm_skipped));
+                    totals.insert(
+                        "confirm_failures".into(),
+                        json!(self.totals.confirm_failures),
+                    );
+                }
             }
         }
         value
@@ -502,6 +552,31 @@ impl Snapshot {
             })
         };
         Err(HandleError::WrongRerank {
+            handle: self.handle(),
+            found: show(found),
+            expected: show(setting),
+        })
+    }
+
+    /// Refuses a snapshot made with another confirm frontier setting than
+    /// `setting`: the `top_k` and the confirmer's identity
+    /// ([`identity`](super::confirm::FrontierConfirmer::identity)) of the call
+    /// (none: the frontier is off). The confirmer itself is not in a handle,
+    /// so the caller checks what it passes.
+    pub fn check_confirm(&self, setting: Option<(usize, &str)>) -> Result<(), HandleError> {
+        let found = self
+            .confirm
+            .as_ref()
+            .map(|(top_k, identity)| (*top_k, identity.as_str()));
+        if found == setting {
+            return Ok(());
+        }
+        let show = |setting: Option<(usize, &str)>| {
+            setting.map_or("off".to_owned(), |(top_k, identity)| {
+                format!("on at top_k {top_k} with {identity:?}")
+            })
+        };
+        Err(HandleError::WrongConfirm {
             handle: self.handle(),
             found: show(found),
             expected: show(setting),
@@ -731,6 +806,13 @@ impl Snapshot {
         let totals = get(obj, "totals")?
             .as_object()
             .ok_or("totals is not an object")?;
+        // The confirm frontier's counters exist only in a handle made with it.
+        let confirm_total = |key: &str| -> Result<u32, String> {
+            match totals.get(key) {
+                None | Some(Value::Null) => Ok(0),
+                Some(v) => u32_of(v),
+            }
+        };
         Ok(Self {
             question: string_of(get(obj, "question")?)?,
             targets: array(obj, "targets")?
@@ -776,6 +858,13 @@ impl Snapshot {
                     .map(|(reason, n)| Ok((reason.parse::<RerankFailure>()?, u32_of(n)?)))
                     .collect::<Result<_, String>>()?,
                 rerank_skipped: u32_of(get(totals, "rerank_skipped")?)?,
+                confirm_calls: confirm_total("confirm_calls")?,
+                confirm_proposals: confirm_total("confirm_proposals")?,
+                confirm_confirmed: confirm_total("confirm_confirmed")?,
+                confirm_refuted: confirm_total("confirm_refuted")?,
+                confirm_unknown: confirm_total("confirm_unknown")?,
+                confirm_skipped: confirm_total("confirm_skipped")?,
+                confirm_failures: confirm_total("confirm_failures")?,
                 physical_map_calls: u32_of(get(totals, "physical_map_calls")?)?,
                 physical_external_calls: u32_of(get(totals, "physical_external_calls")?)?,
                 stops: u32_of(get(totals, "stops")?)?,
@@ -818,6 +907,13 @@ impl Snapshot {
             rerank_identity: match obj.get("rerank_identity") {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(string_of(v)?),
+            },
+            confirm: match obj.get("confirm") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let v = v.as_object().ok_or("confirm is not an object")?;
+                    Some((usize_of(get(v, "top_k")?)?, string_of(get(v, "identity")?)?))
+                }
             },
             score_bound: get(obj, "score_bound")?
                 .as_bool()
@@ -1173,6 +1269,11 @@ impl Run<'_> {
                 .rerank
                 .as_ref()
                 .map(|(rescorer, _)| rescorer.identity()),
+            confirm: self
+                .t
+                .confirm
+                .as_ref()
+                .map(|(confirmer, top_k)| (*top_k, confirmer.identity())),
             score_bound: self.t.score_bound,
             top_k: self.t.bound.map_or(0, |(k, _)| k),
             priors: self
@@ -1312,6 +1413,9 @@ impl Run<'_> {
         }
         if let (Some(floor), Some(object)) = (self.rerank_floor(), resume.as_object_mut()) {
             object.insert("rerank_floor".into(), json!(floor));
+        }
+        if let (Some((_, top_k)), Some(object)) = (&self.t.confirm, resume.as_object_mut()) {
+            object.insert("confirm".into(), json!({"top_k": top_k}));
         }
         if let (false, Some(object)) = (score_bound, resume.as_object_mut()) {
             object.insert("score_bound".into(), json!(false));
