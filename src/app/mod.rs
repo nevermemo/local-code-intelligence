@@ -105,7 +105,10 @@ pub struct App {
     /// every server under `sync = "watch"` (see [`Self::language_servers`]).
     analyzer: Arc<lsp::Manager>,
     /// Whether the first touch of a workspace warms its language servers
-    /// (see [`Self::warm_language_servers`]); fixed by the configuration.
+    /// (see [`Self::warm_language_servers`]); fixed by the configuration:
+    /// `shared` sessions with `[traverse] enabled` and `lsp.live` in the
+    /// default set (`[run_profile.lsp] live`, on by default) or named by a
+    /// policy.
     warm_on_touch: bool,
     /// The warm start of each workspace id touched so far, one per id.
     warm_starts: std::sync::Mutex<WarmStarts>,
@@ -130,13 +133,14 @@ impl App {
         let profile_hash = config.run_profile().hash;
         let warm_on_touch = config.run_profile.lsp.sessions == crate::config::LspSessions::Shared
             && config.traverse.enabled
-            && config.traverse.policies.values().any(|policy| {
-                policy
-                    .extra_maps
-                    .iter()
-                    .flatten()
-                    .any(|map| map.trim() == lci_maps::lsp_live::LSP_LIVE_ID)
-            });
+            && (config.run_profile.lsp.live
+                || config.traverse.policies.values().any(|policy| {
+                    policy
+                        .extra_maps
+                        .iter()
+                        .flatten()
+                        .any(|map| map.trim() == lci_maps::lsp_live::LSP_LIVE_ID)
+                }));
         Ok(Self {
             config,
             profile_hash,
@@ -225,7 +229,8 @@ impl App {
     /// servers of every enabled adapter (see [`lsp::Manager::prime`]) so the
     /// first `lsp.live` walk finds them started instead of paying the start.
     /// Returns at once; no request waits for the warm-up. Only when
-    /// `[run_profile.lsp] sessions = "shared"` (the default) and a
+    /// `[run_profile.lsp] sessions = "shared"` (the default) and `lsp.live` in the
+    /// default map set (`[run_profile.lsp] live`, on by default) or a
     /// `[traverse.policies.*]` `extra_maps` names `lsp.live` (under `per_call`
     /// nothing starts), and once per workspace and process. Only the servers a
     /// walk would share start: those that see an edit on their own

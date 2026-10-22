@@ -1381,7 +1381,8 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
 /// `call_hierarchy`) reach the recipes' walk (the profile is the one they run
 /// under) and change nothing there: the walk has no `lsp.live`, the only map
 /// that asks for implementations or the call hierarchy, so the stamped profile
-/// hash stays true for a recipe whichever way a key is set.
+/// hash stays true for a recipe whichever way a key is set. `breaker` and
+/// `live` default to on, so their profiles here switch them off.
 #[tokio::test]
 async fn flow_from_runs_the_same_with_the_lsp_request_switches_on() {
     assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
@@ -1397,7 +1398,11 @@ async fn flow_from_runs_the_same_with_the_lsp_request_switches_on() {
             ..lci_core::config::LspProfile::default()
         },
         lci_core::config::LspProfile {
-            breaker: true,
+            breaker: false,
+            ..lci_core::config::LspProfile::default()
+        },
+        lci_core::config::LspProfile {
+            live: false,
             ..lci_core::config::LspProfile::default()
         },
     ];

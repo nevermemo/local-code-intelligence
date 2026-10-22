@@ -304,14 +304,14 @@ pub(super) async fn load_with(
     if mode == ScipMode::Off {
         return Ok(Arc::new(Loaded::empty(
             mode,
-            "graph.scip: empty (scip.mode = off): the SCIP-built maps (structure.contains, seeds.bm25, scip.impact, scip.implements, tests.tested_by, config.key, exact.closure) have nothing to read; grep.live places its results by file only (no SCIP spans); lsp.live places nodes only with [run_profile.lsp] places = outline (the index has none)".to_owned(),
+            "graph.scip: empty (scip.mode = off): the SCIP-built maps (structure.contains, seeds.bm25, scip.impact, scip.implements, tests.tested_by, config.key, exact.closure) have nothing to read; grep.live places its results by file only (no SCIP spans); lsp.live places nodes from the server's own outline unless [run_profile.lsp] places = scip (the index has none)".to_owned(),
         )));
     }
     let none_read = |why: &str| {
         Arc::new(Loaded::empty(
             mode,
             format!(
-                "graph.scip: no SCIP index read at {} (scip.mode = cache): the SCIP-built maps (seeds.bm25 among them) are empty; grep.live places its results by file only (no SCIP spans); lsp.live places nodes only with [run_profile.lsp] places = outline (the index has none){why}",
+                "graph.scip: no SCIP index read at {} (scip.mode = cache): the SCIP-built maps (seeds.bm25 among them) are empty; grep.live places its results by file only (no SCIP spans); lsp.live places nodes from the server's own outline unless [run_profile.lsp] places = scip (the index has none){why}",
                 index.display()
             ),
         ))
