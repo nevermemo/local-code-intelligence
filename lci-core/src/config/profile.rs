@@ -38,6 +38,24 @@ pub struct RunProfileConfig {
     pub freshness: RunProfileFreshness,
     /// `[run_profile.seeds]`: where a traversal's starting nodes come from.
     pub seeds: RunProfileSeeds,
+    /// `[run_profile.grep]`: switches of the grep-style maps.
+    pub grep: RunProfileGrep,
+}
+
+/// `[run_profile.grep]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileGrep {
+    /// Let the opt-in map `grep.structural` run. `false` (the default): naming
+    /// it gives a note and no edges, ripgrep is not started for it, it is not
+    /// in the default map set, and every answer is as without the key. `true`:
+    /// the map is in the default set of a call that has a tree root and names
+    /// no maps, and it runs when named. From a symbol it finds the files that
+    /// hold the name as a whole word with ripgrep, parses each with the
+    /// chunker's tree-sitter grammar and keeps the occurrences in a header
+    /// (`impl .. for ..`, `extends`, `implements`) or a call, by an ast-grep
+    /// pattern; a name in a comment or a string gives no edge.
+    pub structural: bool,
 }
 
 /// `[run_profile.seeds]`.
@@ -796,6 +814,7 @@ mod tests {
         config.run_profile.lsp.call_hierarchy = true;
         config.run_profile.seeds.bm25 = true;
         config.run_profile.seeds.literal = true;
+        config.run_profile.grep.structural = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config.run_profile.lsp.places = LspPlaces::Outline;
         config
@@ -1063,6 +1082,49 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn grep_structural_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.grep.structural);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.grep]\nstructural = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.grep.structural);
+        assert!(!on.run_profile.seeds.bm25 && !on.run_profile.seeds.literal);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["grep"]["structural"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["grep"]["structural"], false);
+        assert_eq!(on.value["run_profile"]["grep"]["structural"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.grep.structural")
+        );
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.grep]\nstructural = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.grep]\nstructural = \"yes\"\n",
+            "[run_profile.grep]\nstructural = 1\n",
+            "[run_profile.grep]\nfoo = 1\n",
+            "[run_profile]\nstructural = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn seeds_literal_is_off_by_default_and_is_part_of_the_profile() {
         let off = Config::default();
         assert!(!off.run_profile.seeds.literal);
@@ -1224,6 +1286,7 @@ mode = \"sometimes\"
             "run_profile.lsp.call_hierarchy",
             "run_profile.seeds.bm25",
             "run_profile.seeds.literal",
+            "run_profile.grep.structural",
             "run_profile.lsp.sync",
             "run_profile.lsp.places",
             "run_profile.lsp.breaker",
