@@ -292,3 +292,131 @@ async fn a_server_that_never_publishes_costs_each_open_at_most_the_cap() {
     .await
     .expect("within the outer bound");
 }
+
+/// A changed text is sent as `didChange` (the documents fake advertises full
+/// sync) and the hook waits for the publication of the change like it does
+/// for an open: the second request's `definition` is read after the
+/// publication for version 2, and no wait runs out. Fails without the fake's
+/// publication on `didChange` (the wait runs to its 3 s cap and the counter
+/// reads 1) and without the wait (`request_during_pending_diagnostics.txt`
+/// reads 1).
+#[tokio::test]
+async fn a_did_change_waits_for_the_servers_diagnostics_like_an_open() {
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let state = temp.path().join("state");
+        write(
+            &root,
+            "src/Calculator.cs",
+            "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; }\n",
+        );
+        let file = root.join("src/CallSite.cs");
+        write(
+            &root,
+            "src/CallSite.cs",
+            "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\n",
+        );
+        let args = [
+            "--mode",
+            "documents",
+            "--diagnostics-delay-ms",
+            "300",
+            "--text-document-sync",
+            "1",
+            "--state",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([state.to_string_lossy().into_owned()])
+        .collect();
+        let transport = TransportConfig {
+            executable: env!("CARGO_BIN_EXE_fake-lsp-server").to_owned(),
+            args,
+            working_dir: temp.path().to_owned(),
+            timeout: LOADED_BUDGET,
+            label: "fake".to_owned(),
+        };
+        let client = JsonRpcClient::spawn(&transport, &[], Box::new(|_| false))
+            .await
+            .unwrap();
+        let initialized = client
+            .request(
+                "initialize",
+                json!({
+                    "rootUri": reqwest::Url::from_directory_path(&root).unwrap().to_string(),
+                    "capabilities": {},
+                }),
+            )
+            .await
+            .unwrap();
+        client.notify("initialized", json!({})).await.unwrap();
+        let adapter = PythonServer::new(
+            &PythonLspConfig {
+                path: Some(transport.executable.clone()),
+                args: Vec::new(),
+                disabled: false,
+            },
+            LOADED_BUDGET,
+        );
+        // What the session builds from the server's `initialize` result.
+        let sync = local_code_intelligence::lsp::change_sync_of(&initialized);
+        assert_eq!(sync, local_code_intelligence::lsp::ChangeSync::Full);
+        let sent = SentTexts::with_sync(sync);
+
+        for (index, edit) in [false, true].into_iter().enumerate() {
+            if edit {
+                write(
+                    &root,
+                    "src/CallSite.cs",
+                    "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\n// edited\n",
+                );
+            }
+            adapter
+                .before_position_request(&client, &sent, &file, "src/CallSite.cs")
+                .await
+                .unwrap();
+            client
+                .request("textDocument/definition", definition_at(&file))
+                .await
+                .unwrap();
+            assert_eq!(
+                events(&state, "diagnostics_sent.txt"),
+                index + 1,
+                "request {index}: it waited for the publication of its own send"
+            );
+            assert_eq!(
+                events(&state, "request_during_pending_diagnostics.txt"),
+                0,
+                "request {index}: a definition reached the server before the publication"
+            );
+            assert_eq!(client.diagnostics_wait_timeouts(), 0, "request {index}");
+        }
+        let events = std::fs::read_to_string(state.join("events.jsonl")).unwrap();
+        let sends: Vec<(String, i64)> = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| {
+                matches!(
+                    event["method"].as_str(),
+                    Some("textDocument/didOpen" | "textDocument/didChange")
+                )
+            })
+            .map(|event| {
+                (
+                    event["method"].as_str().unwrap().to_owned(),
+                    event["version"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sends,
+            [
+                ("textDocument/didOpen".to_owned(), 1),
+                ("textDocument/didChange".to_owned(), 2)
+            ]
+        );
+    })
+    .await
+    .expect("within the outer bound");
+}

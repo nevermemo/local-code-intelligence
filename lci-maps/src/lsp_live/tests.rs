@@ -101,6 +101,8 @@ fn table() -> Arc<Table> {
 #[derive(Default)]
 struct Fake {
     definitions: HashMap<Place, Vec<Place>>,
+    /// Every definition request at one of these places fails.
+    definition_errors: HashSet<Place>,
     references: HashMap<Place, Vec<Place>>,
     implementations: HashMap<Place, Vec<Place>>,
     /// `Some`: every implementation request fails with this text.
@@ -181,7 +183,11 @@ impl Drop for SetOnDrop {
 #[crate::async_trait]
 impl LspBackend for Fake {
     async fn definition(&self, at: &Place) -> Result<Vec<Place>, String> {
-        self.answer(self.definitions.get(at)).await
+        let answer = self.answer(self.definitions.get(at)).await;
+        if self.definition_errors.contains(at) {
+            return Err("textDocument/definition failed".into());
+        }
+        answer
     }
 
     async fn references(&self, at: &Place) -> Result<Vec<Place>, String> {
@@ -1337,5 +1343,142 @@ fn rust_members_take_the_declarations_ids() {
     assert_eq!(
         bare.defined_at(&place(path, 7, 3)),
         Some(minted("mycrate-x", "free", SymbolKind::Function, 0))
+    );
+}
+
+// ---- K26: the confirmer of the confirm frontier --------------------------------
+
+fn proposal(src: &str, path: &str, line: u32) -> Proposal {
+    Proposal {
+        src: sym(src),
+        dst: file("src/x.rs"),
+        site: Site {
+            path: path.into(),
+            blob: String::new(),
+            line,
+            col: 4,
+        },
+    }
+}
+
+#[tokio::test]
+async fn the_lsp_confirmer_confirms_a_site_whose_definition_is_the_source_symbol() {
+    let at = |path: &str, line: u32| place(path, line, 4);
+    let backend = Fake {
+        definitions: HashMap::from([
+            // Defined at `a` itself.
+            (at("src/m.rs", 20), vec![place("src/a.rs", 1, 3)]),
+            // Defined at `b`: another symbol.
+            (at("src/n.rs", 21), vec![place("src/b.rs", 10, 3)]),
+            // Inside the lines of `a`, where no name is: the enclosing symbol.
+            (at("src/o.rs", 23), vec![place("src/a.rs", 2, 0)]),
+            // Two answers, one of them `a`.
+            (
+                at("src/p.rs", 24),
+                vec![place("src/b.rs", 10, 3), place("src/a.rs", 1, 3)],
+            ),
+        ]),
+        definition_errors: HashSet::from([at("src/q.rs", 22)]),
+        ..Fake::default()
+    };
+    let requests = backend.requests.clone();
+    let map = Arc::new(map_over(backend));
+    let confirmer = map.confirmer();
+    assert_eq!(confirmer.identity(), "lsp.live definition");
+
+    let proposals = vec![
+        proposal("a", "src/m.rs", 20),
+        proposal("a", "src/n.rs", 21),
+        // A server error is not an answer.
+        proposal("a", "src/q.rs", 22),
+        proposal("a", "src/o.rs", 23),
+        proposal("a", "src/p.rs", 24),
+        // The server knows nothing at this place.
+        proposal("a", "src/r.rs", 25),
+    ];
+    let answer = confirmer.confirm(&proposals, 100).await.unwrap();
+    assert_eq!(
+        answer.verdicts,
+        vec![
+            Verdict::Confirmed,
+            Verdict::Refuted,
+            Verdict::Unknown,
+            Verdict::Confirmed,
+            Verdict::Confirmed,
+            Verdict::Unknown,
+        ]
+    );
+    // One request per proposal, and the call says so.
+    assert_eq!(requests.load(Ordering::SeqCst), 6);
+    assert_eq!(answer.calls, 6);
+
+    // The allowance stops the call: the rest are not asked.
+    let capped = confirmer.confirm(&proposals, 2).await.unwrap();
+    assert_eq!(
+        capped.verdicts,
+        vec![
+            Verdict::Confirmed,
+            Verdict::Refuted,
+            Verdict::Unknown,
+            Verdict::Unknown,
+            Verdict::Unknown,
+            Verdict::Unknown,
+        ]
+    );
+    assert_eq!(capped.calls, 2);
+    assert_eq!(requests.load(Ordering::SeqCst), 8);
+    let none = confirmer.confirm(&proposals, 0).await.unwrap();
+    assert_eq!((none.calls, none.verdicts.len()), (0, 6));
+    assert!(none.verdicts.iter().all(|v| *v == Verdict::Unknown));
+    assert_eq!(requests.load(Ordering::SeqCst), 8);
+    // A confirmer failure is not a failure of the map's expansions.
+    assert_eq!(map.last_error(), None);
+}
+
+#[tokio::test]
+async fn an_answer_only_the_file_holds_is_unknown_not_refuted() {
+    // `src/z.rs` is not in the table: no symbol is defined at or around its
+    // places (an import or re-export line, a symbol the index lacks).
+    let at = |path: &str, line: u32| place(path, line, 4);
+    let in_z = place("src/z.rs", 3, 0);
+    let in_a = place("src/a.rs", 1, 3);
+    let in_b = place("src/b.rs", 10, 3);
+    let backend = Fake {
+        definitions: HashMap::from([
+            (at("src/m.rs", 1), vec![in_z.clone()]),
+            (at("src/m.rs", 2), vec![in_z.clone(), in_b.clone()]),
+            (at("src/m.rs", 3), vec![in_z.clone(), in_a]),
+            (at("src/m.rs", 4), vec![in_b]),
+        ]),
+        ..Fake::default()
+    };
+    let map = Arc::new(map_over(backend));
+    let confirmer = map.confirmer();
+    let ask = |src: NodeId, line: u32| Proposal {
+        src,
+        ..proposal("a", "src/m.rs", line)
+    };
+    let proposals = vec![
+        // Only the file holds the answer: unknown, not a refutation.
+        ask(sym("a"), 1),
+        // The file and another symbol: the other symbol refutes.
+        ask(sym("a"), 2),
+        // The file and the source symbol: confirmed.
+        ask(sym("a"), 3),
+        // The source is the file itself: its own place confirms, a place of
+        // another symbol refutes.
+        ask(file("src/z.rs"), 1),
+        ask(file("src/z.rs"), 4),
+    ];
+    let answer = confirmer.confirm(&proposals, 100).await.unwrap();
+    assert_eq!(
+        answer.verdicts,
+        vec![
+            Verdict::Unknown,
+            Verdict::Refuted,
+            Verdict::Confirmed,
+            Verdict::Confirmed,
+            Verdict::Refuted,
+        ]
     );
 }

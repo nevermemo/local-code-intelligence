@@ -144,7 +144,8 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   enabled, configured adapter lists; built from the manager's memory, it starts no server. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
   `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the
   manager an outline cache, used only for adapters whose `LspAdapter::opens_documents()` is true (pyright, gopls,
-  jdtls, clangd, marksman: the hook resends the disk text and the server takes it): `Manager::document_symbols` keys each
+  jdtls, clangd, typescript-language-server, marksman: the hook sends a changed disk text, as a `didChange` with the whole
+  text when the session read change sync (`ChangeSync`, from `textDocumentSync` in the `initialize` result) from the server and as a second `didOpen` otherwise, and the server takes it; the wait for the `publishDiagnostics` of the send is kept in `SentTexts` until a hook has finished it, so a cancelled hook leaves it to the next caller of the file; `SentTexts` holds at most `MAX_OPEN_DOCUMENTS` = 64 files per session and closes the least recently used one that has no open in flight before a new file is opened): `Manager::document_symbols` keys each
   non-empty answer by (provider, workspace id, path),
   `lsp::content_hash` of the file (`workspace::hash`, as the manifest) and the id of the server session that gave it,
   at most `MAX_CACHED_OUTLINES` (4096) entries. With `[run_profile.lsp] implementations = true`
