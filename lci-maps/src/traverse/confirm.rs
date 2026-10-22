@@ -11,14 +11,19 @@
 //! confirmer answers one [`Verdict`] per proposal:
 //!
 //! * [`Verdict::Confirmed`]: the hop keeps its value; it is relabelled as a
-//!   server answer (witness [`WitnessClass::Lsp`], confidence at least
-//!   [`CONFIRMED_CONF`]), so later corroboration and the labels of an answer
-//!   read it as one ([`relabel`]).
-//! * [`Verdict::Refuted`]: the server resolved the name to another node. The
+//!   server answer ([`relabel`]): the best edge's witness and the offer of
+//!   `grep.live` become [`WitnessClass::Lsp`], the witness list gains it, and
+//!   the confidences are at least [`CONFIRMED_CONF`]. What it does not change:
+//!   the edge's `claims`, so the corroboration grouping (`add_groups` decides
+//!   a text group from the claims) still sees a `mentions` claim, and the
+//!   fusion and the hop value, which are computed before this hook runs.
+//! * [`Verdict::Refuted`]: the server resolved the name to another symbol. The
 //!   hop is dropped: not a hop, not a route. Its arrival still corroborates at
 //!   0 when the node has a state, as an arrival outside the beam does.
-//! * [`Verdict::Unknown`]: no answer, an error, the deadline or the call cap.
-//!   The hop is unchanged (fail-open).
+//! * [`Verdict::Unknown`]: no answer, an error, the deadline or the call cap,
+//!   or an answer the node table cannot name (only a file holds the place: an
+//!   import or re-export line, a symbol the index lacks). The hop is unchanged
+//!   (fail-open).
 //!
 //! Each proposal is at most one external call. The call is given the pop's
 //! remaining `max_external_calls` ([`FrontierConfirmer::confirm`]), what it

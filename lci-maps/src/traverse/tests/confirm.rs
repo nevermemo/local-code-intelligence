@@ -276,13 +276,18 @@ async fn an_unknown_verdict_and_a_failed_call_leave_the_hop_as_it_was() {
             result.warnings
         );
     }
+}
 
-    // A confirmer that never answers is cut at the walk's deadline: the hops
-    // are as they were and the cut is no failure of the confirmer.
+/// A confirmer that never answers is cut at the walk's deadline: the hops are
+/// as they were and the cut is no failure of the confirmer. The tokio clock is
+/// paused, so the cut comes as soon as the runtime is idle, whatever the load
+/// of the machine; the walk's own deadline (a real clock, 60 s here) is never
+/// near, so nothing else ends the walk first.
+#[tokio::test(start_paused = true)]
+async fn a_confirmer_the_deadline_cuts_changes_nothing() {
+    let reg = registry(vec![grep(&[("s", "a"), ("s", "b")])]);
     let stub = Stub::all(Verdict::Refuted).replying(Reply::Hang);
-    let mut limits = budget(20);
-    limits.deadline = Instant::now() + Duration::from_millis(100);
-    let hung = walk_with(&reg, seeds(), limits, Some((&stub, 5))).await;
+    let hung = walk_with(&reg, vec![seed("s")], budget(20), Some((&stub, 5))).await;
     assert!(hung.reached(&node("a")) && hung.reached(&node("b")));
     assert_eq!(hung.totals.confirm_failures, 0);
     assert_eq!(hung.totals.confirm_refuted, 0);

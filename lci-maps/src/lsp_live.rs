@@ -1023,12 +1023,42 @@ impl LspLive {
             map: Arc::clone(self),
         })
     }
+
+    /// What the answered `places` of a definition request say about `src`:
+    /// confirmed when one of them is held by `src` (the symbol defined there,
+    /// else the one whose definition holds its line; the file, when `src` is
+    /// a file); refuted when one is held by another symbol; otherwise (every
+    /// place is held only by its file: the node table cannot name a symbol
+    /// there) unknown, since an import or re-export line, a symbol the index
+    /// lacks or another id scheme would otherwise refute a true reference.
+    fn verdict(&self, src: &NodeId, places: &[Place]) -> Verdict {
+        let mut other_symbol = false;
+        for place in places {
+            let symbol = self
+                .places
+                .defined_at(place)
+                .or_else(|| self.places.enclosing(&place.path, place.line));
+            match symbol {
+                Some(symbol) if symbol == *src => return Verdict::Confirmed,
+                Some(_) => other_symbol = true,
+                None => {
+                    if NodeId::file(&place.path).is_ok_and(|file| file == *src) {
+                        return Verdict::Confirmed;
+                    }
+                }
+            }
+        }
+        if other_symbol {
+            Verdict::Refuted
+        } else {
+            Verdict::Unknown
+        }
+    }
 }
 
-/// [`LspLive::confirmer`]: an answered place that holds the proposal's `src`
-/// (the symbol defined there, else the one whose definition holds its line,
-/// else the file) confirms it; answers that all name something else refute
-/// it; no answer or an error is unknown.
+/// The confirmer of [`LspLive::confirmer`]: an answered place held by the
+/// proposal's `src` confirms it, one held by another symbol refutes it, and
+/// no answer, an error or an answer only a file holds is unknown.
 struct LspConfirmer {
     map: Arc<LspLive>,
 }
@@ -1056,16 +1086,7 @@ impl FrontierConfirmer for LspConfirmer {
             };
             verdicts.push(match self.map.backend.definition(&at).await {
                 Ok(places) if places.is_empty() => Verdict::Unknown,
-                Ok(places) => {
-                    let holds_src = places
-                        .iter()
-                        .any(|place| self.map.holder(place, true).as_ref() == Some(&proposal.src));
-                    if holds_src {
-                        Verdict::Confirmed
-                    } else {
-                        Verdict::Refuted
-                    }
-                }
+                Ok(places) => self.map.verdict(&proposal.src, &places),
                 // The map's own `last_error` is left alone: it reports the
                 // expansions, and a hop that stays as it was needs no note.
                 Err(_) => Verdict::Unknown,
