@@ -2,7 +2,13 @@
 //! call can use, and the helpers the map registration shares (K39a; History:
 //! the registry of `run_with_trait_seeds` in `mod.rs`).
 
-use super::first_stage::{EXACT_CLOSURE_ID, EXACT_PICKAXE_ID};
+use super::{
+    Call,
+    first_stage::{EXACT_CLOSURE_ID, EXACT_PICKAXE_ID},
+};
+use crate::config::{LspSessions, RunProfileConfig};
+use anyhow::{Result, anyhow, bail};
+use lci_core::config::TraversePolicy;
 use lci_maps::{
     MapId,
     config_key::CONFIG_KEY_MAP_ID,
@@ -122,4 +128,168 @@ pub(super) fn warn_probe_compile_once() {
             "probe.compile runs cargo check on a scratch copy of the tree: build scripts and procedural macros execute (rust_analyzer_trusted = true)"
         );
     });
+}
+
+/// What a call wants of the registry: the maps (`wanted`, in the order the
+/// registry registers them) and the notes the choice gives (the `[run_profile]`
+/// off notes in the order bm25, literal, repo_map, structural, then the
+/// policy's maps left out for want of a tree).
+pub(super) struct Selection {
+    pub wanted: Vec<MapId>,
+    pub notes: Vec<String>,
+}
+
+impl Selection {
+    /// Whether the call wants the map.
+    pub(super) fn wants(&self, id: MapId) -> bool {
+        self.wanted.contains(&id)
+    }
+}
+
+/// Chooses the maps of a call: the named ones, or the defaults plus the
+/// opt-in maps the run profile and the call's tree and manager switch on. The
+/// errors are the caller's mistakes (an unknown map, a map that needs the tree
+/// without one). `policy` and `preset` are what `presets::policy_for` and
+/// `presets::resolve` made of the call's steering.
+pub(super) fn select(
+    call: &Call<'_>,
+    profile: &RunProfileConfig,
+    policy: &TraversePolicy,
+    preset: Option<&str>,
+) -> Result<Selection> {
+    let mut bm25_off_note: Option<String> = None;
+    let mut literal_off_note: Option<String> = None;
+    let mut repo_map_off_note: Option<String> = None;
+    let mut structural_off_note: Option<String> = None;
+    let known_map = |id: &str| {
+        MAPS.iter()
+            .chain(&OPT_IN_MAPS)
+            .copied()
+            .find(|known| *known == id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown map {id:?}; the maps are {}, and, only when named, {}",
+                    MAPS.join(", "),
+                    OPT_IN_MAPS.join(", ")
+                )
+            })
+    };
+    // Extra maps named by the policy that this call cannot run (no tree).
+    let mut skipped_maps: Vec<String> = Vec::new();
+    let wanted: Vec<MapId> = match call.maps {
+        None => {
+            let mut ids = MAPS.to_vec();
+            // The policy's extra maps read the tree.
+            if call.scip_root.is_some() {
+                for name in policy.extra_maps.iter().flatten() {
+                    let id = known_map(name).map_err(|e| {
+                        anyhow!("policy {}: extra_maps: {e}", preset.unwrap_or_default())
+                    })?;
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            } else {
+                skipped_maps = policy.extra_maps.iter().flatten().cloned().collect();
+            }
+            ids
+        }
+        Some(ids) => ids.iter().map(|id| known_map(id)).collect::<Result<_>>()?,
+    };
+    let mut wanted = wanted;
+    // `[run_profile.lsp] live`: `lsp.live` joins the default set of a call
+    // that has a tree and a manager that outlives it. The CLI one-shot and
+    // `sessions = "per_call"` are left out (a server that dies with the call
+    // cannot amortise its start, d438); a missing or dead server is a note and
+    // an unavailable map below, never an error.
+    if profile.lsp.live
+        && call.maps.is_none()
+        && call.scip_root.is_some()
+        && profile.lsp.sessions == LspSessions::Shared
+        && call.lsp_sessions.is_some()
+        && !wanted.contains(&LSP_LIVE_ID)
+    {
+        wanted.push(LSP_LIVE_ID);
+    }
+    // `[run_profile.seeds] bm25`: the map is in the default set only when the
+    // key is on; with it off a call that names the map gets a note and the
+    // map is not part of the call (nothing registers, nothing seeds).
+    if profile.seeds.bm25 {
+        if call.maps.is_none() && !wanted.contains(&SEEDS_BM25) {
+            wanted.push(SEEDS_BM25);
+        }
+    } else if wanted.contains(&SEEDS_BM25) {
+        wanted.retain(|id| *id != SEEDS_BM25);
+        if call.maps.is_some() {
+            bm25_off_note = Some(
+                "seeds.bm25 is off ([run_profile.seeds] bm25 = false): the map gives no start nodes"
+                    .to_owned(),
+            );
+        }
+    }
+    // `[run_profile.seeds] literal`: the same for `seeds.literal`.
+    if profile.seeds.literal {
+        if call.maps.is_none() && !wanted.contains(&SEEDS_LITERAL) {
+            wanted.push(SEEDS_LITERAL);
+        }
+    } else if wanted.contains(&SEEDS_LITERAL) {
+        wanted.retain(|id| *id != SEEDS_LITERAL);
+        if call.maps.is_some() {
+            literal_off_note = Some(
+                "seeds.literal is off ([run_profile.seeds] literal = false): the map gives no start nodes"
+                    .to_owned(),
+            );
+        }
+    }
+    // `[run_profile.seeds] repo_map`: the same for `seeds.repo_map`.
+    if profile.seeds.repo_map {
+        if call.maps.is_none() && !wanted.contains(&SEEDS_REPO_MAP) {
+            wanted.push(SEEDS_REPO_MAP);
+        }
+    } else if wanted.contains(&SEEDS_REPO_MAP) {
+        wanted.retain(|id| *id != SEEDS_REPO_MAP);
+        if call.maps.is_some() {
+            repo_map_off_note = Some(
+                "seeds.repo_map is off ([run_profile.seeds] repo_map = false): the map gives no start nodes"
+                    .to_owned(),
+            );
+        }
+    }
+    // `[run_profile.grep] structural`: the same for `grep.structural`, which
+    // reads the tree, so a call joins it to the default set only with a root.
+    if profile.grep.structural {
+        if call.maps.is_none() && call.scip_root.is_some() && !wanted.contains(&STRUCTURAL_ID) {
+            wanted.push(STRUCTURAL_ID);
+        }
+    } else if wanted.contains(&STRUCTURAL_ID) {
+        wanted.retain(|id| *id != STRUCTURAL_ID);
+        if call.maps.is_some() {
+            structural_off_note = Some(
+                "grep.structural is off ([run_profile.grep] structural = false): the map gives no edges"
+                    .to_owned(),
+            );
+        }
+    }
+    // `seeds.bm25` and `seeds.repo_map` read the SCIP graph only, not the
+    // tree; `seeds.literal` searches the tree through the application's search
+    // and says so when the call has none.
+    if wanted.iter().any(|id| {
+        ![SEEDS_BM25, SEEDS_REPO_MAP, SEEDS_LITERAL].contains(id) && OPT_IN_MAPS.contains(id)
+    }) && call.scip_root.is_none()
+    {
+        bail!("the maps named beyond the defaults read the tree: give its root");
+    }
+    let mut notes = Vec::new();
+    notes.extend(bm25_off_note);
+    notes.extend(literal_off_note);
+    notes.extend(repo_map_off_note);
+    notes.extend(structural_off_note);
+    if !skipped_maps.is_empty() {
+        notes.push(format!(
+            "policy {}: the maps {} read the tree and were left out: give --root (or the workspace) to run them as measured",
+            preset.unwrap_or_default(),
+            skipped_maps.join(", ")
+        ));
+    }
+    Ok(Selection { wanted, notes })
 }

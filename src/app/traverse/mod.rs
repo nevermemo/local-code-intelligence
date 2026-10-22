@@ -574,126 +574,11 @@ pub async fn run_with_trait_seeds(
     if call.top_k == 0 || call.top_k > MAX_TOP_K {
         bail!("top_k must be 1 through {MAX_TOP_K}");
     }
-    let mut bm25_off_note: Option<String> = None;
-    let mut literal_off_note: Option<String> = None;
-    let mut repo_map_off_note: Option<String> = None;
-    let mut structural_off_note: Option<String> = None;
-    let known_map = |id: &str| {
-        MAPS.iter()
-            .chain(&OPT_IN_MAPS)
-            .copied()
-            .find(|known| *known == id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "unknown map {id:?}; the maps are {}, and, only when named, {}",
-                    MAPS.join(", "),
-                    OPT_IN_MAPS.join(", ")
-                )
-            })
-    };
     // The call's question type (its steering policy) sets the measured
     // first-stage and walk defaults; a call without a named policy sets none.
     let (steer, preset) = presets::resolve(call.steer)?;
     let policy = presets::policy_for(limits, preset.as_deref())?;
-    // Extra maps named by the policy that this call cannot run (no tree).
-    let mut skipped_maps: Vec<String> = Vec::new();
-    let wanted: Vec<MapId> = match call.maps {
-        None => {
-            let mut ids = MAPS.to_vec();
-            // The policy's extra maps read the tree.
-            if call.scip_root.is_some() {
-                for name in policy.extra_maps.iter().flatten() {
-                    let id = known_map(name).map_err(|e| {
-                        anyhow!(
-                            "policy {}: extra_maps: {e}",
-                            preset.as_deref().unwrap_or_default()
-                        )
-                    })?;
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
-            } else {
-                skipped_maps = policy.extra_maps.iter().flatten().cloned().collect();
-            }
-            ids
-        }
-        Some(ids) => ids.iter().map(|id| known_map(id)).collect::<Result<_>>()?,
-    };
-    let mut wanted = wanted;
-    // `[run_profile.lsp] live`: `lsp.live` joins the default set of a call
-    // that has a tree and a manager that outlives it. The CLI one-shot and
-    // `sessions = "per_call"` are left out (a server that dies with the call
-    // cannot amortise its start, d438); a missing or dead server is a note and
-    // an unavailable map below, never an error.
-    if profile.lsp.live
-        && call.maps.is_none()
-        && call.scip_root.is_some()
-        && profile.lsp.sessions == LspSessions::Shared
-        && call.lsp_sessions.is_some()
-        && !wanted.contains(&LSP_LIVE_ID)
-    {
-        wanted.push(LSP_LIVE_ID);
-    }
-    // `[run_profile.seeds] bm25`: the map is in the default set only when the
-    // key is on; with it off a call that names the map gets a note and the
-    // map is not part of the call (nothing registers, nothing seeds).
-    if profile.seeds.bm25 {
-        if call.maps.is_none() && !wanted.contains(&SEEDS_BM25) {
-            wanted.push(SEEDS_BM25);
-        }
-    } else if wanted.contains(&SEEDS_BM25) {
-        wanted.retain(|id| *id != SEEDS_BM25);
-        if call.maps.is_some() {
-            bm25_off_note = Some(
-                "seeds.bm25 is off ([run_profile.seeds] bm25 = false): the map gives no start nodes"
-                    .to_owned(),
-            );
-        }
-    }
-    // `[run_profile.seeds] literal`: the same for `seeds.literal`.
-    if profile.seeds.literal {
-        if call.maps.is_none() && !wanted.contains(&SEEDS_LITERAL) {
-            wanted.push(SEEDS_LITERAL);
-        }
-    } else if wanted.contains(&SEEDS_LITERAL) {
-        wanted.retain(|id| *id != SEEDS_LITERAL);
-        if call.maps.is_some() {
-            literal_off_note = Some(
-                "seeds.literal is off ([run_profile.seeds] literal = false): the map gives no start nodes"
-                    .to_owned(),
-            );
-        }
-    }
-    // `[run_profile.seeds] repo_map`: the same for `seeds.repo_map`.
-    if profile.seeds.repo_map {
-        if call.maps.is_none() && !wanted.contains(&SEEDS_REPO_MAP) {
-            wanted.push(SEEDS_REPO_MAP);
-        }
-    } else if wanted.contains(&SEEDS_REPO_MAP) {
-        wanted.retain(|id| *id != SEEDS_REPO_MAP);
-        if call.maps.is_some() {
-            repo_map_off_note = Some(
-                "seeds.repo_map is off ([run_profile.seeds] repo_map = false): the map gives no start nodes"
-                    .to_owned(),
-            );
-        }
-    }
-    // `[run_profile.grep] structural`: the same for `grep.structural`, which
-    // reads the tree, so a call joins it to the default set only with a root.
-    if profile.grep.structural {
-        if call.maps.is_none() && call.scip_root.is_some() && !wanted.contains(&STRUCTURAL_ID) {
-            wanted.push(STRUCTURAL_ID);
-        }
-    } else if wanted.contains(&STRUCTURAL_ID) {
-        wanted.retain(|id| *id != STRUCTURAL_ID);
-        if call.maps.is_some() {
-            structural_off_note = Some(
-                "grep.structural is off ([run_profile.grep] structural = false): the map gives no edges"
-                    .to_owned(),
-            );
-        }
-    }
+    let selection = maps::select(call, profile, &policy, preset.as_deref())?;
     // The policy's first_k and seed_k take the place of the [traverse] keys.
     let tuned;
     let limits = if policy.first_k.is_some() || policy.seed_k.is_some() {
@@ -706,15 +591,6 @@ pub async fn run_with_trait_seeds(
     } else {
         limits
     };
-    // `seeds.bm25` and `seeds.repo_map` read the SCIP graph only, not the
-    // tree; `seeds.literal` searches the tree through the application's search
-    // and says so when the call has none.
-    if wanted.iter().any(|id| {
-        ![SEEDS_BM25, SEEDS_REPO_MAP, SEEDS_LITERAL].contains(id) && OPT_IN_MAPS.contains(id)
-    }) && call.scip_root.is_none()
-    {
-        bail!("the maps named beyond the defaults read the tree: give its root");
-    }
     let priors = match (&limits.priors, &limits.question_type) {
         (None, None) => HopPriors::default(),
         (Some(path), Some(question_type)) => HopPriors::open(path, question_type)
@@ -726,17 +602,7 @@ pub async fn run_with_trait_seeds(
         .transpose()?;
     let (mut budget, mut warnings) = clamp_budget(limits, call.budget);
     let mut notes = Vec::new();
-    notes.extend(bm25_off_note);
-    notes.extend(literal_off_note);
-    notes.extend(repo_map_off_note);
-    notes.extend(structural_off_note);
-    if !skipped_maps.is_empty() {
-        notes.push(format!(
-            "policy {}: the maps {} read the tree and were left out: give --root (or the workspace) to run them as measured",
-            preset.as_deref().unwrap_or_default(),
-            skipped_maps.join(", ")
-        ));
-    }
+    notes.extend(selection.notes.iter().cloned());
     // First stage alone: the policy says so, or the call asks for fewer
     // answers (first stage plus walk) than the policy's walk is worth. Only
     // a first call with a first stage: a continuation is the walk, and
@@ -780,7 +646,7 @@ pub async fn run_with_trait_seeds(
         handler.as_ref().map(|(_, stops, _)| stops),
         actions.as_ref(),
         &budget,
-        &wanted,
+        &selection.wanted,
     ));
     let store = HandleStore::in_dir(&dirs.handles);
     let snapshot = match call.handle {
@@ -905,7 +771,7 @@ pub async fn run_with_trait_seeds(
             .check_top_k(call.top_k)
             .map_err(|e| anyhow!("{e}"))?;
     }
-    let wants = |id: MapId| wanted.contains(&id);
+    let wants = |id: MapId| selection.wants(id);
     // The maps the call asked for that could not be set up (K13: an answer that
     // lacks one is not labelled complete). Read only under `answer_labels`.
     let mut unavailable: Vec<MapId> = Vec::new();
@@ -925,7 +791,7 @@ pub async fn run_with_trait_seeds(
     // The start nodes (not on a continuation, which resumes the old ones).
     let mut found = Seeds::default();
     if snapshot.is_none() {
-        found = find_seeds(limits, call, &loaded, &wanted).await?;
+        found = find_seeds(limits, call, &loaded, &selection.wanted).await?;
         notes.append(&mut found.notes);
         // The deadline is the walk's own: a slow hybrid search (a loaded
         // embedder) must not spend it before the first pop. The search is
@@ -1459,7 +1325,7 @@ pub async fn run_with_trait_seeds(
         }
     } else if let Some(root) = call.scip_root {
         let mut exact: Vec<ExactCard> = Vec::new();
-        for id in wanted.iter().copied() {
+        for id in selection.wanted.iter().copied() {
             if id == EXACT_CLOSURE_ID {
                 match impact_map(call.scip_index, root, &loaded).await {
                     Ok(map) => {
