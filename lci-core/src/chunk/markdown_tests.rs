@@ -461,7 +461,7 @@ fn the_fixture_chunks_match_the_record() {
 // -- scan ------------------------------------------------------------------------
 
 #[test]
-fn the_scan_indexes_lowercase_md_files_and_applies_ignore_files() {
+fn the_scan_indexes_md_files_in_any_case_and_applies_ignore_files() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join(".gitignore"), "build/\n").unwrap();
     std::fs::write(temp.path().join(".lciignore"), "private/**\n").unwrap();
@@ -492,6 +492,7 @@ fn the_scan_indexes_lowercase_md_files_and_applies_ignore_files() {
             ("README.md", "markdown"),
             ("docs/guide.md", "markdown"),
             (".hidden/notes.md", "markdown"),
+            ("UPPER.MD", "markdown"),
             ("lib.rs", "rust"),
         ])
     );
