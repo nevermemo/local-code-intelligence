@@ -89,6 +89,7 @@ struct Spec {
     handle: Option<String>,
     rootless: bool,
     lsp: Option<Config>,
+    lsp_sessions: Option<std::sync::Arc<lci_core::lsp::Manager>>,
     trajectory: usize,
 }
 
@@ -146,7 +147,7 @@ async fn ask(
         steer: &steer,
         handle: spec.handle.as_deref(),
         lsp: spec.lsp.as_ref(),
-        lsp_sessions: None,
+        lsp_sessions: spec.lsp_sessions.clone(),
     };
     traverse::run(&limits(), profile, &cell.dirs(spec.trajectory), &call).await
 }
@@ -661,6 +662,34 @@ async fn lsp_down() {
         notes(&report)
     );
     pin("lsp_down", &cell, &report);
+}
+
+/// `lsp.live` in the default set: no maps named, a tree and a manager that
+/// outlives the call (`Call.lsp_sessions`, as the service passes it) put the
+/// map after the four default ones (`[run_profile.lsp] live`, K11b-3). The
+/// language servers are missing, so the map is unavailable: its note, and the
+/// answer is not labelled complete.
+#[tokio::test]
+async fn lsp_default() {
+    let cell = cell();
+    let config = lsp_base();
+    let spec = Spec {
+        question: "Combine",
+        seeds: seeds(&[COMBINE]),
+        pops: Some(2),
+        lsp_sessions: Some(std::sync::Arc::new(lci_core::lsp::Manager::new(&config))),
+        lsp: Some(config),
+        ..Default::default()
+    };
+    let mut profile = profile();
+    profile.traverse.answer_labels = true;
+    let report = ask(&cell, &spec, &profile).await.unwrap();
+    assert!(
+        notes(&report).contains("lsp.live is unavailable"),
+        "{}",
+        notes(&report)
+    );
+    pin("lsp_default", &cell, &report);
 }
 
 /// `lsp.live` with the documents fake: the edges come from the server. The
