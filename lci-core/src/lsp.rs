@@ -756,6 +756,62 @@ tokio::task_local! {
     static WALK: Arc<WalkSessions>;
 }
 
+/// Why [`Manager::tree_barrier`] stopped a kept session. The caller's note
+/// says it ([`Restart::note`]): a restart is not always a changed tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartReason {
+    /// The stamp differs from the recorded one, or none was recorded for the
+    /// session (its age is unknown).
+    TreeChanged,
+    /// The index has no file list, so nothing can be stamped.
+    NoFileList,
+    /// The stamp could not be taken; the cause, shortened.
+    StampFailed(String),
+}
+
+impl RestartReason {
+    /// The longest cause [`Self::StampFailed`] keeps.
+    const CAUSE_LIMIT: usize = 120;
+
+    /// [`Self::StampFailed`] for `error`: its root cause, cut to a short line.
+    fn stamp_failed(error: &anyhow::Error) -> Self {
+        let cause = error.root_cause().to_string();
+        let line = cause.lines().next().unwrap_or_default();
+        let mut short: String = line.chars().take(Self::CAUSE_LIMIT).collect();
+        if short.len() < line.len() {
+            short.push_str("...");
+        }
+        Self::StampFailed(short)
+    }
+}
+
+impl std::fmt::Display for RestartReason {
+    /// The words after `<provider> restarted: `.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TreeChanged => formatter.write_str("the tree changed since its last call"),
+            Self::NoFileList => formatter.write_str("the index has no file list to stamp"),
+            Self::StampFailed(cause) => write!(formatter, "the tree stamp failed ({cause})"),
+        }
+    }
+}
+
+/// A kept session [`Manager::tree_barrier`] stopped, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restart {
+    pub provider: &'static str,
+    pub reason: RestartReason,
+}
+
+impl Restart {
+    /// `<prefix>: <provider> restarted: <reason>`, the note of a call that
+    /// found the session stopped (`lsp` for navigation and search, `lsp.live`
+    /// for a traversal).
+    pub fn note(&self, prefix: &str) -> String {
+        format!("{prefix}: {} restarted: {}", self.provider, self.reason)
+    }
+}
+
 /// Which sessions one walk used, and whether it started each or found it
 /// running (started by an earlier call, or by an overlapping walk that got to
 /// the server first). The barrier cannot say: two walks can both pass it
@@ -1382,7 +1438,9 @@ impl Manager {
     /// source, no index snapshot) or a failed stamp (a stat or directory read
     /// that failed for a reason other than "not found") every session of
     /// `adapters` is restarted and nothing is recorded: no sharing without a
-    /// stamp.
+    /// stamp. Each session it stopped is returned with the [`RestartReason`]
+    /// (a changed or unrecorded stamp, no file list, a failed stamp), for the
+    /// caller's note.
     ///
     /// The barriers of one workspace run one at a time (the stamp is taken
     /// under the workspace's barrier lock), so a slower barrier cannot record
@@ -1405,7 +1463,7 @@ impl Manager {
         &self,
         workspace: &Workspace,
         adapters: &[&Arc<dyn LspAdapter>],
-    ) -> Vec<&'static str> {
+    ) -> Vec<Restart> {
         let mut restarted = Vec::new();
         if adapters.is_empty() {
             return restarted;
@@ -1423,6 +1481,9 @@ impl Manager {
             Some(source) => source.indexed_files(workspace).await,
             None => None,
         };
+        // Why a session without a stamp is restarted: no file list, unless the
+        // stamp itself failed.
+        let mut unstamped = RestartReason::NoFileList;
         let stamps: Vec<Option<stamp::TreeStamp>> = match listed {
             Some(listed) => {
                 let servers: Vec<(Vec<&'static str>, &'static [&'static str])> = adapters
@@ -1444,6 +1505,7 @@ impl Manager {
                             error = %format!("{error:#}"),
                             "tree stamp failed: the kept sessions are restarted"
                         );
+                        unstamped = RestartReason::stamp_failed(&error);
                         vec![None; adapters.len()]
                     }
                 }
@@ -1459,6 +1521,11 @@ impl Manager {
             if same {
                 continue;
             }
+            let reason = if stamp.is_some() {
+                RestartReason::TreeChanged
+            } else {
+                unstamped.clone()
+            };
             // The only await between the decision and the record is the
             // registry lock, which comes before the session is removed: a
             // caller dropped there has changed nothing, and one that got
@@ -1472,7 +1539,10 @@ impl Manager {
                 };
             }
             if stopped {
-                restarted.push(adapter.provider());
+                restarted.push(Restart {
+                    provider: adapter.provider(),
+                    reason,
+                });
             }
         }
         restarted
@@ -2937,6 +3007,38 @@ mod tests {
         fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
             Box::new(|_| false)
         }
+    }
+
+    /// The note of a restart names its reason; a failed stamp keeps the first
+    /// line of the root cause, cut to a short line.
+    #[test]
+    fn a_restart_note_says_why_the_session_was_stopped() {
+        let note = |reason| {
+            Restart {
+                provider: "csharp-ls",
+                reason,
+            }
+            .note("lsp")
+        };
+        assert_eq!(
+            note(RestartReason::TreeChanged),
+            "lsp: csharp-ls restarted: the tree changed since its last call"
+        );
+        assert_eq!(
+            note(RestartReason::NoFileList),
+            "lsp: csharp-ls restarted: the index has no file list to stamp"
+        );
+        let error = anyhow!("a very long cause\nsecond line").context("stamping /w");
+        assert_eq!(
+            note(RestartReason::stamp_failed(&error)),
+            "lsp: csharp-ls restarted: the tree stamp failed (a very long cause)"
+        );
+        let long = anyhow!("x".repeat(500));
+        let RestartReason::StampFailed(cause) = RestartReason::stamp_failed(&long) else {
+            unreachable!()
+        };
+        assert_eq!(cause.chars().count(), RestartReason::CAUSE_LIMIT + 3);
+        assert!(cause.ends_with("..."));
     }
 
     /// The table of real adapters: only rust-analyzer sees an edit on its own

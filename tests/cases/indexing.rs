@@ -3736,15 +3736,32 @@ fn spawn_count(state: &Path) -> u64 {
         .unwrap()
 }
 
-/// A search report's notes without the ones the tree barrier adds for a
-/// language server the search found running or restarted (`lsp: <provider>
-/// kept session; ...`, `lsp: <provider> restarted: ...`, N104): the tests here
-/// are about the notes of a start and a budget, not of a kept session.
-fn without_barrier_notes(notes: &[String]) -> Vec<String> {
+/// The note of a language server a search or a map run found running.
+#[cfg(feature = "map-equivalence")]
+const KEPT_CSHARP_LS: &str = "lsp: csharp-ls kept session; tree stamp unchanged since N s ago";
+
+/// The note of a language server whose kept session the barrier stopped
+/// because an edit changed the tree.
+#[cfg(feature = "map-equivalence")]
+const RESTARTED_CSHARP_LS: &str = "lsp: csharp-ls restarted: the tree changed since its last call";
+
+/// `notes` with the seconds of a kept-session note replaced by `N`, which two
+/// calls a moment apart need not agree on.
+#[cfg(feature = "map-equivalence")]
+fn masked_seconds(notes: &[String]) -> Vec<String> {
     notes
         .iter()
-        .filter(|note| !note.starts_with("lsp: "))
-        .cloned()
+        .map(|note| match note.split_once("unchanged since ") {
+            Some((head, tail)) => match tail.split_once(" s ago") {
+                Some((seconds, rest))
+                    if !seconds.is_empty() && seconds.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    format!("{head}unchanged since N s ago{rest}")
+                }
+                _ => note.clone(),
+            },
+            None => note.clone(),
+        })
         .collect()
 }
 
@@ -5592,7 +5609,14 @@ async fn the_map_registry_fuses_the_pool_of_a_traced_search_bit_for_bit() {
         .await
         .unwrap();
     assert!(maps.warnings.is_empty(), "{:?}", maps.warnings);
-    assert!(maps.notes.is_empty(), "{:?}", maps.notes);
+    // The traced search started the C# server, so the map path finds it
+    // running and says so, as a search does (N110).
+    assert_eq!(
+        masked_seconds(&maps.notes),
+        [KEPT_CSHARP_LS],
+        "{:?}",
+        maps.notes
+    );
     assert_eq!(maps.rows.len(), traced.len());
     for (row, trace) in maps.rows.iter().zip(traced) {
         assert_eq!(
@@ -5674,11 +5698,18 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
         for part in &maps.warnings {
             assert!(warning.contains(part.as_str()), "{part} not in {warning}");
         }
-        // The map path does not carry the tree barrier's notes.
+        // The map path carries the tree barrier's notes (N110): it found the
+        // C# server running, as the next search will; a search that started
+        // the server itself (the first one) notes nothing.
         assert_eq!(
-            maps.notes,
-            without_barrier_notes(&report.notes),
+            masked_seconds(&maps.notes),
+            [KEPT_CSHARP_LS],
             "embedding fails: {embedding_fails}"
+        );
+        assert!(
+            report.notes.is_empty() || masked_seconds(&report.notes) == [KEPT_CSHARP_LS],
+            "{:?}",
+            report.notes
         );
         assert_eq!(
             maps.rows.len(),
@@ -5694,6 +5725,65 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
         }
     }
     fake.embed_fails.store(false, Ordering::SeqCst);
+    task.abort();
+}
+
+/// N110: the LSP map's status carries what the tree barrier did, with the
+/// search report's wording: a kept server the edit made stale is restarted and
+/// noted as such on both paths, and one found running is noted as kept.
+#[cfg(feature = "map-equivalence")]
+#[tokio::test]
+async fn the_map_registry_notes_the_tree_barrier_as_the_search_report_does() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("t0-barrier-notes");
+    let calculator = |extra: &str| {
+        format!(
+            "// golden_rank_4\nnamespace Acceptance;\npublic sealed class Calculator\n{{\n    // golden_rank_1\n    public int Add(int a, int b) => a + b;\n}}\n{extra}"
+        )
+    };
+    write(&workspace, "src/Calculator.cs", &calculator(""));
+    let state = temp.path().join("lsp-state-t0-barrier-notes");
+    config.lsp_search_budget_ms = 30_000;
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+    app.index(&workspace).await.unwrap();
+
+    // The search starts the server: nothing to note yet.
+    let started = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .unwrap();
+    assert!(started.notes.is_empty(), "{:?}", started.notes);
+    assert!(started.warning.is_none(), "{:?}", started.warning);
+
+    // An edit between the calls: each path restarts the server it finds, and
+    // says so in the same words. (The edits differ in length, so the stamp
+    // moves whatever the clock does.)
+    write(&workspace, "src/Calculator.cs", &calculator("// one\n"));
+    let report = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .unwrap();
+    assert_eq!(report.notes, [RESTARTED_CSHARP_LS], "search");
+    write(&workspace, "src/Calculator.cs", &calculator("// one two\n"));
+    let maps = app
+        .fuse_through_maps(&workspace, "Calculator")
+        .await
+        .unwrap();
+    assert!(maps.warnings.is_empty(), "{:?}", maps.warnings);
+    assert_eq!(maps.notes, report.notes, "the map path");
+
+    // Unchanged since: each finds the server the other started.
+    let report = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .unwrap();
+    let maps = app
+        .fuse_through_maps(&workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(masked_seconds(&report.notes), [KEPT_CSHARP_LS]);
+    assert_eq!(masked_seconds(&maps.notes), masked_seconds(&report.notes));
     task.abort();
 }
 
