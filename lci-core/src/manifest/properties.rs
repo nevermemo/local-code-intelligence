@@ -241,7 +241,7 @@ fn run_seed(seed: u64) -> Reached {
         reached.lossy += cold.lossy_files.len();
         reached.ignored_by_lciignore += existing(&root)
             .iter()
-            .filter(|path| !path.ends_with(".txt"))
+            .filter(|path| !crate::path::has_extension_ignore_case(path, "txt"))
             .filter(|path| !cold.files.contains_key(**path))
             .filter(|path| !cold.skipped_files.iter().any(|s| s.relative_path == **path))
             .count();

@@ -182,10 +182,10 @@ async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>
 /// those result schemas here would just be one more place for them to go
 /// stale.
 ///
-/// `servers` names the loopback port the service is configured to listen on
-/// (`Config::port`), so the document is right for any port, not only 8768.
-fn openapi_document(config: &Config) -> Value {
-    let port = config.port;
+/// `servers` names the loopback port the service listens on (`port`: the port
+/// the listener is bound to, which differs from `Config::port` when that is 0),
+/// so the document is right for any port, not only 8768.
+fn openapi_document(config: &Config, port: u16) -> Value {
     let request_schema = |schema| {
         let mut schema = serde_json::to_value(schema).unwrap();
         schema.as_object_mut().unwrap().remove("$schema");
@@ -356,7 +356,9 @@ fn openapi_document(config: &Config) -> Value {
     document
 }
 
-pub fn routes() -> Router<Arc<App>> {
+/// The REST routes. `port` is the port the service is bound to, as
+/// `/openapi.json` names it.
+pub fn routes(port: u16) -> Router<Arc<App>> {
     Router::new()
         .route("/v1/index_workspace", post(index_workspace))
         .route("/v1/index_status", post(index_status))
@@ -371,7 +373,9 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/v1/service_status", get(service_status))
         .route(
             "/openapi.json",
-            get(|State(app): State<Arc<App>>| async move { Json(openapi_document(&app.config)) }),
+            get(move |State(app): State<Arc<App>>| async move {
+                Json(openapi_document(&app.config, port))
+            }),
         )
 }
 

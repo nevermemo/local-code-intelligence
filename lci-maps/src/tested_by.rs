@@ -77,7 +77,9 @@ fn is_test_unit(path: &str, chain: Option<&Chain>) -> bool {
     let stem = path
         .rsplit(['/', '\\'])
         .next()
-        .and_then(|file| file.strip_suffix(".rs"))
+        .and_then(|file| file.rsplit_once('.'))
+        .filter(|(_, extension)| extension.eq_ignore_ascii_case("rs"))
+        .map(|(stem, _)| stem)
         .unwrap_or_default();
     chain.is_some_and(|chain| {
         let scopes = &chain.names[..chain.names.len().saturating_sub(1)];

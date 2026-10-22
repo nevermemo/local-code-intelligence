@@ -674,7 +674,10 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
     // therefore chunked with the C grammar (recovered, still searchable) and
     // carry the language `c`; C++ projects that want the C++ grammar name
     // their headers `.hpp`, `.hh`, or `.hxx`. clangd serves both families,
-    // so navigation on a `.h` file is unaffected.
+    // so navigation on a `.h` file is unaffected. Extensions match in any
+    // ASCII case (N94), so `.H` is `c` too, and so is `.C` (C++ by the old
+    // Unix convention), chunked with the C grammar (recovered), which is
+    // a better floor than not indexing it; clangd types a file by its driver.
     LanguageAdapter {
         extension: "h",
         identifier: "c",
@@ -746,10 +749,13 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
     },
 ];
 
+/// The adapter of a file extension (without the dot), matched as ASCII
+/// case-insensitive text: a `.RS` file is a Rust file, as it is on a Windows
+/// file system (N94).
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
     ADAPTERS
         .iter()
-        .find(|adapter| adapter.extension == extension)
+        .find(|adapter| adapter.extension.eq_ignore_ascii_case(extension))
 }
 
 pub fn for_path(path: &Path) -> Option<&'static LanguageAdapter> {
@@ -795,7 +801,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_requested_lowercase_extensions() {
+    fn recognizes_only_the_registered_extensions_in_any_ascii_case() {
         for (extension, identifier, glob, cache_version) in [
             ("rs", "rust", "*.rs", "rust-chunks-v4"),
             ("ts", "typescript", "*.ts", "typescript-chunks-v4"),
@@ -821,13 +827,60 @@ mod tests {
             assert_eq!(adapter.glob(), glob);
             assert_eq!(adapter.cache_version(), cache_version);
         }
+        // Any ASCII case of a registered extension is the same language (N94).
+        for (extension, identifier) in [
+            ("RS", "rust"),
+            ("TS", "typescript"),
+            ("Tsx", "tsx"),
+            ("PY", "python"),
+            ("CS", "csharp"),
+            ("GO", "go"),
+            ("JAVA", "java"),
+            ("C", "c"),
+            ("H", "c"),
+            ("CPP", "cpp"),
+            ("HPP", "cpp"),
+            ("CC", "cpp"),
+            ("CXX", "cpp"),
+            ("HH", "cpp"),
+            ("HXX", "cpp"),
+            ("Cc", "cpp"),
+            ("Hxx", "cpp"),
+            ("MD", "markdown"),
+            ("Md", "markdown"),
+            ("mD", "markdown"),
+        ] {
+            let adapter = for_extension(extension).expect(extension);
+            assert_eq!(adapter.identifier(), identifier, "{extension}");
+            assert_eq!(
+                adapter.cache_version(),
+                for_extension(&extension.to_ascii_lowercase())
+                    .unwrap()
+                    .cache_version()
+            );
+        }
         for extension in [
-            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "H",
-            "CPP", "HPP", "CC", "CXX", "HH", "HXX", "Cc", "Hxx", "c++", "h++", "hp", "ino", "inl",
-            "ipp", "tpp", "cu", "m", "mm", "MD", "Md", "mD", "markdown", "mdx", "mkd", "mdown",
-            "rst", "adoc", "txt",
+            "mts", "cts", "mjs", "cjs", "class", "c++", "h++", "hp", "ino", "inl", "ipp", "tpp",
+            "cu", "m", "mm", "MTS", "markdown", "mdx", "mkd", "mdown", "rst", "adoc", "txt", "RST",
+            "",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
+        }
+    }
+
+    #[test]
+    fn a_path_with_a_mixed_case_extension_has_the_language_of_the_lowercase_one() {
+        for (upper, lower) in [
+            ("src/Lib.RS", "src/lib.rs"),
+            ("tools/Tool.Py", "tools/tool.py"),
+            ("App.TSX", "app.tsx"),
+            ("Native.CPP", "native.cpp"),
+            ("include/Native.H", "include/native.h"),
+            ("Guide.Md", "guide.md"),
+        ] {
+            let folded = for_path(Path::new(upper)).expect(upper);
+            let reference = for_path(Path::new(lower)).expect(lower);
+            assert!(std::ptr::eq(folded, reference), "{upper}");
         }
     }
 
@@ -1117,24 +1170,19 @@ mod tests {
     }
 
     #[test]
-    fn markdown_matches_only_the_lowercase_md_extension_in_a_path() {
+    fn markdown_matches_only_the_md_extension_in_any_ascii_case_in_a_path() {
         for path in [
             "README.md",
             "docs/guide.md",
             "a/b.c/notes.md",
             ".github/x.md",
+            "README.MD",
+            "docs/Guide.Md",
         ] {
             let adapter = for_path(Path::new(path)).unwrap();
             assert_eq!(adapter.identifier(), "markdown", "{path}");
         }
-        for path in [
-            "README.MD",
-            "notes.markdown",
-            "page.mdx",
-            "md",
-            ".md",
-            "a.md.bak",
-        ] {
+        for path in ["notes.markdown", "page.mdx", "md", ".md", "a.md.bak"] {
             assert!(for_path(Path::new(path)).is_none(), "{path}");
         }
         assert!(is_registered_identifier("markdown"));

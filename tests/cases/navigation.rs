@@ -4098,7 +4098,12 @@ async fn typescript_javascript_only_search_and_navigation_keep_typescript_lsp_op
         "unexpected warning: {:?}",
         report.warning
     );
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .typescript_analyzer_running
+    );
 
     fake.embed_fails.store(true, Ordering::SeqCst);
     let lexical_only = app
@@ -4113,7 +4118,12 @@ async fn typescript_javascript_only_search_and_navigation_keep_typescript_lsp_op
     let warning = lexical_only.warning.as_deref().unwrap();
     assert!(warning.contains("Query embedding unavailable"));
     assert!(!warning.contains("LSP"));
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .typescript_analyzer_running
+    );
 
     let error = app
         .definition(&workspace, "src/telemetry.ts", 1, 0)
@@ -4125,7 +4135,12 @@ async fn typescript_javascript_only_search_and_navigation_keep_typescript_lsp_op
             .contains("typescript-language-server is disabled"),
         "unexpected error: {error}"
     );
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .typescript_analyzer_running
+    );
     task.abort();
 }
 
@@ -4202,7 +4217,7 @@ async fn single_language_search_and_navigation_keep_each_optional_lsp_optional()
             query: "ComputeQuarterlyRevenue",
             position: (2, 28),
             server: "csharp-ls",
-            running: |status| status.analyzer_running,
+            running: |status| status.csharp_analyzer_running,
             embedded_chunks: None,
         },
     ];

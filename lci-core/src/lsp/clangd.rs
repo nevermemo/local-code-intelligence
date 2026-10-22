@@ -19,6 +19,7 @@
 use crate::config::ClangdLspConfig;
 use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
+use crate::path::has_extension_ignore_case;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -181,12 +182,10 @@ impl LspAdapter for ClangdServer {
 /// class or template in a C++ project's `.h` into parse errors for the server.
 /// Navigation results are still attributed to the indexed language `c`.
 fn language_id_for(relative: &str) -> &'static str {
-    match Path::new(relative)
-        .extension()
-        .and_then(|extension| extension.to_str())
-    {
-        Some("c") => "c",
-        _ => "cpp",
+    if has_extension_ignore_case(relative, "c") {
+        "c"
+    } else {
+        "cpp"
     }
 }
 
@@ -229,6 +228,10 @@ mod tests {
         // `.h` is indexed as `c` but opened for the server as C++ (see the
         // function's documentation).
         assert_eq!(language_id_for("include/a.h"), "cpp");
+        // The extension folds case (N94): `A.C` is C, `A.HPP` is C++.
+        assert_eq!(language_id_for("src/A.C"), "c");
+        assert_eq!(language_id_for("src/A.CPP"), "cpp");
+        assert_eq!(language_id_for("include/A.H"), "cpp");
         contract::assert_initialize_params_name_this_process(
             &usable,
             tempfile::tempdir().unwrap().path(),

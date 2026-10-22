@@ -38,7 +38,8 @@ const FROZEN_DIR: &str = "docs/spike/multimap/v2/";
 fn is_frozen(rel: &str) -> bool {
     rel.starts_with(FROZEN_DIR)
         && rel.rsplit('/').next().is_some_and(|name| {
-            name.ends_with(".md") && (name.contains("-prereg") || name.ends_with("-results.md"))
+            lci_core::path::has_extension_ignore_case(name, "md")
+                && (name.contains("-prereg") || name.ends_with("-results.md"))
         })
 }
 
@@ -327,7 +328,10 @@ impl Checker<'_> {
                 },
             ));
         }
-        if anchor.is_empty() || !is_file || !linked.ends_with(".md") {
+        if anchor.is_empty()
+            || !is_file
+            || !lci_core::path::has_extension_ignore_case(&linked, "md")
+        {
             return Ok(None);
         }
         if !self.anchors.contains_key(&linked) {
@@ -450,7 +454,8 @@ pub fn check_repo(root: &Path) -> Result<Report> {
     };
     let mut report = Report::default();
     for rel in &paths {
-        if !rel.ends_with(".md") || rel.starts_with(VENDORED_PREFIX) {
+        if !lci_core::path::has_extension_ignore_case(rel, "md") || rel.starts_with(VENDORED_PREFIX)
+        {
             continue;
         }
         let path = root.join(rel);

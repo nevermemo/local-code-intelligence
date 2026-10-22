@@ -1,0 +1,140 @@
+{
+  "effective_policy": {
+    "hash": "61dbb70aa62be037",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": true,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "seeds.bm25",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "structure.contains",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "seed_source is bm25, the entity index over symbol names, paths and documentation: no search is available for this call (it has no workspace to search)"
+  ],
+  "question": "Combine",
+  "results": [
+    {
+      "depth": 0,
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 16,
+        "line": 4,
+        "path": "src/Calculator.cs"
+      },
+      "text": "sym:rust:Calculator.cs::Combine/fn | seeds.bm25 | p1.00 d0",
+      "via": "seeds.bm25",
+      "witness": null
+    },
+    {
+      "depth": 1,
+      "fanout": 1,
+      "maps": [
+        "structure.contains"
+      ],
+      "n_maps": 1,
+      "node": "file:src/Calculator.cs",
+      "node_kind": "file",
+      "origin": "walk",
+      "overlap": 0.0,
+      "potential": 0.5,
+      "ranked_potential": 0.5,
+      "site": {
+        "col": 1,
+        "line": 1,
+        "path": "src/Calculator.cs"
+      },
+      "text": "file:src/Calculator.cs | structure.contains/exact | p0.50 d1",
+      "via": "structure.contains",
+      "witness": "exact"
+    }
+  ],
+  "seed_fallback": "no search is available for this call (it has no workspace to search)",
+  "seed_hits": [
+    {
+      "how": "bm25",
+      "kind": "symbol",
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "retrievers": [
+        "bm25"
+      ],
+      "score": 2.0974788289063033,
+      "score_kind": "bm25",
+      "symbol": "m::Combine"
+    }
+  ],
+  "seed_sites": {
+    "sym:rust:Calculator.cs::Combine/fn": {
+      "col": 16,
+      "line": 4,
+      "path": "src/Calculator.cs"
+    }
+  },
+  "seed_source": "bm25",
+  "seeds": [
+    "sym:rust:Calculator.cs::Combine/fn"
+  ],
+  "status": "complete",
+  "steering": [],
+  "stop_reason": "complete",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "first_stage": {
+      "exact": 0,
+      "seeds": 1,
+      "walk": 1
+    },
+    "hops": 1,
+    "per_map": {
+      "graph.scip": {
+        "expands": 1
+      },
+      "structure.contains": {
+        "expands": 2
+      }
+    },
+    "physical_external_calls": 0,
+    "physical_map_calls": 3,
+    "pops": 2,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "trace": {
+    "events": 5,
+    "hash": "9a7f8935d76eb100"
+  }
+}
