@@ -3876,12 +3876,9 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
             .await
             .unwrap();
         assert!(early.warning.is_none(), "{:?}", early.warning);
-        assert_eq!(
-            without_barrier_notes(&early.notes).len(),
-            1,
-            "search {attempt}: {:?}",
-            early.notes
-        );
+        // Search 1 finds the session running but misses the budget: that is
+        // the one note (no `kept session` label on an answer it never gave).
+        assert_eq!(early.notes.len(), 1, "search {attempt}: {:?}", early.notes);
         assert!(
             !channels_seen(&early).contains("lsp"),
             "search {attempt} ran during priming"

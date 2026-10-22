@@ -2070,8 +2070,9 @@ async fn with_sync_off_the_barrier_restarts_the_session_and_the_new_one_walks_th
         .await
         .unwrap();
     assert_eq!(names(&found.results), ["ProbeG1"], "{found:?}");
-    // (The sidecar's Rust file brings a second server, rust-analyzer, which
-    // the barrier restarts as well.)
+    // (rust-analyzer's path is missing in this fixture, so it has no server;
+    // its failed-start session entry is also stopped and noted by the
+    // barrier, which is why the notes are searched, not compared whole.)
     assert!(
         found
             .notes
@@ -2180,8 +2181,9 @@ async fn with_sync_on_the_session_is_told_about_the_edit_and_the_barrier_replace
         .await
         .unwrap();
     assert_eq!(names(&found.results), ["ProbeG1"], "{found:?}");
-    // (The sidecar's Rust file brings a second server, rust-analyzer, which
-    // the barrier restarts as well.)
+    // (rust-analyzer's path is missing in this fixture, so it has no server;
+    // its failed-start session entry is also stopped and noted by the
+    // barrier, which is why the notes are searched, not compared whole.)
     assert!(
         found
             .notes

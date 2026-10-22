@@ -1821,7 +1821,9 @@ impl App {
     /// (`Manager::tree_barrier`): one whose tree changed since its last check
     /// is stopped and the search starts a fresh one (inside the budget, so a
     /// slow start reads as an over-budget note). The channel lists those
-    /// restarts and the sessions the search found running.
+    /// restarts and the sessions the search found running whose requests
+    /// completed (one that missed the budget or failed is not an answer from
+    /// a kept session).
     async fn lsp_channel(
         &self,
         providers: &[Arc<dyn LspAdapter>],
@@ -1852,14 +1854,20 @@ impl App {
             .await;
         let mut channel = LspChannel {
             restarted,
-            reused: walk.reused(),
             ..LspChannel::default()
         };
+        // The providers whose requests all completed: the session is recorded
+        // when a request acquires it, so a provider that then missed the
+        // budget or failed is not labelled as an answer from a kept session.
+        let mut completed: Vec<&'static str> = Vec::new();
         let mut per_provider = Vec::new();
         for (provider, gathered, answer) in answers {
             per_provider.push(gathered);
             match answer {
-                Ok(failure) => channel.failures.extend(failure),
+                Ok(failure) => {
+                    completed.extend(failure.is_none().then_some(provider));
+                    channel.failures.extend(failure);
+                }
                 Err(_) => {
                     tracing::debug!(
                         provider,
@@ -1870,6 +1878,11 @@ impl App {
                 }
             }
         }
+        channel.reused = walk
+            .reused()
+            .into_iter()
+            .filter(|(provider, _)| completed.contains(provider))
+            .collect();
         for index in 0..symbol_queries.len() {
             for locations in &mut per_provider {
                 if let Some(found) = locations.get_mut(index) {
