@@ -5748,3 +5748,73 @@ async fn the_map_registry_leaves_the_semantic_map_off_on_a_vectorless_snapshot()
     );
     task.abort();
 }
+
+/// N105: a debug build of `lci traverse --maps seeds.hybrid` overflowed
+/// Windows' 1 MiB main-thread stack when the hybrid search created the index
+/// with the embedder unreachable. Runs the real binary against a tiny tree and
+/// SCIP index; the embedder URL is a port nothing listens on (the index is
+/// built without vectors), so only the process's own stack decides the result.
+#[test]
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn traverse_seeds_hybrid_runs_through_the_binary_without_overflowing_its_stack() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    let source = "pub fn parse_widget_config() {}\n";
+    write(&root, "src/lib.rs", source);
+    let mut document = scip::types::Document::default();
+    document.relative_path = "src/lib.rs".to_owned();
+    let symbol = "rust-analyzer cargo demo 0.1.0 widget/parse_widget_config().".to_owned();
+    let mut definition = scip::types::Occurrence::default();
+    definition.range = vec![0, 7, 25];
+    definition.symbol = symbol.clone();
+    definition.symbol_roles = 1;
+    definition.enclosing_range = vec![0, 0, 0, source.trim_end().len() as i32];
+    document.occurrences.push(definition);
+    let mut info = scip::types::SymbolInformation::default();
+    info.symbol = symbol;
+    info.kind = scip::types::symbol_information::Kind::Function.into();
+    document.symbols.push(info);
+    let mut message = scip::types::Index::default();
+    message.documents.push(document);
+    let index = temp.path().join("index.scip");
+    scip::write_message_to_file(&index, message).unwrap();
+
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "data_dir = '{}'\nembedding_url = 'http://127.0.0.1:9/v1'\n\n[channels]\nsemantic = false\nlexical = true\nlsp = false\nreranker = false\n\n[index]\nfreshness = \"manual\"\n\n[traverse]\nenabled = true\n",
+            temp.path().join("data").display()
+        ),
+    )
+    .unwrap();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+    command
+        .current_dir(temp.path())
+        .arg("--config")
+        .arg(&config)
+        .arg("traverse")
+        .arg("--scip")
+        .arg(&index)
+        .arg("--root")
+        .arg(&root)
+        .args([
+            "--maps",
+            "seeds.hybrid",
+            "--question",
+            "parse widget config",
+        ]);
+    strip_lci_env(&mut command);
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("overflowed"), "{stderr}");
+    assert!(output.status.success(), "{:?}: {stderr}", output.status);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout is not JSON ({error}): {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(report["mode"], "traverse", "{report}");
+}
