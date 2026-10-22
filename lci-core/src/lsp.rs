@@ -3306,6 +3306,99 @@ mod tests {
         }
     }
 
+    /// An index file list that has none on its first call (no snapshot yet) and
+    /// lists `src/lib.rs` on every later one.
+    struct NoneThenListed(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl stamp::IndexedFiles for NoneThenListed {
+        async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
+            (self.0.fetch_add(1, Ordering::SeqCst) > 0)
+                .then(|| Arc::new(vec!["src/lib.rs".to_owned()]))
+        }
+    }
+
+    /// A manager whose index lists nothing at first, its rust-analyzer a path
+    /// that does not exist (a session registers and its start fails, so no
+    /// real server is reached), and a session for `workspace` that began under
+    /// the first, stampless barrier: that barrier removed the record, so the
+    /// stamp of the next call finds none (N114).
+    async fn manager_with_an_unrecorded_session(
+        workspace: &Workspace,
+    ) -> (Manager, Arc<dyn LspAdapter>) {
+        let config = Config {
+            rust_analyzer_path: "definitely-missing-rust-analyzer".into(),
+            ..Config::default()
+        };
+        let manager = Manager::new(&config).with_indexed_files(Arc::new(NoneThenListed(
+            std::sync::atomic::AtomicUsize::new(0),
+        ))
+            as Arc<dyn stamp::IndexedFiles>);
+        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
+        assert!(
+            manager.tree_barrier(workspace, &[&rust]).await.is_empty(),
+            "no session yet: nothing to stop"
+        );
+        manager.session(&rust, workspace).await.unwrap();
+        assert!(
+            manager
+                .has_session(&Manager::session_key(&rust, workspace))
+                .await
+        );
+        (manager, rust)
+    }
+
+    /// A session that began while the barrier had no stamp has no record, so
+    /// the next barrier that does stamp the tree calls it `Unrecorded`, not
+    /// `TreeChanged`: `tree_barrier` restarts it with that reason, and
+    /// `search_barrier` keeps a watcher with it and records nothing, so the
+    /// next `tree_barrier` still restarts it.
+    #[tokio::test]
+    async fn a_session_started_under_a_stampless_barrier_is_unrecorded_at_the_next_stamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let ws = Workspace {
+            id: crate::workspace::hash(&path.to_string_lossy()),
+            path,
+        };
+
+        let (manager, rust) = manager_with_an_unrecorded_session(&ws).await;
+        let restarted = manager.tree_barrier(&ws, &[&rust]).await;
+        assert_eq!(
+            restarted,
+            [Restart {
+                provider: "rust-analyzer",
+                reason: RestartReason::Unrecorded,
+            }]
+        );
+
+        let (manager, rust) = manager_with_an_unrecorded_session(&ws).await;
+        let barrier = manager.search_barrier(&ws, &[&rust]).await;
+        assert!(barrier.restarted.is_empty(), "{barrier:?}");
+        assert_eq!(
+            barrier.kept,
+            [Kept {
+                provider: "rust-analyzer",
+                reason: RestartReason::Unrecorded,
+            }]
+        );
+        assert_eq!(
+            barrier.kept[0].note("lsp"),
+            "lsp: rust-analyzer kept session; no tree stamp was recorded for it (kept: it watches its workspace)"
+        );
+        // The search recorded nothing for the session it kept.
+        let restarted = manager.tree_barrier(&ws, &[&rust]).await;
+        assert_eq!(
+            restarted,
+            [Restart {
+                provider: "rust-analyzer",
+                reason: RestartReason::Unrecorded,
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn a_probe_is_run_once_per_provider_until_it_fails() {
         let timeout = Duration::from_secs(1);
