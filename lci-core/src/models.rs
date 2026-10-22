@@ -145,13 +145,13 @@ impl std::error::Error for EmbedderSkipped {}
 /// the window has passed. After that the next call probes the service again;
 /// if it fails to connect it trips the breaker once more. Time is passed in
 /// so the logic is testable without sleeping.
-struct ConnectBreaker {
+pub(crate) struct ConnectBreaker {
     window: Duration,
     tripped_at: Mutex<Option<Instant>>,
 }
 
 impl ConnectBreaker {
-    fn new(window: Duration) -> Self {
+    pub(crate) fn new(window: Duration) -> Self {
         Self {
             window,
             tripped_at: Mutex::new(None),
@@ -168,18 +168,18 @@ impl ConnectBreaker {
 
     /// Time left until the next call may probe the service, or `None` when
     /// it may do so now (never tripped, cleared, or the window has passed).
-    fn remaining(&self, now: Instant) -> Option<Duration> {
+    pub(crate) fn remaining(&self, now: Instant) -> Option<Duration> {
         let tripped_at = (*self.state())?;
         self.window
             .checked_sub(now.saturating_duration_since(tripped_at))
             .filter(|left| !left.is_zero())
     }
 
-    fn trip(&self, now: Instant) {
+    pub(crate) fn trip(&self, now: Instant) {
         *self.state() = Some(now);
     }
 
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         *self.state() = None;
     }
 }

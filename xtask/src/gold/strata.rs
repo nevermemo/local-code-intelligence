@@ -295,13 +295,13 @@ pub fn classify(set: Set, item: &Value) -> Stratum {
 
 // ------------------------------------------------------------------ report
 
-fn file_stem(path: &str) -> &str {
+pub(crate) fn file_stem(path: &str) -> &str {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
 /// Stems too common to say anything when a question holds them.
-const GENERIC_STEMS: [&str; 9] = [
+pub(crate) const GENERIC_STEMS: [&str; 9] = [
     "mod", "lib", "main", "test", "tests", "index", "readme", "types", "utils",
 ];
 
@@ -349,7 +349,7 @@ fn question_words(item: &Value) -> Vec<String> {
 }
 
 /// Whether the stem of `path` is one of `words` (generic and short stems never).
-fn holds_stem(words: &[String], path: &str) -> bool {
+pub(crate) fn holds_stem(words: &[String], path: &str) -> bool {
     let stem = file_stem(path).to_ascii_lowercase();
     stem.len() >= 3 && !GENERIC_STEMS.contains(&stem.as_str()) && words.contains(&stem)
 }

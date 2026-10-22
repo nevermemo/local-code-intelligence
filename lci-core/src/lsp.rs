@@ -9,9 +9,10 @@ use crate::{
         java::JavaServer,
         python::PythonServer,
         rust::RustServer,
-        transport::{JsonRpcClient, RpcError},
+        transport::{InactivityTimeout, JsonRpcClient, RpcError},
         typescript::TypeScriptServer,
     },
+    models::ConnectBreaker,
     workspace::Workspace,
 };
 use anyhow::{Context, Result, anyhow};
@@ -136,7 +137,14 @@ struct GenericClient {
 }
 
 impl GenericClient {
-    async fn spawn(adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Result<Arc<Self>> {
+    /// Spawns and initializes the server. `start_timeout` bounds the
+    /// `initialize` request only (`lsp_start_timeout_seconds`); everything
+    /// after it keeps the transport's own timeout.
+    async fn spawn(
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        start_timeout: Duration,
+    ) -> Result<Arc<Self>> {
         let transport = adapter
             .transport_config(&workspace.path)
             .with_context(|| format!("{} is disabled or has no executable", adapter.provider()))?;
@@ -150,7 +158,7 @@ impl GenericClient {
         let params = adapter
             .initialize_params(&workspace.path)
             .with_context(|| format!("cannot build {} initialization", adapter.provider()))?;
-        rpc.request("initialize", params)
+        rpc.request_within("initialize", params, start_timeout)
             .await
             .with_context(|| format!("initialize {}", adapter.provider()))?;
         rpc.notify("initialized", json!({})).await?;
@@ -380,6 +388,8 @@ impl Session {
         adapter: Arc<dyn LspAdapter>,
         workspace: Workspace,
         stuck_after: Option<Duration>,
+        breakers: Option<Arc<LspBreakers>>,
+        start_timeout: Duration,
     ) -> Arc<Self> {
         let (sender, start) = watch::channel(None);
         let (primed_sender, primed) = watch::channel(false);
@@ -389,7 +399,7 @@ impl Session {
             let provider = adapter.provider();
             let started = Instant::now();
             let outcome = tokio::select! {
-                outcome = GenericClient::spawn(&adapter, &workspace) => outcome,
+                outcome = GenericClient::spawn(&adapter, &workspace, start_timeout) => outcome,
                 // Every receiver is gone: the manager was dropped.
                 () = sender.closed() => return,
             };
@@ -414,6 +424,10 @@ impl Session {
                     None
                 }
             };
+            // Once per start, whatever the number of callers waiting on it.
+            if let Some(breakers) = &breakers {
+                breakers.note_start(provider, &outcome);
+            }
             sender.send_replace(Some(outcome.map_err(|error| format!("{error:#}"))));
             let Some(client) = client else { return };
 
@@ -803,6 +817,104 @@ impl WalkSessions {
     }
 }
 
+/// How long a provider whose version probe failed, or whose server could not be
+/// started, is left alone under `[run_profile.lsp] breaker = true` (see
+/// [`LspBreakers`]).
+pub const LSP_DOWN_WINDOW: Duration = Duration::from_secs(30);
+
+/// `[run_profile.lsp] breaker`: one skip window per provider. A failed version
+/// probe, or a server start that failed for a reason other than the inactivity
+/// timeout (the process could not be spawned, exited, or broke the protocol),
+/// opens the provider's window; until it has passed, [`Manager::probe_once`]
+/// and a new session start are refused at once with an error that says so, so a
+/// dead server costs one probe or start per window instead of one per call. A
+/// start that merely timed out (a slow `initialize`) opens nothing, a started
+/// server is never refused, and a successful probe or start closes the window.
+/// Shared by `Arc` between the managers of one service (see
+/// [`Manager::with_breakers`]), so a traversal's per-call manager reads the
+/// windows the service's manager opened. Time is read from the clock, with
+/// [`Self::reset`] and, in tests, `expire` in place of waiting.
+pub struct LspBreakers {
+    window: Duration,
+    by_provider: std::sync::Mutex<HashMap<&'static str, ConnectBreaker>>,
+}
+
+impl LspBreakers {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            by_provider: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with<R>(&self, provider: &'static str, act: impl FnOnce(&ConnectBreaker) -> R) -> R {
+        let mut by_provider = self
+            .by_provider
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        act(by_provider
+            .entry(provider)
+            .or_insert_with(|| ConnectBreaker::new(self.window)))
+    }
+
+    /// Time left until `provider` may be probed or started again, or `None`
+    /// when it may be now (no window, or it has passed).
+    pub fn remaining(&self, provider: &'static str) -> Option<Duration> {
+        self.with(provider, |breaker| breaker.remaining(Instant::now()))
+    }
+
+    /// Opens `provider`'s window now.
+    pub fn trip(&self, provider: &'static str) {
+        self.with(provider, |breaker| breaker.trip(Instant::now()));
+    }
+
+    /// Closes `provider`'s window.
+    pub fn clear(&self, provider: &'static str) {
+        self.with(provider, ConnectBreaker::clear);
+    }
+
+    /// Closes every window.
+    pub fn reset(&self) {
+        self.by_provider
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Ages `provider`'s window past its end, in place of waiting for it. If
+    /// the clock has not run for a full window yet it closes the window.
+    #[cfg(test)]
+    fn expire(&self, provider: &'static str) {
+        self.with(provider, |breaker| {
+            match Instant::now().checked_sub(self.window) {
+                Some(past) => breaker.trip(past),
+                None => breaker.clear(),
+            }
+        });
+    }
+
+    /// The refusal for a provider whose window is open, `None` when it is not.
+    fn refusal(&self, provider: &'static str) -> Option<anyhow::Error> {
+        self.remaining(provider).map(|left| {
+            anyhow!(
+                "{provider}: skipped for {} s after a failed probe or start (lsp breaker)",
+                left.as_secs() + 1
+            )
+        })
+    }
+
+    /// What the end of a server start does to the window: a started server
+    /// closes it, a start that timed out ([`InactivityTimeout`]) leaves it
+    /// alone (the server may only be slow), any other failure opens it.
+    fn note_start<T>(&self, provider: &'static str, outcome: &Result<T>) {
+        match outcome {
+            Ok(_) => self.clear(provider),
+            Err(error) if error.chain().any(|cause| cause.is::<InactivityTimeout>()) => {}
+            Err(_) => self.trip(provider),
+        }
+    }
+}
+
 /// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
 /// and C# (csharp-ls) are always constructed; TypeScript/JavaScript, Python,
 /// Go, and Java join the same registry as optional, individually
@@ -864,6 +976,13 @@ pub struct Manager {
     /// The kept outlines, `Some` only under `[run_profile.lsp]
     /// outline_cache = true` (see [`Self::document_symbols`]).
     outlines: Option<Arc<std::sync::Mutex<OutlineCache>>>,
+    /// The skip windows, `Some` only under `[run_profile.lsp] breaker = true`
+    /// (see [`LspBreakers`]); a per-call manager borrows the service's
+    /// ([`Self::with_breakers`]).
+    breakers: Option<Arc<LspBreakers>>,
+    /// `lsp_start_timeout_seconds`, or `lsp_timeout_seconds` when it is 0: the
+    /// inactivity bound of a server's `initialize` request.
+    start_timeout: Duration,
 }
 
 /// The running syncs of a [`Manager`], by workspace id.
@@ -988,7 +1107,32 @@ impl Manager {
                 .lsp
                 .outline_cache
                 .then(|| Arc::new(std::sync::Mutex::new(OutlineCache::default()))),
+            breakers: config
+                .run_profile
+                .lsp
+                .breaker
+                .then(|| Arc::new(LspBreakers::new(LSP_DOWN_WINDOW))),
+            start_timeout: if config.lsp_start_timeout_seconds > 0 {
+                Duration::from_secs(config.lsp_start_timeout_seconds)
+            } else {
+                timeout
+            },
         }
+    }
+
+    /// The skip windows of `[run_profile.lsp] breaker` (`None` when it is
+    /// off), to hand to the per-call managers of a walk.
+    pub fn breakers(&self) -> Option<Arc<LspBreakers>> {
+        self.breakers.clone()
+    }
+
+    /// This manager reading and opening `breakers` in place of its own windows
+    /// (`None`: no windows at all), so the managers of one service share them.
+    /// Call before the first request.
+    #[must_use]
+    pub fn with_breakers(mut self, breakers: Option<Arc<LspBreakers>>) -> Self {
+        self.breakers = breakers;
+        self
     }
 
     /// This manager with `source` as the index's file list for the tree
@@ -1070,12 +1214,32 @@ impl Manager {
     /// The default probe also keeps a process-wide memo of its own (see
     /// [`adapter::probe_subprocess_version`]), so a second manager in the same
     /// process does not run a binary again that has answered.
+    ///
+    /// Under `[run_profile.lsp] breaker = true` a failed probe opens the
+    /// provider's window (see [`LspBreakers`]) and a caller that finds it open
+    /// gets an error that says so, without a probe; a probe that passes closes
+    /// it. A provider whose probe has passed is answered from memory before
+    /// the window is read.
     pub async fn probe_once(&self, adapter: &Arc<dyn LspAdapter>, timeout: Duration) -> Result<()> {
         let provider = adapter.provider();
         if self.probed.lock().unwrap().contains(provider) {
             return Ok(());
         }
-        adapter.probe_readiness(timeout).await?;
+        if let Some(refusal) = self
+            .breakers
+            .as_ref()
+            .and_then(|breakers| breakers.refusal(provider))
+        {
+            return Err(refusal);
+        }
+        let probe = adapter.probe_readiness(timeout).await;
+        if let Some(breakers) = &self.breakers {
+            match &probe {
+                Ok(()) => breakers.clear(provider),
+                Err(_) => breakers.trip(provider),
+            }
+        }
+        probe?;
         self.probed.lock().unwrap().insert(provider);
         Ok(())
     }
@@ -1106,7 +1270,16 @@ impl Manager {
     /// Asking for the session counts as using it, recorded
     /// under the registry lock, so the idle sweeper cannot release it between
     /// this caller finding it and the caller's first request.
-    async fn session(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Arc<Session> {
+    ///
+    /// Under `[run_profile.lsp] breaker = true`, a new start is refused with an
+    /// error (and no session is begun) while the provider's window is open
+    /// (see [`LspBreakers`]); a session that is already there and usable is
+    /// returned whatever the window says.
+    async fn session(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+    ) -> Result<Arc<Session>> {
         let key = Self::session_key(adapter, workspace);
         let (session, reused) = {
             let mut sessions = self.sessions.lock().await;
@@ -1117,8 +1290,20 @@ impl Manager {
                 existing.touch();
                 (Arc::clone(existing), true)
             } else {
-                let session =
-                    Session::begin(Arc::clone(adapter), workspace.clone(), self.stuck_after);
+                if let Some(refusal) = self
+                    .breakers
+                    .as_ref()
+                    .and_then(|breakers| breakers.refusal(adapter.provider()))
+                {
+                    return Err(refusal);
+                }
+                let session = Session::begin(
+                    Arc::clone(adapter),
+                    workspace.clone(),
+                    self.stuck_after,
+                    self.breakers.clone(),
+                    self.start_timeout,
+                );
                 if let Some(replaced) = sessions.insert(key.clone(), Arc::clone(&session))
                     && replaced.stuck()
                 {
@@ -1129,7 +1314,7 @@ impl Manager {
             }
         };
         self.note_walk(&key, session.id, session.provider, reused);
-        session
+        Ok(session)
     }
 
     /// Tells the walk this request belongs to, if any, that it used session
@@ -1163,7 +1348,7 @@ impl Manager {
         workspace: &Workspace,
         after_priming: bool,
     ) -> Result<(Arc<Session>, Arc<GenericClient>)> {
-        let session = self.session(adapter, workspace).await;
+        let session = self.session(adapter, workspace).await?;
         let client = session.client().await?;
         if after_priming {
             session.primed().await?;
@@ -1952,8 +2137,16 @@ impl Manager {
                 Ok(Ok(())) => {
                     // Begin every start before waiting for any, so the servers
                     // warm side by side.
-                    drop(self.session(adapter, workspace).await);
-                    starting.push((adapter, started));
+                    match self.session(adapter, workspace).await {
+                        Ok(session) => {
+                            drop(session);
+                            starting.push((adapter, started));
+                        }
+                        // The provider's window is open (`breaker`).
+                        Err(error) => {
+                            outcomes.insert(adapter.provider(), Err(error));
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
                     outcomes.insert(adapter.provider(), Err(error));
@@ -2799,20 +2992,25 @@ mod tests {
         }
     }
 
-    /// An index file list that counts how many stamps are being taken at once.
-    struct SlowFiles {
+    /// An index file list that counts how many stamps are being taken at once,
+    /// and holds each one until the test hands it a permit.
+    struct GatedFiles {
         in_flight: std::sync::atomic::AtomicUsize,
         most: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
+        /// Released once a stamp has been entered (the first one to be taken).
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
     }
 
     #[async_trait::async_trait]
-    impl stamp::IndexedFiles for SlowFiles {
+    impl stamp::IndexedFiles for GatedFiles {
         async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(now, Ordering::SeqCst);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            self.entered.notify_one();
+            self.gate.acquire().await.unwrap().forget();
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Some(Arc::new(vec!["src/lib.rs".to_owned()]))
         }
@@ -2821,8 +3019,15 @@ mod tests {
     /// The barriers of one workspace run one at a time: a barrier that took
     /// its stamp before another finished could record an older stamp over the
     /// newer one and stop the server the other had just started.
+    ///
+    /// No timer: the stub holds every stamp it is asked for until the test
+    /// adds a permit, and the test adds them once the first stamp has been
+    /// entered. On the current-thread runtime of `#[tokio::test]` the three
+    /// spawned barriers are polled in order before the test resumes, so a
+    /// barrier without its workspace lock would already be inside the stub
+    /// (`most` 3); with the lock, the other two wait on it, and `most` is 1.
     #[tokio::test]
-    async fn concurrent_barriers_of_one_workspace_run_one_at_a_time() {
+    async fn concurrent_barriers_of_one_workspace_are_serialised_without_a_timer() {
         let temp = tempfile::tempdir().unwrap();
         let path = dunce::canonicalize(temp.path()).unwrap();
         let ws = Workspace {
@@ -2831,20 +3036,30 @@ mod tests {
         };
         std::fs::create_dir_all(ws.path.join("src")).unwrap();
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        let source = Arc::new(SlowFiles {
+        let source = Arc::new(GatedFiles {
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             most: std::sync::atomic::AtomicUsize::new(0),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
         });
-        let manager = Manager::new(&Config::default())
-            .with_indexed_files(Arc::clone(&source) as Arc<dyn stamp::IndexedFiles>);
-        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
-        let only = [&rust];
-        let (a, b, c) = tokio::join!(
-            manager.tree_barrier(&ws, &only),
-            manager.tree_barrier(&ws, &only),
-            manager.tree_barrier(&ws, &only),
+        let manager = Arc::new(
+            Manager::new(&Config::default())
+                .with_indexed_files(Arc::clone(&source) as Arc<dyn stamp::IndexedFiles>),
         );
+        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
+        let barriers: Vec<_> = (0..3)
+            .map(|_| {
+                let (manager, ws, rust) = (Arc::clone(&manager), ws.clone(), Arc::clone(&rust));
+                tokio::spawn(async move { manager.tree_barrier(&ws, &[&rust]).await })
+            })
+            .collect();
+        source.entered.notified().await;
+        source.gate.add_permits(3);
+        let mut restarted = Vec::new();
+        for barrier in barriers {
+            restarted.push(barrier.await.unwrap());
+        }
         assert_eq!(source.calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             source.most.load(Ordering::SeqCst),
@@ -2852,7 +3067,7 @@ mod tests {
             "two barriers of one workspace took their stamps at once"
         );
         // No session ran, so nothing was stopped or kept.
-        for restarted in [a, b, c] {
+        for restarted in restarted {
             assert!(restarted.is_empty());
         }
     }
@@ -2885,6 +3100,162 @@ mod tests {
         let other = Manager::new(&Config::default());
         other.probe_once(&adapter, timeout).await.unwrap();
         assert_eq!(counts.asked.load(Ordering::SeqCst), 3);
+    }
+
+    /// A window long enough that no test outlives it: a test that needs it to
+    /// have passed calls `expire` instead of waiting.
+    fn long_window() -> Arc<LspBreakers> {
+        Arc::new(LspBreakers::new(Duration::from_secs(3600)))
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_opens_the_window_and_the_next_caller_is_refused_without_a_probe() {
+        let timeout = Duration::from_secs(1);
+        let adapter = Arc::new(Probing {
+            answers: vec![false, true],
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let asked = || adapter.asked.load(Ordering::SeqCst);
+        let dyn_adapter: Arc<dyn LspAdapter> = Arc::clone(&adapter) as Arc<dyn LspAdapter>;
+        let breakers = long_window();
+        let manager = Manager::new(&Config::default()).with_breakers(Some(Arc::clone(&breakers)));
+        // The first probe fails and is run.
+        assert!(manager.probe_once(&dyn_adapter, timeout).await.is_err());
+        assert_eq!(asked(), 1);
+        assert!(breakers.remaining("probing-server").is_some());
+        // The next caller is refused by the window, with no probe.
+        let refused = manager.probe_once(&dyn_adapter, timeout).await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("lsp breaker"),
+            "{refused:#}"
+        );
+        assert_eq!(asked(), 1);
+        // The window has passed: the provider is probed again, and the
+        // success is remembered.
+        breakers.expire("probing-server");
+        manager.probe_once(&dyn_adapter, timeout).await.unwrap();
+        assert_eq!(asked(), 2);
+        assert!(breakers.remaining("probing-server").is_none());
+        manager.probe_once(&dyn_adapter, timeout).await.unwrap();
+        assert_eq!(asked(), 2);
+    }
+
+    /// An adapter whose version probe passes and whose server cannot start (it
+    /// has no executable), counting the starts it was asked for.
+    struct Starting {
+        starts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LspAdapter for Starting {
+        fn provider(&self) -> &'static str {
+            "starting-server"
+        }
+        fn languages(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn configured_command(&self) -> Option<String> {
+            None
+        }
+        fn readiness_component_name(&self) -> &'static str {
+            "starting_server_available"
+        }
+        async fn probe_readiness(&self, _timeout: Duration) -> Result<()> {
+            Ok(())
+        }
+        fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        fn initialize_params(&self, _root: &std::path::Path) -> Option<Value> {
+            None
+        }
+        fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+            Box::new(|_| false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_opens_the_window_and_the_next_request_is_refused_at_once() {
+        let stub = Arc::new(Starting {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let starts = || stub.starts.load(Ordering::SeqCst);
+        let adapter: Arc<dyn LspAdapter> = Arc::clone(&stub) as Arc<dyn LspAdapter>;
+        let workspace = prime_workspace();
+        let breakers = long_window();
+        let manager = Manager::new(&Config::default()).with_breakers(Some(Arc::clone(&breakers)));
+        // The first request starts the server once; the start fails, which
+        // opens the window.
+        let first = manager
+            .symbols(&adapter, &workspace, "x")
+            .await
+            .unwrap_err();
+        let first = format!("{first:#}");
+        assert!(first.contains("disabled or has no executable"), "{first}");
+        assert!(!first.contains("lsp breaker"), "{first}");
+        assert_eq!(starts(), 1);
+        assert!(breakers.remaining("starting-server").is_some());
+        // The next request is refused at once: no start is attempted.
+        let second = manager
+            .symbols(&adapter, &workspace, "x")
+            .await
+            .unwrap_err();
+        assert!(format!("{second:#}").contains("lsp breaker"), "{second:#}");
+        assert_eq!(starts(), 1);
+        // The window has passed: the server is started again.
+        breakers.expire("starting-server");
+        assert!(manager.symbols(&adapter, &workspace, "x").await.is_err());
+        assert_eq!(starts(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_the_breaker_every_request_starts_the_server_again() {
+        let stub = Arc::new(Starting {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let adapter: Arc<dyn LspAdapter> = Arc::clone(&stub) as Arc<dyn LspAdapter>;
+        let workspace = prime_workspace();
+        let manager = Manager::new(&Config::default());
+        assert!(manager.breakers().is_none());
+        for _ in 0..2 {
+            let error = manager
+                .symbols(&adapter, &workspace, "x")
+                .await
+                .unwrap_err();
+            assert!(!format!("{error:#}").contains("lsp breaker"), "{error:#}");
+        }
+        // Each request starts the server again.
+        assert_eq!(stub.starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_timed_out_start_opens_no_window() {
+        let breakers = LspBreakers::new(Duration::from_secs(3600));
+        let timed_out: Result<()> = Err(anyhow::Error::new(InactivityTimeout {
+            label: "csharp-ls".into(),
+            seconds: 5,
+        })
+        .context("initialize csharp-ls"));
+        // A slow start is not a dead one.
+        breakers.note_start("csharp-ls", &timed_out);
+        assert!(breakers.remaining("csharp-ls").is_none());
+        // Any other failure of a start opens the window.
+        breakers.note_start("csharp-ls", &Err::<(), _>(anyhow!("start x: no such file")));
+        assert!(breakers.remaining("csharp-ls").is_some());
+        // Another provider is not touched, and a start that succeeds closes it.
+        assert!(breakers.remaining("rust-analyzer").is_none());
+        breakers.note_start("csharp-ls", &Ok(()));
+        assert!(breakers.remaining("csharp-ls").is_none());
+        // A timed-out start leaves an open window as it is.
+        breakers.trip("csharp-ls");
+        breakers.note_start("csharp-ls", &timed_out);
+        assert!(breakers.remaining("csharp-ls").is_some());
+        breakers.reset();
+        assert!(breakers.remaining("csharp-ls").is_none());
     }
 
     /// How a [`Primable`]'s version probe behaves.
