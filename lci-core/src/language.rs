@@ -674,7 +674,10 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
     // therefore chunked with the C grammar (recovered, still searchable) and
     // carry the language `c`; C++ projects that want the C++ grammar name
     // their headers `.hpp`, `.hh`, or `.hxx`. clangd serves both families,
-    // so navigation on a `.h` file is unaffected.
+    // so navigation on a `.h` file is unaffected. Extensions match in any
+    // ASCII case (N94), so `.H` is `c` too, and so is `.C` (C++ by the old
+    // Unix convention), chunked with the C grammar (recovered), which is
+    // a better floor than not indexing it; clangd types a file by its driver.
     LanguageAdapter {
         extension: "h",
         identifier: "c",
