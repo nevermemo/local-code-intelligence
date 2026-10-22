@@ -112,7 +112,8 @@
 //! are listed when the walk ends by [`ManagerBackend::walk`] (the sessions its
 //! requests found running, not the barrier's view: two walks can both pass
 //! the barrier before either starts a server), and the walk labels their
-//! answers.
+//! answers. Navigation and the search channel, which use the same manager,
+//! pass the same barrier once per call and are recorded the same way.
 //!
 //! A missing server binary is found by [`ManagerBackend::open`], before any
 //! walk, as an error the caller reports; the map is then not registered. The

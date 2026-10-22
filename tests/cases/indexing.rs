@@ -3736,6 +3736,18 @@ fn spawn_count(state: &Path) -> u64 {
         .unwrap()
 }
 
+/// A search report's notes without the ones the tree barrier adds for a
+/// language server the search found running or restarted (`lsp: <provider>
+/// kept session; ...`, `lsp: <provider> restarted: ...`, N104): the tests here
+/// are about the notes of a start and a budget, not of a kept session.
+fn without_barrier_notes(notes: &[String]) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|note| !note.starts_with("lsp: "))
+        .cloned()
+        .collect()
+}
+
 /// Searches until one finishes without the "language server still starting"
 /// note, i.e. until the server is up and primed. Bounded at about 20 s.
 async fn search_until_the_language_server_answers(
@@ -3745,7 +3757,7 @@ async fn search_until_the_language_server_answers(
 ) -> local_code_intelligence::app::SearchReport {
     for _ in 0..100 {
         let report = app.search(workspace, query, Some(10)).await.unwrap();
-        if report.notes.is_empty() {
+        if without_barrier_notes(&report.notes).is_empty() {
             return report;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3812,10 +3824,19 @@ async fn a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming
         warm.notes
     );
     assert!(warm.warning.is_none(), "{:?}", warm.warning);
-    assert!(warm.notes.is_empty(), "{:?}", warm.notes);
+    // Nothing to note about a start or the budget; the server it found
+    // running is the one note (the tree barrier's, N104).
     assert!(
-        serde_json::to_value(&warm).unwrap().get("notes").is_none(),
-        "a search with nothing to note leaves the field out"
+        without_barrier_notes(&warm.notes).is_empty(),
+        "{:?}",
+        warm.notes
+    );
+    assert!(
+        warm.notes
+            .iter()
+            .all(|note| note.starts_with("lsp: csharp-ls kept session; ")),
+        "{:?}",
+        warm.notes
     );
     assert_eq!(
         spawn_count(&state),
@@ -3855,6 +3876,8 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
             .await
             .unwrap();
         assert!(early.warning.is_none(), "{:?}", early.warning);
+        // Search 1 finds the session running but misses the budget: that is
+        // the one note (no `kept session` label on an answer it never gave).
         assert_eq!(early.notes.len(), 1, "search {attempt}: {:?}", early.notes);
         assert!(
             !channels_seen(&early).contains("lsp"),
@@ -3980,7 +4003,11 @@ async fn concurrent_searches_start_one_language_server() {
             report.warning,
             report.notes
         );
-        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        assert!(
+            without_barrier_notes(&report.notes).is_empty(),
+            "{:?}",
+            report.notes
+        );
     }
     assert_eq!(
         spawn_count(&state),
@@ -5647,8 +5674,10 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
         for part in &maps.warnings {
             assert!(warning.contains(part.as_str()), "{part} not in {warning}");
         }
+        // The map path does not carry the tree barrier's notes.
         assert_eq!(
-            maps.notes, report.notes,
+            maps.notes,
+            without_barrier_notes(&report.notes),
             "embedding fails: {embedding_fails}"
         );
         assert_eq!(

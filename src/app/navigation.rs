@@ -27,6 +27,39 @@ pub struct NavigationReport {
     /// as an error.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// What the tree barrier did for the servers this call asked, which is
+    /// information about the answer, not a failure (see [`barrier_notes`]):
+    /// `lsp: <provider> restarted: the tree changed since its last call` for a
+    /// kept server the barrier stopped (the answer is from a fresh one), then
+    /// `lsp: <provider> kept session; tree stamp unchanged since <n> s ago`
+    /// (or `; no tree stamp was recorded for it`) for a server this call found
+    /// running (exact for what the stamp covers). A server this call started
+    /// adds nothing. Absent from the JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// The notes of a call that passed the tree barrier
+/// ([`lsp::Manager::tree_barrier`]) and made its requests inside a
+/// [`lsp::WalkSessions`] scope: one `restarted` entry per provider whose kept
+/// session the barrier stopped, then one `kept session` entry per provider
+/// whose answers came from a session the call found running. The wording is
+/// the traversal's `lsp.live` notes with `lsp:` as the prefix.
+pub(crate) fn barrier_notes(
+    restarted: &[&'static str],
+    reused: &[(&'static str, Option<std::time::Duration>)],
+) -> Vec<String> {
+    let restarted = restarted
+        .iter()
+        .map(|provider| format!("lsp: {provider} restarted: the tree changed since its last call"));
+    let reused = reused.iter().map(|(provider, unchanged)| match unchanged {
+        Some(unchanged) => format!(
+            "lsp: {provider} kept session; tree stamp unchanged since {} s ago",
+            unchanged.as_secs()
+        ),
+        None => format!("lsp: {provider} kept session; no tree stamp was recorded for it"),
+    });
+    restarted.chain(reused).collect()
 }
 
 /// What [`App::release_language_servers`] stopped.
@@ -111,12 +144,25 @@ impl App {
         not_searched.sort();
         let mut results = Vec::new();
         let mut failures: Vec<(&'static str, String)> = Vec::new();
-        for adapter in applicable.values() {
-            match self.analyzer.symbols(adapter, &workspace, query).await {
-                Ok(mut found) => results.append(&mut found),
-                Err(error) => failures.push((adapter.provider(), format!("{error:#}"))),
+        // A kept session passes the tree barrier before any request, once per
+        // call (see `Manager::tree_barrier`); the requests run in one scope
+        // that records which sessions the call found running.
+        let applicable_refs: Vec<&Arc<dyn LspAdapter>> = applicable.values().collect();
+        let restarted = self
+            .analyzer
+            .tree_barrier(&workspace, &applicable_refs)
+            .await;
+        let walk = Arc::new(lsp::WalkSessions::default());
+        walk.scope(async {
+            for adapter in applicable.values() {
+                match self.analyzer.symbols(adapter, &workspace, query).await {
+                    Ok(mut found) => results.append(&mut found),
+                    Err(error) => failures.push((adapter.provider(), format!("{error:#}"))),
+                }
             }
-        }
+        })
+        .await;
+        let notes = barrier_notes(&restarted, &walk.reused());
         // `applicable` is a map, so sort for a stable message and log order.
         failures.sort();
         order_symbols(&mut results);
@@ -153,6 +199,7 @@ impl App {
             workspace,
             results,
             warnings,
+            notes,
         })
     }
 
@@ -218,21 +265,24 @@ impl App {
         let file = Self::source_path(&workspace, relative_file_path)?;
         let (language, adapter) = self.navigation_target(&file)?;
         Self::ensure_indexed_language(&workspace, language, &self.store).await?;
-        let results = self
-            .analyzer
-            .definition(
+        // The kept session passes the tree barrier first (see `symbols`).
+        let restarted = self.analyzer.tree_barrier(&workspace, &[&adapter]).await;
+        let walk = Arc::new(lsp::WalkSessions::default());
+        let results = walk
+            .scope(self.analyzer.definition(
                 &adapter,
                 &workspace,
                 &file,
                 relative_file_path,
                 line - 1,
                 character,
-            )
+            ))
             .await?;
         Ok(NavigationReport {
             workspace,
             results,
             warnings: Vec::new(),
+            notes: barrier_notes(&restarted, &walk.reused()),
         })
     }
 
@@ -249,9 +299,10 @@ impl App {
         let file = Self::source_path(&workspace, relative_file_path)?;
         let (language, adapter) = self.navigation_target(&file)?;
         Self::ensure_indexed_language(&workspace, language, &self.store).await?;
-        let results = self
-            .analyzer
-            .references(
+        let restarted = self.analyzer.tree_barrier(&workspace, &[&adapter]).await;
+        let walk = Arc::new(lsp::WalkSessions::default());
+        let results = walk
+            .scope(self.analyzer.references(
                 &adapter,
                 &workspace,
                 &file,
@@ -259,12 +310,13 @@ impl App {
                 line - 1,
                 character,
                 include_declaration,
-            )
+            ))
             .await?;
         Ok(NavigationReport {
             workspace,
             results,
             warnings: Vec::new(),
+            notes: barrier_notes(&restarted, &walk.reused()),
         })
     }
 }
@@ -319,6 +371,47 @@ mod tests {
         order_symbols(&mut other);
         assert_eq!(one, other);
         assert_eq!(one, [first, early, late]);
+    }
+
+    fn report(notes: Vec<String>) -> NavigationReport {
+        NavigationReport {
+            workspace: Workspace {
+                id: "w".to_owned(),
+                path: std::path::PathBuf::from("/w"),
+            },
+            results: Vec::new(),
+            warnings: Vec::new(),
+            notes,
+        }
+    }
+
+    /// The wire: an answer with no barrier note serialises as it did before
+    /// `notes` existed.
+    #[test]
+    fn a_report_without_notes_serialises_without_the_key() {
+        let json = serde_json::to_value(report(Vec::new())).unwrap();
+        assert!(json.get("notes").is_none(), "{json}");
+        assert!(json.get("warnings").is_none(), "{json}");
+        let json =
+            serde_json::to_value(report(vec!["lsp: csharp-ls restarted".to_owned()])).unwrap();
+        assert_eq!(json["notes"][0], "lsp: csharp-ls restarted");
+    }
+
+    #[test]
+    fn the_barrier_notes_list_restarts_first_then_kept_sessions() {
+        use std::time::Duration;
+        assert!(barrier_notes(&[], &[]).is_empty());
+        assert_eq!(
+            barrier_notes(
+                &["csharp-ls"],
+                &[("pyright", Some(Duration::from_secs(7))), ("clangd", None)]
+            ),
+            [
+                "lsp: csharp-ls restarted: the tree changed since its last call",
+                "lsp: pyright kept session; tree stamp unchanged since 7 s ago",
+                "lsp: clangd kept session; no tree stamp was recorded for it",
+            ]
+        );
     }
 
     #[test]

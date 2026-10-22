@@ -3245,7 +3245,7 @@ async fn manager_readiness_reports_starting_then_ready_and_the_status_shows_it()
     let wire = serde_json::to_value(&status).unwrap();
     assert_eq!(wire["analyzers"]["csharp-ls"]["state"], "ready", "{wire}");
     assert!(wire["analyzers"]["rust-analyzer"].is_null(), "{wire}");
-    assert_eq!(wire["analyzers"].as_object().unwrap().len(), 7, "{wire}");
+    assert_eq!(wire["analyzers"].as_object().unwrap().len(), 8, "{wire}");
     models_task.abort();
 
     // A server that cannot be started is `failed`.
@@ -3295,6 +3295,7 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
         "csharp-ls",
         "gopls",
         "jdtls",
+        "marksman",
         "pyright",
         "rust-analyzer",
         "typescript-language-server",
@@ -5495,7 +5496,10 @@ async fn a_synced_change_drops_the_files_kept_outline() {
 /// text calls `Add`. It lives next to the workspace, never in it. The graph
 /// has no call edge: the only way from `Add` to `Run` is `lsp.live`'s
 /// `textDocument/references`.
-fn csharp_scip_index(temp: &tempfile::TempDir, workspace: &Workspace) -> std::path::PathBuf {
+pub(super) fn csharp_scip_index(
+    temp: &tempfile::TempDir,
+    workspace: &Workspace,
+) -> std::path::PathBuf {
     csharp_scip_index_of(
         &temp.path().join("index.scip"),
         workspace,
@@ -5550,7 +5554,7 @@ fn csharp_scip_index_of(
 /// The C# fixture with the `documents`-mode fake and a request timeout that a
 /// slow start under load does not exceed; rust-analyzer is pointed at a binary
 /// that does not exist, so no test depends on one being installed.
-fn shared_sessions_fixture(
+pub(super) fn shared_sessions_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
@@ -5566,7 +5570,7 @@ fn shared_sessions_fixture(
 /// the sync tells it. csharp-ls is a non-watching adapter, so without `watch`
 /// a walk starts its own csharp-ls, as under `per_call`; the tests that mean a
 /// server shared across calls use this fixture.
-fn watching_sessions_fixture(
+pub(super) fn watching_sessions_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state, index) = shared_sessions_fixture(temp);
@@ -5588,7 +5592,7 @@ impl local_code_intelligence::lsp::stamp::IndexedFiles for SnapshotFiles {
 /// A manager of `config` that has `workspace`'s index snapshot, as the
 /// service's has: without one the tree barrier restarts every shared session
 /// it is asked about (no sharing without a stamp).
-fn indexed_manager(config: &Config, workspace: &Workspace) -> Arc<Manager> {
+pub(super) fn indexed_manager(config: &Config, workspace: &Workspace) -> Arc<Manager> {
     indexed_manager_listing(config, workspace, &[])
 }
 
@@ -5607,7 +5611,7 @@ fn indexed_manager_listing(config: &Config, workspace: &Workspace, extra: &[&str
 /// Gives every file and directory under `root` (and `root`) an old
 /// modification time, so that a change made after it cannot share its clock
 /// tick (a directory's modification time moves when an entry is added).
-fn age_tree(root: &std::path::Path) {
+pub(super) fn age_tree(root: &std::path::Path) {
     fn set_modified(path: &std::path::Path, time: std::time::SystemTime) {
         let mut options = std::fs::OpenOptions::new();
         #[cfg(windows)]
@@ -5636,7 +5640,7 @@ fn age_tree(root: &std::path::Path) {
 
 /// Whether the walk noted that the tree barrier restarted `provider`'s kept
 /// session.
-fn restart_noted(answer: &Value, provider: &str) -> bool {
+pub(super) fn restart_noted(answer: &Value, provider: &str) -> bool {
     let wanted = format!("lsp.live: {provider} restarted: the tree changed since its last call");
     answer["notes"].as_array().is_some_and(|notes| {
         notes
@@ -5648,7 +5652,7 @@ fn restart_noted(answer: &Value, provider: &str) -> bool {
 /// Whether the walk labelled its answer as coming from a kept session of
 /// `provider`, whose tree stamp has not changed (the answer of a reused server
 /// is not a fresh server's).
-fn kept_noted(answer: &Value, provider: &str) -> bool {
+pub(super) fn kept_noted(answer: &Value, provider: &str) -> bool {
     let wanted = format!("lsp.live: {provider} kept session; tree stamp unchanged since ");
     answer["notes"].as_array().is_some_and(|notes| {
         notes
@@ -5660,7 +5664,7 @@ fn kept_noted(answer: &Value, provider: &str) -> bool {
 /// One `lsp.live` traversal of `Add` over the fixture, under `sessions`, with
 /// `manager` offered as the shared manager. The budgets are wide: a cold fake
 /// server starts well inside them even on a loaded machine.
-async fn traverse_add(
+pub(super) async fn traverse_add(
     config: &Config,
     workspace: &Workspace,
     index: &std::path::Path,
@@ -5843,7 +5847,7 @@ async fn traverse_add_past_a_cold_start(
 }
 
 /// Whether the answer reached `Run` through `lsp.live`.
-fn reached_run_through_lsp_live(answer: &Value) -> bool {
+pub(super) fn reached_run_through_lsp_live(answer: &Value) -> bool {
     answer["results"].as_array().is_some_and(|cards| {
         cards.iter().any(|card| {
             card["node"].as_str() == Some("sym:rust:CallSite.cs::Run/fn")
@@ -5891,17 +5895,20 @@ async fn finished_warm_start(
 /// over the `documents`-mode fake, with the C# workspace indexed (a warm start
 /// waits for an index). `extra_args` are more fake-server flags; `tweak`
 /// changes the configuration before the service opens.
-struct WarmService {
-    temp: tempfile::TempDir,
-    config: Config,
-    app: App,
-    workspace: Workspace,
-    state: std::path::PathBuf,
+pub(super) struct WarmService {
+    pub(super) temp: tempfile::TempDir,
+    pub(super) config: Config,
+    pub(super) app: App,
+    pub(super) workspace: Workspace,
+    pub(super) state: std::path::PathBuf,
     _fake: Arc<FakeModels>,
-    models_task: tokio::task::JoinHandle<()>,
+    pub(super) models_task: tokio::task::JoinHandle<()>,
 }
 
-async fn indexed_warm_service(extra_args: &[&str], tweak: impl FnOnce(&mut Config)) -> WarmService {
+pub(super) async fn indexed_warm_service(
+    extra_args: &[&str],
+    tweak: impl FnOnce(&mut Config),
+) -> WarmService {
     let (temp, config, fake, models_task) = fixture().await;
     let state = temp.path().join("state");
     let path = temp.path().join("workspace");
@@ -6991,7 +6998,7 @@ fn reached_through_lsp_live(answer: &Value, node: &str) -> bool {
 }
 
 /// `CallSite.cs` with a second caller of `Add` on a line of its own.
-const CALL_SITE_WITH_TWICE_CS: &str = "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\npublic static class More { public static int Twice(Calculator value) => value.Add(2, 2); }\n";
+pub(super) const CALL_SITE_WITH_TWICE_CS: &str = "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\npublic static class More { public static int Twice(Calculator value) => value.Add(2, 2); }\n";
 
 /// Under the default `sessions = "shared"` a server that is shared (here
 /// csharp-ls under `sync = "watch"`) outlives the walk that started it. The
@@ -8367,7 +8374,7 @@ fn barrier_only_fixture(
 /// How many server processes the fake started in `state`. `spawns/` holds one
 /// entry per start, claimed atomically, so it counts overlapping starts that
 /// `spawn_count.txt` (last writer wins) can hide.
-fn spawns_started(state: &std::path::Path) -> usize {
+pub(super) fn spawns_started(state: &std::path::Path) -> usize {
     std::fs::read_dir(state.join("spawns"))
         .map(|entries| entries.count())
         .unwrap_or(0)

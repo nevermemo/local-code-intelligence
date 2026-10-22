@@ -15,18 +15,18 @@ per-server limits are in the same section, and plans are in [the roadmap](develo
 | Java (`.java`) | `jdtls`, `lsp/java.rs`, shipped. `[java].path` is the install directory; LCI spawns `java` itself | `tree-sitter-java` 0.23.5. Chunks types, methods, constructors, fields and static initializers | None verified. `scip-java` is listed in prior art only | None | Needs JDK 21+. Windows: the spawn avoids jdtls's Python launcher, which hung because the `java` grandchild survived a kill |
 | C (`.c`, `.h`) | One shared `clangd`, `lsp/clangd.rs`, shipped | `tree-sitter-c` 0.24.2. Chunks functions, declarations, type definitions, struct, union and enum specifiers, preprocessor definitions | None verified. `scip-clang` is listed in prior art only | None | `.h` is always `c`, even in C++ projects. `compile_commands.json` is optional (`[clangd].args`) |
 | C++ (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`) | The same shared `clangd` | `tree-sitter-cpp` 0.23.4. Chunks namespaces, classes, structs, unions, functions, declarations, type definitions, templates, enums, preprocessor definitions | None verified | None | A `.h` header in a C++ project is chunked with the C grammar |
-| Markdown (`.md`) | None. `marksman` adapter planned (K12c, N95) | Hand-written heading splitter, no grammar. Off by default (`[index].prose = false`) | Not applicable | Instructions set (document sections). The docs-for-code set (548 items) exists; whether its documents are Markdown is not verified | The language bar's server item is waived for prose until marksman lands |
+| Markdown (`.md`) | `marksman`, `lsp/markdown.rs`, shipped. Headings and links only (outline, link definition, references to a heading); not part of the search LSP channel; reached only for an indexed prose file | Hand-written heading splitter, no grammar. Off by default (`[index].prose = false`) | Not applicable | Instructions set (document sections). The docs-for-code set (548 items) exists; whether its documents are Markdown is not verified | The server needs `[index].prose = true` and `[markdown].path` (a `marksman` release) and a `.git` directory or `.marksman.toml` at the workspace root (LCI writes none); headings are named `H<level>: <text>`; real-server acceptance is `acceptance markdown-lsp` |
 
 Every code language also has a chunk golden (`every_language_chunks.json`) and a fixture in the `multilingual`
 acceptance. Those check indexing, not retrieval questions, so they are not counted as gold above. Live acceptance
-has `*-lsp`, `*-missing` and `*-recovery` steps for Python, TypeScript, Go, Java, C#, C and C++, and only an `lsp` step
+has `*-lsp`, `*-missing` and `*-recovery` steps for Python, TypeScript, Go, Java, C#, C and C++, `markdown-lsp` and `markdown-missing` steps for Markdown, and only an `lsp` step
 for Rust; each skips when its tool is missing ([local live acceptance](development/local-live-acceptance.md)).
 
 Gold column: gold files are private and outside the repository except the seed questions (`eval-seed.json`) and the
 bug-localisation set (`gold-bugloc.json`), both under `docs/spike/multimap`; the sets are listed in
 [evaluation.md](spike/multimap/evaluation.md#sets). No set exists for C#, Go, Java, C, C++, Python or
 TypeScript and JavaScript code questions. The 450-key structured-grep spike sample (LCI, Vite, Home Assistant) measured live grep on config keys and is not retrieval gold. The languages of the 15 public repositories planned for the agent A/B
-pilot are not verified. External held-out gold (SWE-PolyBench Verified, LongCodeArena): the converter and the leak check are built (K4a, d484); the download, the real conversion and the counts are K4b.
+pilot are not verified. External held-out gold (SWE-PolyBench Verified, LongCodeArena): built (K4a d484, K4b d499), data in the owner's gold directory and never in the repository; the LongCodeArena parquet files go through a one-off conversion to JSONL outside the repository (no parquet reader in xtask); counts in [evaluation.md](spike/multimap/evaluation.md#sets).
 
 Syntax tier plans: tree-sitter 0.26 (K15a; today the runtime is 0.25 and the grammar crates are 0.23 to 0.25), Codanna parsing and resolution behind a Cargo
-feature (K14a to K14d), structural grep over `ast-grep-core` (K19).
+feature (K14a to K14d), structural grep over `ast-grep-core` (K19: built as the opt-in map `grep.structural`, pinned to `=0.40.1` because it needs tree-sitter 0.25; ceiling in test-results).

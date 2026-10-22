@@ -7,6 +7,7 @@ use crate::{
         csharp::CSharpServer,
         go::GoServer,
         java::JavaServer,
+        markdown::MarkdownServer,
         python::PythonServer,
         rust::RustServer,
         transport::{InactivityTimeout, JsonRpcClient, RpcError},
@@ -36,6 +37,7 @@ pub mod go;
 pub mod java;
 #[cfg(windows)]
 mod job;
+pub mod markdown;
 pub mod python;
 pub mod rust;
 pub mod stamp;
@@ -760,8 +762,9 @@ tokio::task_local! {
 /// before either starts a server. So the manager records it when a request
 /// acquires its session ([`Manager::session`]), for the requests made inside
 /// [`WalkSessions::scope`]; the walk reads [`Self::reused`] when it ends and
-/// labels the answers of a reused server. Requests made outside a scope (the
-/// warm start, navigation, the search channel) are not recorded.
+/// labels the answers of a reused server. Navigation and the search channel
+/// make their requests inside a scope too. Requests made outside a scope (the
+/// warm start) are not recorded.
 #[derive(Default)]
 pub struct WalkSessions {
     seen: std::sync::Mutex<Vec<SessionUse>>,
@@ -1078,6 +1081,7 @@ impl Manager {
             Arc::new(GoServer::new(&config.go, timeout)),
             Arc::new(JavaServer::new(config, timeout)),
             Arc::new(ClangdServer::new(&config.clangd, timeout)),
+            Arc::new(MarkdownServer::new(&config.markdown, timeout)),
         ];
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let syncs = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -2951,7 +2955,7 @@ mod tests {
         assert_eq!(watching, ["rust-analyzer"]);
         assert_eq!(
             manager.adapters().len(),
-            7,
+            8,
             "a new adapter must be classified"
         );
     }
@@ -3745,6 +3749,7 @@ mod tests {
                 ("csharp-ls", false),
                 ("gopls", true),
                 ("jdtls", true),
+                ("marksman", true),
                 ("pyright", true),
                 ("rust-analyzer", false),
                 ("typescript-language-server", false),

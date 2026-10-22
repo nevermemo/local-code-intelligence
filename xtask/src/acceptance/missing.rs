@@ -223,7 +223,7 @@ async fn checks(
             spec.display_name
         );
     }
-    if !warning_mentions_provider {
+    if search_reports_missing_server(spec) && !warning_mentions_provider {
         bail!(
             "search_code did not report the unavailable optional {} provider: {search_body}",
             spec.display_name
@@ -322,6 +322,22 @@ async fn checks(
     }
 
     Ok(())
+}
+
+/// The languages whose server does not join the search's LSP channel
+/// (`LspAdapter::joins_search_channel` is `false`: marksman's symbols are
+/// headings, not code names). A search never starts such a server, so it has
+/// no unavailable-provider warning to give; navigation and the service
+/// status still report it.
+const OUT_OF_SEARCH_CHANNEL: &[&str] = &["markdown"];
+
+/// Whether a search filtered to this spec's languages reports a missing
+/// server: every server does except one outside the search channel.
+fn search_reports_missing_server(spec: &MissingServerSpec) -> bool {
+    !spec
+        .search_languages
+        .iter()
+        .any(|language| OUT_OF_SEARCH_CHANNEL.contains(language))
 }
 
 /// True when `text` names the optional provider directly, or mentions the
@@ -441,7 +457,8 @@ fn search_returns_calculator(body: &str) -> bool {
 mod tests {
     use super::{
         MissingServerSpec, ProcessCheck, definition_error_is_tooling_error,
-        search_returns_calculator, service_status_reports_missing_provider,
+        search_reports_missing_server, search_returns_calculator,
+        service_status_reports_missing_provider,
     };
     use serde_json::{Value, json};
 
@@ -465,7 +482,31 @@ mod tests {
         }
     }
 
+    fn markdown_spec() -> MissingServerSpec {
+        MissingServerSpec {
+            language_key: "markdown",
+            display_name: "Markdown",
+            config_section: "markdown",
+            missing_path: "missing-marksman",
+            extra_config_lines: vec![],
+            source_files: vec![],
+            search_query: "query",
+            search_languages: &["markdown"],
+            definition_file: "docs/source.md",
+            definition_line: 1,
+            definition_character: 1,
+            exact_provider_terms: &["marksman", "markdown language server"],
+            near_word: "markdown",
+            extra_terms: &["marksman"],
+            process_check: ProcessCheck::Children("marksman"),
+        }
+    }
+
     fn status_body(component_ready: bool, degraded: Value) -> String {
+        component_status_body("go_language_server_available", component_ready, degraded)
+    }
+
+    fn component_status_body(name: &str, component_ready: bool, degraded: Value) -> String {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -474,7 +515,7 @@ mod tests {
                     "ready": true,
                     "can_create_semantic_index": true,
                     "components": [{
-                        "name": "go_language_server_available",
+                        "name": name,
                         "ready": component_ready,
                         "required": false,
                         "detail": null
@@ -569,6 +610,34 @@ mod tests {
             &sse_body,
             &go_spec()
         ));
+    }
+
+    #[test]
+    fn a_missing_marksman_is_a_degraded_markdown_component_and_not_a_search_warning() {
+        let name = "markdown_language_server_available";
+        let spec = markdown_spec();
+        let degraded =
+            json!([{"name": name, "reason": "configured marksman command is unavailable"}]);
+        assert!(service_status_reports_missing_provider(
+            &component_status_body(name, false, degraded.clone()),
+            &spec
+        ));
+        assert!(!service_status_reports_missing_provider(
+            &component_status_body(name, true, json!([])),
+            &spec
+        ));
+        // The Go component does not count for the Markdown spec.
+        assert!(!service_status_reports_missing_provider(
+            &status_body(false, json!([{"name": "go_language_server_available"}])),
+            &spec
+        ));
+        assert!(definition_error_is_tooling_error(
+            "marksman is disabled or has no executable",
+            &spec
+        ));
+        // marksman stays out of the search channel; every other server warns.
+        assert!(!search_reports_missing_server(&spec));
+        assert!(search_reports_missing_server(&go_spec()));
     }
 
     #[test]

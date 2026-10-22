@@ -149,7 +149,7 @@ pub struct Status {
     pub clangd_analyzer_running: bool,
     /// Whether a started, ready language server is running for this
     /// workspace, keyed by provider name (`rust-analyzer`, `csharp-ls`,
-    /// `typescript-language-server`, `pyright`, `gopls`, `jdtls`, `clangd`).
+    /// `typescript-language-server`, `pyright`, `gopls`, `jdtls`, `clangd`, `marksman`).
     /// Derived from the language-server registry, so it has one entry for
     /// every registered server, `false` for one that is not running, disabled
     /// or unconfigured.

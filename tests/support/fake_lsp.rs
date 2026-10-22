@@ -194,6 +194,12 @@ pub struct FakeLspConfig {
     /// the tree-stamp barrier to be the only way an edit reaches a kept server
     /// sets it; off by default.
     pub ignore_watched_files: bool,
+    /// `--exit-at-start`: after claiming its start ordinal (`spawns/<n>`) the
+    /// server exits 0 on the first frame it reads, the `initialize` request,
+    /// and answers nothing: a start that fails, which a version probe (run
+    /// with no input, so it ends at end of input) does not meet. Off by
+    /// default.
+    pub exit_at_start: bool,
 }
 
 /// An error response the fake sends instead of an answer: `code` and
@@ -352,6 +358,7 @@ pub fn run_from_env() -> io::Result<()> {
         status_shape_rust: cli_arg(&cli, "--status-shape").as_deref() == Some("rust"),
         string_id_server_requests: cli.iter().any(|arg| arg == "--string-id-server-requests"),
         ignore_watched_files: cli.iter().any(|arg| arg == "--ignore-watched-files"),
+        exit_at_start: cli.iter().any(|arg| arg == "--exit-at-start"),
     };
     run_server(config)
 }
@@ -572,6 +579,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             }
             break;
         };
+        if config.exit_at_start {
+            return Ok(());
+        }
         let body = str::from_utf8(&frame)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let request: serde_json::Value = serde_json::from_str(body)

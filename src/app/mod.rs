@@ -184,12 +184,24 @@ impl App {
     /// first search does not pay the start (see [`lsp::Manager::prime`]). The
     /// map holds, per provider, the warm-up time or why there was none. The
     /// warm-up uses the sessions searches use; it never changes an answer.
+    /// The sessions it starts are stamped first (the tree barrier every search
+    /// and navigation call passes), so the first search keeps them unless the
+    /// tree has changed since.
     pub async fn prime_language_servers(
         &self,
         path: &std::path::Path,
         timeout: std::time::Duration,
     ) -> Result<std::collections::BTreeMap<&'static str, Result<std::time::Duration>>> {
         let workspace = crate::workspace::Workspace::resolve(path, &self.config.data_dir)?;
+        let enabled: Vec<Arc<dyn crate::lsp::adapter::LspAdapter>> = self
+            .analyzer
+            .adapters()
+            .iter()
+            .filter(|adapter| adapter.enabled())
+            .cloned()
+            .collect();
+        let refs: Vec<&Arc<dyn crate::lsp::adapter::LspAdapter>> = enabled.iter().collect();
+        self.analyzer.tree_barrier(&workspace, &refs).await;
         Ok(self.analyzer.prime(&workspace, timeout).await)
     }
 
@@ -198,8 +210,8 @@ impl App {
     /// `LspAdapter::keeps_session` (the server lists its tree stamp's
     /// configuration files and sees an edit on its own or `sync = "watch"`
     /// tells it). These sessions pass the tree barrier of a traverse walk
-    /// (`lsp::Manager::tree_barrier`); navigation and the search channel do
-    /// not (their kept sessions are as before).
+    /// (`lsp::Manager::tree_barrier`); navigation and the search channel pass
+    /// the same barrier, once per call, and are recorded in the same way.
     fn shares_session(&self, adapter: &Arc<dyn crate::lsp::adapter::LspAdapter>) -> bool {
         let profile = &self.config.run_profile.lsp;
         profile.sessions == crate::config::LspSessions::Shared
