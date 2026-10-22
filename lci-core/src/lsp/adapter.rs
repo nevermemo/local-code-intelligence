@@ -264,6 +264,9 @@ pub struct SentTexts {
     /// that makes room, then its `didOpen`), so concurrent new files cannot
     /// each see room and together overfill the table.
     open_set: tokio::sync::Mutex<()>,
+    /// The files closed to make room and not opened since, so the open of one
+    /// of them is told from a first open ([`SentText::reopened`]).
+    closed: Arc<Mutex<HashSet<String>>>,
     /// What the server advertised for a changed document: `didChange` with the
     /// whole text under `Full` and `Incremental`, a second `didOpen` under
     /// `None` (the default, and what a server without the capability is sent).
@@ -284,6 +287,10 @@ struct SentText {
     /// [`OpenedDocument`] it ignores, which costs nothing) does not leave the
     /// text unwaited for.
     pending: Option<u64>,
+    /// Whether the send is the open of a file the session had closed to make
+    /// room: its diagnostics wait then takes only a publication that states a
+    /// version ([`JsonRpcClient::wait_diagnostics_reopened`]).
+    reopened: bool,
     /// When a caller of [`open_if_changed`] last asked for the uri, whether it
     /// sent or found the text current: the order of eviction.
     last_used: Instant,
@@ -307,6 +314,9 @@ pub struct OpenedDocument {
     /// document in the session, then one more for each text sent after it, so
     /// a publication that names an older version is not for this text.
     version: i64,
+    /// Whether this is the open of a file the session closed before (see
+    /// [`SentText::reopened`]).
+    reopened: bool,
     texts: Arc<Mutex<HashMap<String, SentText>>>,
     _gate: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -321,9 +331,15 @@ impl OpenedDocument {
     /// the next caller of the uri; a wait that ended, either way, is settled
     /// and not repeated for the same text.
     pub async fn wait_for_diagnostics(&self, rpc: &JsonRpcClient, cap: Duration) -> bool {
-        let answered = rpc
-            .wait_diagnostics(&self.uri, self.diagnostics_before, self.version, cap)
-            .await;
+        let answered = if self.reopened {
+            // A server that publishes on `didClose` sends that publication
+            // without a version, possibly after this `didOpen` was written.
+            rpc.wait_diagnostics_reopened(&self.uri, self.diagnostics_before, self.version, cap)
+                .await
+        } else {
+            rpc.wait_diagnostics(&self.uri, self.diagnostics_before, self.version, cap)
+                .await
+        };
         if let Some(sent) = self
             .texts
             .lock()
@@ -395,10 +411,20 @@ impl SentTexts {
     /// The `diagnostics_before` reading and the `version` of the last send of
     /// `uri` when no hook has finished waiting for the server's publication
     /// for it.
-    fn pending_wait(&self, uri: &str) -> Option<(u64, i64)> {
+    fn pending_wait(&self, uri: &str) -> Option<(u64, i64, bool)> {
         let texts = self.texts.lock().unwrap_or_else(PoisonError::into_inner);
         let sent = texts.get(uri)?;
-        sent.pending.map(|before| (before, sent.version))
+        sent.pending
+            .map(|before| (before, sent.version, sent.reopened))
+    }
+
+    /// Whether the session closed `uri` to make room and has not opened it
+    /// since.
+    fn was_closed(&self, uri: &str) -> bool {
+        self.closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(uri)
     }
 
     /// Marks `uri` as just asked for, if the session has sent it.
@@ -480,7 +506,7 @@ impl SentTexts {
                 );
                 break;
             };
-            let texts = Arc::clone(&self.texts);
+            let (texts, closed) = (Arc::clone(&self.texts), Arc::clone(&self.closed));
             let evicted = uri.clone();
             let closed = rpc
                 .notify_holding(
@@ -492,6 +518,10 @@ impl SentTexts {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .remove(&evicted);
+                        closed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(evicted);
                     },
                 )
                 .await;
@@ -517,14 +547,24 @@ impl SentTexts {
         version: i64,
         diagnostics_before: u64,
     ) -> impl FnOnce() + Send + 'static {
-        let (texts, uri) = (Arc::clone(&self.texts), uri.to_owned());
+        let reopened = version == 1 && self.was_closed(uri);
+        let (texts, closed, uri) = (
+            Arc::clone(&self.texts),
+            Arc::clone(&self.closed),
+            uri.to_owned(),
+        );
         move || {
+            closed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&uri);
             texts.lock().unwrap_or_else(PoisonError::into_inner).insert(
                 uri,
                 SentText {
                     hash,
                     version,
                     pending: Some(diagnostics_before),
+                    reopened,
                     last_used: Instant::now(),
                 },
             );
@@ -581,10 +621,11 @@ pub async fn open_if_changed(
         // cancelled after its write, or its hook never waits) is this one's.
         return Ok(sent
             .pending_wait(&uri)
-            .map(|(diagnostics_before, version)| OpenedDocument {
+            .map(|(diagnostics_before, version, reopened)| OpenedDocument {
                 uri,
                 diagnostics_before,
                 version,
+                reopened,
                 texts: Arc::clone(&sent.texts),
                 _gate: gate,
             }));
@@ -598,6 +639,9 @@ pub async fn open_if_changed(
     } else {
         None
     };
+    // The file was closed to make room earlier: a server that publishes on
+    // `didClose` may still owe that (versionless) publication.
+    let reopened = version == 1 && sent.was_closed(&uri);
     let diagnostics_before = rpc.diagnostics_seen(&uri);
     let (method, params) = if version > 1 && sent.sync != ChangeSync::None {
         (
@@ -632,6 +676,7 @@ pub async fn open_if_changed(
         uri,
         diagnostics_before,
         version,
+        reopened,
         texts: Arc::clone(&sent.texts),
         _gate: gate,
     }))
@@ -792,6 +837,7 @@ mod tests {
                     hash: "h".into(),
                     version: 1,
                     pending: None,
+                    reopened: false,
                     last_used: base + Duration::from_secs(index as u64),
                 },
             );

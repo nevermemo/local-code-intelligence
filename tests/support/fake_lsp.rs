@@ -100,6 +100,11 @@ pub struct FakeLspConfig {
     /// `openClose` and advertises no change sync; with 2 the fake still applies
     /// a change without a `range` and notes a ranged one.
     pub text_document_sync: u64,
+    /// `--close-diagnostics-delay-ms <n>` (`--mode documents`): a `didClose`
+    /// is answered by an empty `publishDiagnostics` for the closed document
+    /// after `n` ms, carrying no `version` (what pyright and clangd do when a
+    /// document is closed). Off by default.
+    pub close_diagnostics_delay_ms: Option<u64>,
     /// The first process exits on its first definition request
     /// (`--exit-on-definition-request`), leaving the replacement healthy.
     pub exit_on_definition_request: bool,
@@ -336,6 +341,8 @@ pub fn run_from_env() -> io::Result<()> {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
         no_diagnostics: cli.iter().any(|arg| arg == "--no-diagnostics"),
+        close_diagnostics_delay_ms: cli_arg(&cli, "--close-diagnostics-delay-ms")
+            .and_then(|value| value.parse().ok()),
         text_document_sync: cli_arg(&cli, "--text-document-sync")
             .and_then(|value| value.parse().ok())
             .unwrap_or(1),
@@ -450,11 +457,11 @@ fn send_due_diagnostics<W: Write>(
     stdout: &mut W,
     config: &FakeLspConfig,
 ) -> io::Result<()> {
-    while pending
-        .front()
-        .is_some_and(|(due, ..)| *due <= Instant::now())
-    {
-        let Some((_, uri, version)) = pending.pop_front() else {
+    // In order of falling due (the publication after a `didClose` may be
+    // delayed differently from the one after a `didOpen`); with one delay for
+    // all, that is the order they were queued in.
+    while let Some(at) = pending.iter().position(|(due, ..)| *due <= Instant::now()) {
+        let Some((_, uri, version)) = pending.remove(at) else {
             break;
         };
         record_event(config.state_dir.as_deref(), "diagnostics_sent.txt");
@@ -543,20 +550,23 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     // a publication that falls due while the server waits is sent then and a
     // request that arrives first is read first.
     let mut pending_diagnostics: VecDeque<(Instant, String, Option<i64>)> = VecDeque::new();
-    let threaded_input = (config.diagnostics_delay_ms > 0 && !config.no_diagnostics).then(|| {
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut stdin = io::stdin();
-            loop {
-                let frame = read_frame(&mut stdin);
-                let last = !matches!(frame, Ok(Some(_)));
-                if sender.send(frame).is_err() || last {
-                    break;
+    let threaded_input = ((config.diagnostics_delay_ms > 0
+        || config.close_diagnostics_delay_ms.is_some())
+        && !config.no_diagnostics)
+        .then(|| {
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let mut stdin = io::stdin();
+                loop {
+                    let frame = read_frame(&mut stdin);
+                    let last = !matches!(frame, Ok(Some(_)));
+                    if sender.send(frame).is_err() || last {
+                        break;
+                    }
                 }
-            }
+            });
+            receiver
         });
-        receiver
-    });
 
     loop {
         let frame = loop {
@@ -564,10 +574,8 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             let Some(input) = &threaded_input else {
                 break read_frame(&mut stdin)?;
             };
-            let received = match pending_diagnostics.front() {
-                Some((due, ..)) => {
-                    input.recv_timeout(due.saturating_duration_since(Instant::now()))
-                }
+            let received = match pending_diagnostics.iter().map(|(due, ..)| *due).min() {
+                Some(due) => input.recv_timeout(due.saturating_duration_since(Instant::now())),
                 None => input
                     .recv()
                     .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
@@ -676,6 +684,21 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                             Instant::now() + Duration::from_millis(config.diagnostics_delay_ms),
                             uri.to_owned(),
                             request["params"]["textDocument"]["version"].as_i64(),
+                        ));
+                        send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
+                    }
+                    // `--close-diagnostics-delay-ms`: like pyright and clangd, an
+                    // empty publication for the closed document, without a
+                    // version, after the delay.
+                    if method == "textDocument/didClose"
+                        && !config.no_diagnostics
+                        && let Some(delay) = config.close_diagnostics_delay_ms
+                        && let Some(uri) = request["params"]["textDocument"]["uri"].as_str()
+                    {
+                        pending_diagnostics.push_back((
+                            Instant::now() + Duration::from_millis(delay),
+                            uri.to_owned(),
+                            None,
                         ));
                         send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
                     }

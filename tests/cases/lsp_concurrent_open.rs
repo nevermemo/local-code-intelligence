@@ -328,3 +328,86 @@ async fn a_dropped_open_leaves_its_diagnostics_wait_to_the_next_caller() {
     .await
     .expect("within the outer bound");
 }
+
+/// A server that publishes empty diagnostics when it closes a document
+/// (pyright, clangd; the fake with `--close-diagnostics-delay-ms`, the
+/// publication carries no version) must not end the diagnostics wait of the
+/// open that follows the close. The 65th file closes the first; once the
+/// first file's own first publication is in (1000 ms), it is asked for again,
+/// while the close's publication (1500 ms after the close) is still on its
+/// way and the re-open's own (1000 ms after the re-open) comes after it. The
+/// wait must end on the latter: three publications counted for the file (open,
+/// close, re-open), not two. Fails when the re-open's wait accepts a
+/// publication that carries no version.
+#[tokio::test]
+async fn a_close_publication_does_not_end_a_reopens_diagnostics_wait() {
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, root) = started_fake_with(
+            &temp,
+            &[
+                "--diagnostics-delay-ms",
+                "1000",
+                "--close-diagnostics-delay-ms",
+                "1500",
+            ],
+        )
+        .await;
+        let relative = |number: u32| format!("src/F{number:03}.cs");
+        for number in 1..=65 {
+            write(
+                &root,
+                &relative(number),
+                &format!(
+                    "namespace Acceptance;\npublic sealed class F{number:03} {{ public int Run() => 1; }}\n"
+                ),
+            );
+        }
+        let sent = SentTexts::default();
+        let open = |number: u32| {
+            let (client, sent, root, relative) = (&client, &sent, root.clone(), relative(number));
+            async move {
+                open_if_changed(
+                    client,
+                    sent,
+                    &root.join(&relative),
+                    &relative,
+                    "fake",
+                    "csharp",
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first_uri = reqwest::Url::from_file_path(root.join(relative(1)))
+            .unwrap()
+            .to_string();
+
+        // 64 files fill the table; the 65th closes the first.
+        for number in 1..=65 {
+            let opened = open(number).await;
+            assert!(opened.is_some(), "F{number:03} is sent");
+        }
+        // The first file's first publication is in, the close's is not.
+        assert!(
+            client
+                .wait_diagnostics(&first_uri, 0, 1, LOADED_BUDGET)
+                .await
+        );
+        assert_eq!(client.diagnostics_seen(&first_uri), 1);
+
+        let reopened = open(1).await.expect("the closed file is opened again");
+        assert!(
+            reopened.wait_for_diagnostics(&client, LOADED_BUDGET).await,
+            "the re-open's own publication came within the cap"
+        );
+        assert_eq!(
+            client.diagnostics_seen(&first_uri),
+            3,
+            "open, close and re-open were each published: the wait did not end on the close's"
+        );
+        assert_eq!(client.diagnostics_wait_timeouts(), 0);
+    })
+    .await
+    .expect("within the outer bound");
+}
