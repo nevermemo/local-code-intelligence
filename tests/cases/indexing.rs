@@ -1287,6 +1287,43 @@ async fn a_search_waiting_for_a_cancelled_explicit_index_does_not_report_a_stale
     task.abort();
 }
 
+/// A search dropped in the middle of its stale check (an MCP cancel) must not
+/// leave the throttle stamped: the next search, well inside the interval, still
+/// runs the check and refreshes, instead of reusing a snapshot nobody checked.
+#[tokio::test]
+async fn a_search_dropped_mid_stale_check_leaves_the_next_search_free_to_check() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 3600;
+    config.embedding_timeout_seconds = 3600;
+    let workspace = temp.path().join("dropped-stale-check");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    write(&workspace, "lib.rs", "fn replacement() {}\n");
+    fake.hold_documents.store(true, Ordering::SeqCst);
+    let mut stalled = Box::pin(app.search(&workspace, "replacement", Some(1)));
+    tokio::select! {
+        result = &mut stalled => panic!("the search finished while blocked: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(60), fake.document_held.notified()) => {
+            result.expect("the stale check reaches the embedding request");
+        }
+    }
+    drop(stalled);
+    fake.hold_documents.store(false, Ordering::SeqCst);
+
+    let next = app
+        .search(&workspace, "replacement", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&next).unwrap()["index"]["action"],
+        "refreshed_incrementally"
+    );
+    assert!(next.results[0].chunk.code.contains("replacement"));
+    task.abort();
+}
+
 #[tokio::test]
 async fn manual_freshness_reuses_stale_snapshot_without_refresh() {
     let (temp, mut config, fake, task) = fixture().await;

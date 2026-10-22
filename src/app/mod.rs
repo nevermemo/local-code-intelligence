@@ -45,8 +45,9 @@ struct WorkspaceCoordination {
     flight_error: Mutex<Option<String>>,
     /// Wall-clock time of the last `on-search` filesystem staleness check,
     /// so repeated searches within `stale_check_interval_seconds` skip the
-    /// scan and reuse the current snapshot.
-    last_stale_check: Mutex<Option<Instant>>,
+    /// scan and reuse the current snapshot. A synchronous mutex, held only
+    /// for a read or a write of the value, so a drop guard can restore it.
+    last_stale_check: std::sync::Mutex<Option<Instant>>,
     /// When the last repair-only refresh of a vectorless snapshot ended still
     /// vectorless (or failed), so a search does not run another one inside
     /// `EMBEDDER_DOWN_WINDOW` while the embedder keeps failing (an HTTP 5xx

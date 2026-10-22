@@ -4289,6 +4289,9 @@ async fn assert_a_cancelled_call_stops_its_work(tool: &str, arguments: impl Fn(&
     let (temp, mut config, _fake, models_task) = fixture().await;
     let embedder = stalling_embedder();
     config.embedding_url = embedder.url.clone();
+    // High, so a loaded machine cannot pass by a timeout and a retry instead
+    // of the cancel.
+    config.embedding_timeout_seconds = 3600;
     config.channels.lsp = false;
     let workspace = temp.path().join("cancelled-mcp-call");
     write(&workspace, "lib.rs", "fn translator() {}\n");
