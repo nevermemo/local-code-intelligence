@@ -82,6 +82,17 @@ pub struct RunProfileSeeds {
     /// search's seeds. The recipes' seeds are given, so they run the same
     /// under both values.
     pub literal: bool,
+    /// Let the opt-in map `seeds.repo_map` run. `false` (the default): naming
+    /// it gives a note and no seeds, it is not in the default map set, and
+    /// every answer is as without the key. `true`: the map is in the default
+    /// set when a call names no maps, and it runs when named. It ranks the
+    /// SCIP graph's function and method nodes by personalized PageRank over
+    /// the call and containment edges (not `implements`), with the random jump
+    /// on the question's best `seeds.bm25` matches, and appends the top nodes
+    /// the other sources did not give after theirs. A question with no
+    /// `seeds.bm25` match gives no seeds. The recipes' seeds are given, so
+    /// they run the same under both values.
+    pub repo_map: bool,
 }
 
 /// `[run_profile.freshness]`.
@@ -814,6 +825,7 @@ mod tests {
         config.run_profile.lsp.call_hierarchy = true;
         config.run_profile.seeds.bm25 = true;
         config.run_profile.seeds.literal = true;
+        config.run_profile.seeds.repo_map = true;
         config.run_profile.grep.structural = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config.run_profile.lsp.places = LspPlaces::Outline;
@@ -1167,6 +1179,48 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn seeds_repo_map_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.seeds.repo_map);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nrepo_map = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.seeds.repo_map);
+        assert!(!on.run_profile.seeds.bm25 && !on.run_profile.seeds.literal);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["seeds"]["repo_map"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["seeds"]["repo_map"], false);
+        assert_eq!(on.value["run_profile"]["seeds"]["repo_map"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.seeds.repo_map")
+        );
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nrepo_map = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.seeds]\nrepo_map = \"yes\"\n",
+            "[run_profile.seeds]\nrepo_map = 1\n",
+            "[run_profile]\nrepo_map = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn stat_gate_is_off_by_default_and_is_part_of_the_profile() {
         let off = Config::default();
         assert!(!off.run_profile.freshness.stat_gate);
@@ -1286,6 +1340,7 @@ mode = \"sometimes\"
             "run_profile.lsp.call_hierarchy",
             "run_profile.seeds.bm25",
             "run_profile.seeds.literal",
+            "run_profile.seeds.repo_map",
             "run_profile.grep.structural",
             "run_profile.lsp.sync",
             "run_profile.lsp.places",

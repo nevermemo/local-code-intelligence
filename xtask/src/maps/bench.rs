@@ -608,7 +608,7 @@ fn with_seed_keys_on(base: Option<&str>, keys: &[(&str, &str)]) -> Result<Option
     ))
 }
 
-/// Naming `seeds.bm25`, `seeds.literal` or `grep.structural` in `--maps` turns its
+/// Naming `seeds.bm25`, `seeds.literal`, `seeds.repo_map` or `grep.structural` in `--maps` turns its
 /// profile key (`[run_profile.seeds]`, `[run_profile.grep]`) on for the run (d461, d483), since the map gives no
 /// start nodes while the key is off. When the `--config` overlay (if any) does
 /// not already have the key on, the effective overlay becomes a file written to
@@ -822,18 +822,20 @@ pub(super) fn select_items(
 
 /// The maps that only find start nodes; they are never expanded, so they
 /// show up in a call by the seeds they gave, not by calls counted.
-const SEED_MAPS: [&str; 4] = [
+const SEED_MAPS: [&str; 5] = [
     "seeds.hybrid",
     "seeds.scip_names",
     "seeds.bm25",
     "seeds.literal",
+    "seeds.repo_map",
 ];
 
 /// The maps that are off until their profile key is on (the seed maps, K19),
 /// each as (map, table, key) (d461, d483).
-const OPT_IN_SEED_KEYS: [(&str, &str, &str); 3] = [
+const OPT_IN_SEED_KEYS: [(&str, &str, &str); 4] = [
     ("seeds.bm25", "seeds", "bm25"),
     ("seeds.literal", "seeds", "literal"),
+    ("seeds.repo_map", "seeds", "repo_map"),
     ("grep.structural", "grep", "structural"),
 ];
 
@@ -846,7 +848,7 @@ fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
         | "tests.tested_by" | "exact.closure" => Some(&[Symbol]),
         "exact.pickaxe" => Some(&[Commit]),
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
-        "seeds.bm25" => Some(&[Symbol]),
+        "seeds.bm25" | "seeds.repo_map" => Some(&[Symbol]),
         "seeds.literal" => Some(&[Symbol, File]),
         "structure.contains" | "grep.live" | "grep.structural" | "probe.compile" => {
             Some(&[Symbol, File])
@@ -1283,6 +1285,7 @@ pub fn check_probe(
             "seeds.hybrid" => "hybrid",
             "seeds.bm25" => "bm25",
             "seeds.literal" => "literal",
+            "seeds.repo_map" => "repo_map",
             _ => "name_tokens",
         };
         let source = response["seed_source"].as_str().unwrap_or("none");
@@ -4407,6 +4410,40 @@ pub fn free_two() {}
         assert!(check_probe("seeds.literal", &nothing, None).is_ok());
         // That exception is the literal map's alone.
         assert!(check_probe("seeds.bm25", &nothing, None).is_err());
+    }
+
+    #[test]
+    fn seed_maps_know_repo_map_and_its_key() {
+        use NodeKind::Symbol;
+        assert!(SEED_MAPS.contains(&"seeds.repo_map"));
+        // The descriptor in src/app/traverse/seeds.rs (`SeedMap::repo_map`).
+        assert_eq!(map_emits("seeds.repo_map"), Some(&[Symbol][..]));
+        let maps = vec!["seeds.repo_map".to_string()];
+        assert!(can_answer(Set::Impact, &maps) && can_answer(Set::WhereTo, &maps));
+        assert!(!can_answer(Set::History, &maps));
+        // Naming it turns `[run_profile.seeds] repo_map` on (and only that key).
+        assert_eq!(
+            named_opt_in_seed_maps(&maps),
+            [("seeds.repo_map", "seeds", "repo_map")]
+        );
+        let text = with_seed_keys_on(None, &[("seeds", "repo_map")])
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("repo_map = true"), "{text}");
+        assert!(
+            !text.contains("bm25") && !text.contains("literal"),
+            "{text}"
+        );
+        // Probed by the start nodes it gave: its own source, not another's.
+        let gave = json!({"seed_source": "repo_map", "seeds": ["sym:rust:a::b/fn"]});
+        assert!(check_probe("seeds.repo_map", &gave, None).is_ok());
+        let bm25 = json!({"seed_source": "bm25", "seeds": ["sym:rust:a::b/fn"]});
+        assert!(check_probe("seeds.repo_map", &bm25, None).is_err());
+        assert!(check_probe("seeds.bm25", &gave, None).is_err());
+        let off = json!({"seed_source": "none", "seeds": [],
+                         "notes": ["seeds.repo_map is off ([run_profile.seeds] repo_map = false): the map gives no start nodes"]});
+        let error = check_probe("seeds.repo_map", &off, None).unwrap_err();
+        assert!(error.contains("seeds.repo_map is off"), "{error}");
     }
 
     /// A traverser whose preflight is `check_probe` on a canned probe answer

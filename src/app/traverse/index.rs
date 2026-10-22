@@ -1,7 +1,10 @@
 //! The loaded SCIP index and the caches of the maps built from it, shared
 //! between calls (traversals and recipes).
 
-use super::seeds::{Bm25Seeds, NameSeeds};
+use super::{
+    repo_map::RepoMap,
+    seeds::{Bm25Seeds, NameSeeds},
+};
 use anyhow::{Context, Result, anyhow};
 use lci_core::{config::profile::ScipMode, node::NodeId};
 use lci_maps::{
@@ -44,6 +47,10 @@ pub(super) struct Loaded {
     /// stamp. A call without the map (the default) never builds it, and the
     /// graph itself holds no documentation.
     bm25: OnceLock<Arc<Bm25Seeds>>,
+    /// The edge lists of `seeds.repo_map`'s PageRank, built by the first call
+    /// that wants the map ([`Loaded::repo_map`]) and kept with the graph for
+    /// the index stamp.
+    repo_map: OnceLock<Arc<RepoMap>>,
     /// The places of the graph's nodes (a definition's line, the function
     /// around a line) that `seeds.literal` places ripgrep's lines by, built
     /// by the first call that wants the map ([`Loaded::places`]).
@@ -80,6 +87,7 @@ impl Loaded {
             names: Arc::new(names),
             index: None,
             bm25: OnceLock::new(),
+            repo_map: OnceLock::new(),
             places: OnceLock::new(),
             contains,
             by_file,
@@ -116,6 +124,25 @@ impl Loaded {
         .await
         .expect("the entity index build does not panic");
         self.bm25.get_or_init(|| built).clone()
+    }
+
+    /// The edge lists of the graph for `seeds.repo_map`, built on the first call
+    /// (on a blocking thread) and kept with the graph for the index stamp.
+    pub(super) async fn repo_map(&self) -> Arc<RepoMap> {
+        if let Some(built) = self.repo_map.get() {
+            return built.clone();
+        }
+        let scip = self.scip.clone();
+        let built = tokio::task::spawn_blocking(move || Arc::new(RepoMap::new(&scip)))
+            .await
+            .expect("the repo map build does not panic");
+        self.repo_map.get_or_init(|| built).clone()
+    }
+
+    /// Whether [`Loaded::repo_map`] has built the edge lists.
+    #[cfg(test)]
+    pub(super) fn repo_map_built(&self) -> bool {
+        self.repo_map.get().is_some()
     }
 
     /// The places of the graph's nodes, built on the first call (on a blocking

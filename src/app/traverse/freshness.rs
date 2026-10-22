@@ -87,11 +87,12 @@ type Files = HashMap<String, CachedFile>;
 
 /// The maps built from the SCIP index and the tree: stale when the tree
 /// differs from the baseline of the index's stamp.
-const SCIP_BUILT: [MapId; 8] = [
+const SCIP_BUILT: [MapId; 9] = [
     "graph.scip",
     "structure.contains",
     "seeds.scip_names",
     "seeds.bm25",
+    "seeds.repo_map",
     "exact.closure",
     "config.key",
     "scip.impact",
@@ -598,6 +599,17 @@ mod tests {
 
         async fn snapshot_hashes(&self) -> Option<HashMap<String, String>> {
             self.0.clone()
+        }
+    }
+
+    #[test]
+    fn the_seed_maps_built_from_the_graph_state_a_snapshot_freshness() {
+        // `seeds.repo_map` reads the same graph as `seeds.bm25`: stale when the
+        // tree differs from the index's baseline, and not a live map.
+        for id in ["seeds.bm25", "seeds.repo_map"] {
+            assert!(SCIP_BUILT.contains(&id) && !LIVE.contains(&id), "{id}");
+            assert_eq!(label(id, Some(0), None), Some(Freshness::snapshot(Some(0))));
+            assert_eq!(label(id, Some(2), None), Some(Freshness::snapshot(Some(2))));
         }
     }
 
