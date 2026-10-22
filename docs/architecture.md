@@ -140,7 +140,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   one call is skipped by the next; `/ready` probes the adapters directly and never reads them. `Status.servers` and
   `Status.languages_without_server` (`index_status`, `lci status`) are the per-language roster: per adapter its
   languages, the ones the index holds, `configured`/`enabled`/`command`, `Manager::probe_state` (the `probe_once` memo
-  read as `probed`/`not_probed`; it runs no probe) and the session's `ServerReadiness`, and the indexed languages no
+  read as `probed`/`not_probed`; it runs no probe), `Manager::breaker_remaining` (an open skip window as `breaker_open_ms`, `null` when none) and the session's `ServerReadiness`, and the indexed languages no
   enabled, configured adapter lists; built from the manager's memory, it starts no server. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
   `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the
   manager an outline cache, used only for adapters whose `LspAdapter::opens_documents()` is true (pyright, gopls,

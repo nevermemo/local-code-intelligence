@@ -2270,6 +2270,16 @@ impl Manager {
         }
     }
 
+    /// Time left in `provider`'s skip window under `[run_profile.lsp]
+    /// breaker = true`, `None` when there is no breaker or its window is
+    /// closed. A read: it runs no probe, starts nothing and opens or closes
+    /// no window.
+    pub fn breaker_remaining(&self, provider: &'static str) -> Option<Duration> {
+        self.breakers
+            .as_ref()
+            .and_then(|breakers| breakers.remaining(provider))
+    }
+
     /// Starts the server of every enabled adapter for `workspace` and waits
     /// until each has finished priming, so that a later `workspace/symbol`
     /// request does not pay the start. Returns, per provider, the time the
@@ -3663,6 +3673,35 @@ mod tests {
         breakers.expire("starting-server");
         assert!(manager.symbols(&adapter, &workspace, "x").await.is_err());
         assert_eq!(starts(), 2);
+    }
+
+    #[tokio::test]
+    async fn breaker_remaining_shows_an_open_window_and_starts_nothing() {
+        let stub = Arc::new(Starting {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let starts = || stub.starts.load(Ordering::SeqCst);
+        let adapter: Arc<dyn LspAdapter> = Arc::clone(&stub) as Arc<dyn LspAdapter>;
+        let workspace = prime_workspace();
+        let breakers = long_window();
+        let manager = Manager::new(&Config::default()).with_breakers(Some(Arc::clone(&breakers)));
+        // Before a failed start there is no window, and reading it starts
+        // nothing.
+        assert!(manager.breaker_remaining("starting-server").is_none());
+        assert_eq!(starts(), 0);
+        // The failed start opens the window; reading it still starts nothing.
+        assert!(manager.symbols(&adapter, &workspace, "x").await.is_err());
+        assert_eq!(starts(), 1);
+        assert!(manager.breaker_remaining("starting-server").is_some());
+        assert!(manager.breaker_remaining("other-server").is_none());
+        assert_eq!(starts(), 1);
+        // A manager without the breaker has no window to show.
+        let plain = Manager::new(&Config::default());
+        assert!(plain.breaker_remaining("starting-server").is_none());
+        // The window has passed.
+        breakers.expire("starting-server");
+        assert!(manager.breaker_remaining("starting-server").is_none());
+        assert_eq!(starts(), 1);
     }
 
     #[tokio::test]

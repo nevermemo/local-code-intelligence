@@ -4064,7 +4064,10 @@ async fn a_default_server_answers_without_or_over_a_corrupt_scip_index() {
 /// `lci status` print.
 #[tokio::test]
 async fn index_status_lists_a_server_per_language_and_the_languages_without_one() {
-    let (temp, config, _fake, models_task) = fixture().await;
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    // Per-call sessions: `status` must start nothing, whatever the stock
+    // `lsp.live` policy becomes.
+    config.run_profile.lsp.sessions = local_code_intelligence::config::LspSessions::PerCall;
     let state = temp.path().join("lsp-state");
     let workspace = temp.path().join("roster-repository");
     write_csharp_workspace(&workspace);
@@ -4136,6 +4139,12 @@ async fn index_status_lists_a_server_per_language_and_the_languages_without_one(
     assert_eq!(csharp["enabled"], true, "{csharp}");
     assert_eq!(csharp["root"], ".", "{csharp}");
     assert!(csharp["session"].is_null(), "{csharp}");
+    // The fake exits 0 on `--version` (no `--state`, null stdin), so a probe
+    // run by `status` would turn this to `probed`: it proves none ran. (The
+    // missing rust-analyzer could not, a failed probe is forgotten.)
+    assert_eq!(csharp["probe"], "not_probed", "no probe ran: {csharp}");
+    // No breaker is on, so no window is shown.
+    assert!(csharp["breaker_open_ms"].is_null(), "{csharp}");
     let pyright = roster(&before, "pyright");
     assert_eq!(
         pyright["languages_in_index"],
@@ -4156,7 +4165,7 @@ async fn index_status_lists_a_server_per_language_and_the_languages_without_one(
     let rust = roster(&before, "rust-analyzer");
     assert_eq!(rust["languages_in_index"], json!(["rust"]), "{rust}");
     assert_eq!(rust["configured"], true, "{rust}");
-    assert_eq!(rust["probe"], "not_probed", "no probe ran: {rust}");
+    assert_eq!(rust["probe"], "not_probed", "{rust}");
     assert_eq!(
         before["languages_without_server"],
         json!(["python"]),

@@ -187,9 +187,14 @@ pub struct ServerRoster {
     pub enabled: bool,
     /// The configured command or installation path.
     pub command: Option<String>,
-    /// `probed` once the binary has answered a version probe in this process;
-    /// a failed probe and one never run are both `not_probed`.
+    /// `probed` once the manager's own version probe has passed (run by
+    /// priming and the `lsp.live` warm start; `/ready` probes separately and
+    /// does not count), else `not_probed`.
     pub probe: crate::lsp::ProbeState,
+    /// Milliseconds left in the server's skip window under
+    /// `[run_profile.lsp] breaker = true` (a failed probe or start opened it);
+    /// `null` without the breaker or when the window is closed.
+    pub breaker_open_ms: Option<u64>,
     /// The directory the server is started at, relative to the workspace.
     pub root: String,
     /// The session's report, as in `analyzers`; `null` without a session.
@@ -678,13 +683,17 @@ impl App {
         // decision is made under a read guard of the workspace, held until the
         // task is spawned (spawning awaits nothing), so a build cannot start
         // between the check and the warm start.
-        if let Some(snapshot) = &snapshot
+        // The languages the index holds, read once for the warm start and the
+        // roster below.
+        let in_index = match &snapshot {
+            Some(snapshot) => Store::languages(snapshot).await.unwrap_or_default(),
+            None => HashSet::new(),
+        };
+        if snapshot.is_some()
             && self.warm_start_due(&workspace.id)
+            && let Ok(_building_excluded) = coordination.lock.try_read()
         {
-            let languages = Store::languages(snapshot).await.unwrap_or_default();
-            if let Ok(_building_excluded) = coordination.lock.try_read() {
-                self.warm_language_servers(&workspace, languages);
-            }
+            self.warm_language_servers(&workspace, in_index.clone());
         }
         let chunks = match &snapshot {
             Some(s) => s.table.count_rows(None).await?,
@@ -724,11 +733,6 @@ impl App {
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let mut analyzers_running = BTreeMap::new();
         let mut analyzers = BTreeMap::new();
-        // The languages the index holds, as the warm start reads them.
-        let in_index = match &snapshot {
-            Some(snapshot) => Store::languages(snapshot).await.unwrap_or_default(),
-            None => HashSet::new(),
-        };
         let mut servers = Vec::new();
         for adapter in self.analyzer.adapters() {
             let provider = adapter.provider();
@@ -754,6 +758,10 @@ impl App {
                 enabled: adapter.enabled(),
                 command,
                 probe: self.analyzer.probe_state(provider),
+                breaker_open_ms: self
+                    .analyzer
+                    .breaker_remaining(provider)
+                    .map(|left| u64::try_from(left.as_millis()).unwrap_or(u64::MAX)),
                 root: ".".to_owned(),
                 session,
             });
@@ -980,7 +988,10 @@ mod tests {
             ..configured
         };
         assert_eq!(without(disabled), ["csharp", "python"]);
-        // No path at all: likewise.
+        // No path at all: the adapter is disabled too, so this case does not
+        // pin the `configured_command` guard in `languages_without_server`; the
+        // guard is redundant today (every adapter's `enabled()` implies a
+        // configured command) and stays as a defence.
         assert_eq!(
             without(crate::config::CSharpLspConfig::default()),
             ["csharp", "python"]
