@@ -100,8 +100,9 @@ const SCIP_BUILT: [MapId; 8] = [
 
 /// The maps that read the working tree or git when they answer, or (`lsp.live`)
 /// query a language server that does.
-const LIVE: [MapId; 5] = [
+const LIVE: [MapId; 6] = [
     "grep.live",
+    "grep.structural",
     "lsp.live",
     "git.history",
     "exact.pickaxe",
@@ -114,7 +115,7 @@ const SNAPSHOT_BACKED: [MapId; 3] = ["seeds.hybrid", "search.lexical", "search.v
 
 /// The live maps whose places (the line of a symbol) come from the SCIP
 /// index: with `verify_on_read` they carry the index's lag.
-const PLACED_BY_INDEX: [MapId; 2] = ["grep.live", "lsp.live"];
+const PLACED_BY_INDEX: [MapId; 3] = ["grep.live", "grep.structural", "lsp.live"];
 
 /// The baselines: one per (index, tree), valid for the stamp it was taken at.
 type Baselines = Mutex<HashMap<(PathBuf, PathBuf), (Stamp, Arc<Files>)>>;
@@ -598,6 +599,15 @@ mod tests {
         async fn snapshot_hashes(&self) -> Option<HashMap<String, String>> {
             self.0.clone()
         }
+    }
+
+    #[test]
+    fn grep_structural_states_a_live_freshness_like_grep_live() {
+        for id in ["grep.live", "grep.structural"] {
+            assert_eq!(label(id, Some(0), None), Some(Freshness::live()), "{id}");
+            assert_eq!(label(id, None, None), Some(Freshness::live()), "{id}");
+        }
+        assert!(PLACED_BY_INDEX.contains(&"grep.structural"));
     }
 
     #[test]

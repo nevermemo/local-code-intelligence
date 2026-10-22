@@ -46,6 +46,7 @@ arrow-row@58.4.0 (1): Apache-2.0
 arrow-schema@58.4.0 (1): Apache-2.0
 arrow-select@58.4.0 (1): Apache-2.0
 arrow-string@58.4.0 (1): Apache-2.0
+ast-grep-core@0.40.1 (1): MIT
 async-channel@2.5.0 (2): Apache-2.0, MIT
 async-compression@0.4.46 (2): MIT, Apache-2.0
 async-lock@3.4.2 (2): Apache-2.0, MIT
@@ -64,6 +65,8 @@ axum-core@0.5.6 (1): MIT
 base64@0.22.1 (2): MIT, Apache-2.0
 base64@0.23.1 (2): MIT, Apache-2.0
 bigdecimal@0.4.10 (2): MIT, Apache-2.0
+bit-set@0.8.0 (2): Apache-2.0, MIT
+bit-vec@0.8.0 (2): Apache-2.0, MIT
 bitflags@1.3.2 (2): MIT, Apache-2.0
 bitflags@2.13.1 (2): MIT, Apache-2.0
 bitvec@1.1.1 (1): MIT
