@@ -246,6 +246,18 @@ pub struct LspCostArgs {
     /// other job is running); after that the run goes on and says so.
     #[arg(long, default_value_t = 45)]
     pub max_quiet_wait_minutes: u64,
+    /// `[run_profile.lsp] places` of every arm. `scip` (the default) writes
+    /// nothing; `outline` lets `lsp.live` place symbols from the server's
+    /// outline, which a tree without a SCIP index needs to get any card.
+    #[arg(long, value_enum, default_value = "scip")]
+    pub places: Places,
+}
+
+/// The `--places` choice (mirrors `[run_profile.lsp] places`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Places {
+    Scip,
+    Outline,
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +377,8 @@ pub struct ConfigCtx {
     /// The measured adapter and its server (`--server`, else the default).
     pub adapter: Adapter,
     pub server: String,
+    /// `--places outline`: every arm writes `places = "outline"`.
+    pub places_outline: bool,
 }
 
 fn toml_path(path: &Path) -> String {
@@ -406,6 +420,9 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
         for line in overlay {
             text.push_str(&line);
             text.push('\n');
+        }
+        if ctx.places_outline {
+            text.push_str("places = \"outline\"\n");
         }
     }
     text
@@ -1241,6 +1258,7 @@ struct RunContext {
     rust_analyzer: String,
     adapter: Adapter,
     server: String,
+    places_outline: bool,
     calls_file: std::fs::File,
 }
 
@@ -1271,6 +1289,7 @@ async fn run_arm(ctx: &mut RunContext, arm: &Arm, condition: &str) -> Result<Vec
                 deadline_ms: ctx.deadline_ms,
                 adapter: ctx.adapter,
                 server: ctx.server.clone(),
+                places_outline: ctx.places_outline,
             },
         ),
     )?;
@@ -1921,8 +1940,17 @@ fn merged_report(members: Vec<(&PathBuf, (RunData, ReportMeta))>) -> String {
             .keys()
             .map(|(condition, arm)| format!("{condition}/{arm}"))
             .collect();
+        // Per run, since the one Setup block is the last run's and `--places`
+        // changes what an arm measures (a run before the flag had none: scip).
+        let places = run_meta
+            .summary
+            .iter()
+            .find(|(key, _)| key == "places")
+            .map_or("scip", |(_, value)| {
+                value.split_whitespace().next().unwrap_or("scip")
+            });
         notes.push(format!(
-            "merged run {} ({}): {}",
+            "merged run {} ({}, places {places}): {}",
             dir.file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
             run_meta.stamp,
@@ -2106,6 +2134,14 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             "arms of this run".to_owned(),
             arms.iter().map(|a| a.name).collect::<Vec<_>>().join(", "),
         ),
+        (
+            "places".to_owned(),
+            match args.places {
+                Places::Scip => "scip (the default; not written)",
+                Places::Outline => "outline (`[run_profile.lsp] places`, every arm)",
+            }
+            .to_owned(),
+        ),
     ];
     if args.adapter == Adapter::Rust {
         summary.push((
@@ -2142,6 +2178,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         rust_analyzer,
         adapter: args.adapter,
         server: server.clone(),
+        places_outline: args.places == Places::Outline,
         calls_file,
     };
     let conditions: Vec<(&str, bool)> = match args.load {
@@ -2349,34 +2386,47 @@ mod tests {
 
     #[test]
     fn every_arm_config_is_a_valid_service_config() {
-        let ctx = ConfigCtx {
-            data_dir: std::env::temp_dir().join("lci-lsp-cost-test-data"),
-            scip_index: std::env::temp_dir().join("index.scip"),
-            rust_analyzer: "rust-analyzer".into(),
-            deadline_ms: 20_000,
-            adapter: Adapter::Rust,
-            server: "rust-analyzer".into(),
-        };
-        for arm in ARMS {
-            let text = arm_config(&arm, &ctx);
-            let config: lci_core::config::Config =
-                toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}\n{text}", arm.name));
-            config
-                .validate()
-                .unwrap_or_else(|e| panic!("{}: {e:#}", arm.name));
-            assert!(config.traverse.enabled);
-            assert_eq!(
-                config.traverse.policies["explore"].extra_maps.as_deref(),
-                Some(&["lsp.live".to_owned()][..])
-            );
-            assert_eq!(
-                config.run_profile.lsp.sessions == lci_core::config::LspSessions::Shared,
-                arm.shared,
-                "{}",
-                arm.name
-            );
-            assert_eq!(config.run_profile.lsp.outline_cache, arm.outline_cache);
-            assert_eq!(config.run_profile.lsp.implementations, arm.implementations);
+        for places_outline in [false, true] {
+            let ctx = ConfigCtx {
+                data_dir: std::env::temp_dir().join("lci-lsp-cost-test-data"),
+                scip_index: std::env::temp_dir().join("index.scip"),
+                rust_analyzer: "rust-analyzer".into(),
+                deadline_ms: 20_000,
+                adapter: Adapter::Rust,
+                server: "rust-analyzer".into(),
+                places_outline,
+            };
+            for arm in ARMS {
+                let text = arm_config(&arm, &ctx);
+                let config: lci_core::config::Config =
+                    toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}\n{text}", arm.name));
+                config
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{}: {e:#}", arm.name));
+                assert!(config.traverse.enabled);
+                assert_eq!(
+                    config.traverse.policies["explore"].extra_maps.as_deref(),
+                    Some(&["lsp.live".to_owned()][..])
+                );
+                assert_eq!(
+                    config.run_profile.lsp.sessions == lci_core::config::LspSessions::Shared,
+                    arm.shared,
+                    "{}",
+                    arm.name
+                );
+                assert_eq!(config.run_profile.lsp.outline_cache, arm.outline_cache);
+                assert_eq!(config.run_profile.lsp.implementations, arm.implementations);
+                assert_eq!(
+                    config.run_profile.lsp.places,
+                    if places_outline {
+                        lci_core::config::LspPlaces::Outline
+                    } else {
+                        lci_core::config::LspPlaces::Scip
+                    },
+                    "{}",
+                    arm.name
+                );
+            }
         }
     }
 
@@ -2538,6 +2588,53 @@ mod tests {
     }
 
     #[test]
+    fn a_merged_report_names_the_places_of_every_run() {
+        let run = |arm: &str| {
+            let mut samples = BTreeMap::new();
+            samples.insert(
+                ("quiet".to_owned(), arm.to_owned()),
+                vec![sample(1, 1, 100.0, 2, 4)],
+            );
+            RunData {
+                conditions: vec![CondMeta {
+                    condition: "quiet".into(),
+                    ..CondMeta::default()
+                }],
+                samples,
+            }
+        };
+        let meta = |stamp: &str, places: Option<&str>| ReportMeta {
+            stamp: stamp.into(),
+            summary: places
+                .map(|p| vec![("places".to_owned(), p.to_owned())])
+                .unwrap_or_default(),
+            ..ReportMeta::default()
+        };
+        let (old, new) = (PathBuf::from("old"), PathBuf::from("new"));
+        let report = merged_report(vec![
+            (&old, (run("base"), meta("s1", None))),
+            (
+                &new,
+                (
+                    run("shared"),
+                    meta(
+                        "s2",
+                        Some("outline (`[run_profile.lsp] places`, every arm)"),
+                    ),
+                ),
+            ),
+        ]);
+        assert!(
+            report.contains("merged run old (s1, places scip): quiet/base"),
+            "{report}"
+        );
+        assert!(
+            report.contains("merged run new (s2, places outline): quiet/shared"),
+            "{report}"
+        );
+    }
+
+    #[test]
     fn a_bimodal_arm_and_every_idle_entry_reach_the_report() {
         let mut fast = sample(1, 1, 100.0, 40, 5);
         fast.record.stop_reason = "bound".into();
@@ -2595,6 +2692,7 @@ mod tests {
             deadline_ms: 20_000,
             adapter,
             server: server.into(),
+            places_outline: false,
         }
     }
 
