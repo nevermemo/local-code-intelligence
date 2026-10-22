@@ -75,13 +75,14 @@ const SCALAR_KEYS: [(&str, &str); 8] = [
 
 /// The language-server sections of the machine set, each with the upper-case
 /// name its environment variables use (`LCI_<NAME>_PATH`, `LCI_<NAME>_DISABLED`).
-const LSP_SECTIONS: [(&str, &str); 6] = [
+const LSP_SECTIONS: [(&str, &str); 7] = [
     ("csharp", "CSHARP"),
     ("typescript", "TYPESCRIPT"),
     ("python", "PYTHON"),
     ("go", "GO"),
     ("java", "JAVA"),
     ("clangd", "CLANGD"),
+    ("markdown", "MARKDOWN"),
 ];
 
 /// The keys of a language-server section, all of which the machine set takes.
@@ -278,6 +279,7 @@ pub struct LocalOverrides {
     pub go: Option<LspOverride>,
     pub java: Option<LspOverride>,
     pub clangd: Option<LspOverride>,
+    pub markdown: Option<LspOverride>,
 }
 
 impl LocalOverrides {
@@ -332,12 +334,13 @@ impl LocalOverrides {
             "go" => self.go.as_ref(),
             "java" => self.java.as_ref(),
             "clangd" => self.clangd.as_ref(),
+            "markdown" => self.markdown.as_ref(),
             _ => None,
         }
     }
 
     /// The slot of language-server section `section` (`csharp`, `typescript`,
-    /// `python`, `go`, `java` or `clangd`).
+    /// `python`, `go`, `java`, `clangd` or `markdown`).
     ///
     /// # Panics
     ///
@@ -350,6 +353,7 @@ impl LocalOverrides {
             "go" => &mut self.go,
             "java" => &mut self.java,
             "clangd" => &mut self.clangd,
+            "markdown" => &mut self.markdown,
             _ => unreachable!("{section} is not a language-server section"),
         }
     }
@@ -425,10 +429,15 @@ impl LocalOverrides {
                     &mut config.java.args,
                     &mut config.java.disabled,
                 ),
-                _ => (
+                "clangd" => (
                     &mut config.clangd.path,
                     &mut config.clangd.args,
                     &mut config.clangd.disabled,
+                ),
+                _ => (
+                    &mut config.markdown.path,
+                    &mut config.markdown.args,
+                    &mut config.markdown.disabled,
                 ),
             };
             if let Some(value) = &patch.path {
@@ -1332,7 +1341,8 @@ mod tests {
                  reranker_model = 'r'\nripgrep_path = '/x/rg'\nrust_analyzer_path = '/x/ra'\n\
                  [csharp]\npath = '/x/cs'\nargs = ['a']\ndisabled = false\n\
                  [typescript]\npath = '/x/ts'\n[python]\npath = '/x/py'\n[go]\npath = '/x/go'\n\
-                 [java]\npath = '/x/java'\n[clangd]\npath = '/x/clangd'\ndisabled = true\n",
+                 [java]\npath = '/x/java'\n[clangd]\npath = '/x/clangd'\ndisabled = true\n\
+                 [markdown]\npath = '/x/marksman'\n",
                 data = literal(&dir.join("d2"))
             ),
         );
@@ -1346,6 +1356,7 @@ mod tests {
         assert!(config.python.enabled() && config.go.enabled() && config.java.enabled());
         assert_eq!(config.csharp.args, vec!["a".to_owned()]);
         assert!(config.clangd.path.is_some() && !config.clangd.enabled());
+        assert!(config.markdown.enabled());
         for key in machine_keys() {
             if key.ends_with(".args") || key.ends_with(".disabled") {
                 continue;
@@ -1821,6 +1832,7 @@ mod tests {
                 &["--compile-commands-dir=build"],
                 Some(true),
             )),
+            markdown: Some(lsp("/x/marksman", &[], None)),
         }
     }
 

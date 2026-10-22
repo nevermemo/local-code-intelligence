@@ -2,11 +2,12 @@ use crate::{
     config::{Config, LspSync},
     language,
     lsp::{
-        adapter::LspAdapter,
+        adapter::{LspAdapter, SentTexts},
         clangd::ClangdServer,
         csharp::CSharpServer,
         go::GoServer,
         java::JavaServer,
+        markdown::MarkdownServer,
         python::PythonServer,
         rust::RustServer,
         transport::{InactivityTimeout, JsonRpcClient, RpcError},
@@ -36,6 +37,7 @@ pub mod go;
 pub mod java;
 #[cfg(windows)]
 mod job;
+pub mod markdown;
 pub mod python;
 pub mod rust;
 pub mod stamp;
@@ -130,6 +132,10 @@ pub struct ServerReadiness {
 /// A live JSON-RPC session with one spawned, initialized language server.
 struct GenericClient {
     rpc: Arc<JsonRpcClient>,
+    /// The texts this session has sent in `didOpen` (see [`SentTexts`]). It
+    /// lives and dies with the server process, so a restarted server is sent
+    /// its files again.
+    sent: SentTexts,
 }
 
 impl GenericClient {
@@ -159,7 +165,10 @@ impl GenericClient {
             .with_context(|| format!("initialize {}", adapter.provider()))?;
         rpc.notify("initialized", json!({})).await?;
         adapter.after_initialized(&rpc).await?;
-        Ok(Arc::new(Self { rpc }))
+        Ok(Arc::new(Self {
+            rpc,
+            sent: SentTexts::default(),
+        }))
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -753,8 +762,9 @@ tokio::task_local! {
 /// before either starts a server. So the manager records it when a request
 /// acquires its session ([`Manager::session`]), for the requests made inside
 /// [`WalkSessions::scope`]; the walk reads [`Self::reused`] when it ends and
-/// labels the answers of a reused server. Requests made outside a scope (the
-/// warm start, navigation, the search channel) are not recorded.
+/// labels the answers of a reused server. Navigation and the search channel
+/// make their requests inside a scope too. Requests made outside a scope (the
+/// warm start) are not recorded.
 #[derive(Default)]
 pub struct WalkSessions {
     seen: std::sync::Mutex<Vec<SessionUse>>,
@@ -1071,6 +1081,7 @@ impl Manager {
             Arc::new(GoServer::new(&config.go, timeout)),
             Arc::new(JavaServer::new(config, timeout)),
             Arc::new(ClangdServer::new(&config.clangd, timeout)),
+            Arc::new(MarkdownServer::new(&config.markdown, timeout)),
         ];
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let syncs = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -1656,8 +1667,9 @@ impl Manager {
 
     /// Same retry contract as [`Self::request`], but runs the adapter's
     /// `before_position_request` hook (e.g. TypeScript's `textDocument/
-    /// didOpen`) against the client before the request on each client (the
-    /// repeats of [`Self::send`] on one server do not run it again).
+    /// didOpen`, sent once per changed text, see [`SentTexts`]) against the
+    /// client before the request on each client (the repeats of
+    /// [`Self::send`] on one server do not run it again).
     async fn position_request(
         &self,
         adapter: &Arc<dyn LspAdapter>,
@@ -1692,7 +1704,7 @@ impl Manager {
             };
             let result = async {
                 adapter
-                    .before_position_request(&client.rpc, file, relative)
+                    .before_position_request(&client.rpc, &client.sent, file, relative)
                     .await?;
                 self.send(adapter, workspace, &session, &client, method, &params)
                     .await
@@ -1716,7 +1728,7 @@ impl Manager {
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
                 adapter
-                    .before_position_request(&client.rpc, file, relative)
+                    .before_position_request(&client.rpc, &client.sent, file, relative)
                     .await?;
                 self.send(adapter, workspace, &session, &client, method, &params)
                     .await
@@ -2943,7 +2955,7 @@ mod tests {
         assert_eq!(watching, ["rust-analyzer"]);
         assert_eq!(
             manager.adapters().len(),
-            7,
+            8,
             "a new adapter must be classified"
         );
     }
@@ -3737,6 +3749,7 @@ mod tests {
                 ("csharp-ls", false),
                 ("gopls", true),
                 ("jdtls", true),
+                ("marksman", true),
                 ("pyright", true),
                 ("rust-analyzer", false),
                 ("typescript-language-server", false),

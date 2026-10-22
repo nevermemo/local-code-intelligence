@@ -12,6 +12,7 @@ publish = false
 # scored-walk harness of the v2 spike (slice M0.4); `scip` needs no `protoc`.
 # `ignore` (already a dependency of `lci-core`) walks the tree for `grep.live`.
 [dependencies]
+ast-grep-core = { version = "=0.40.1", default-features = false, features = ["tree-sitter"] }
 async-trait = "0.1.92"
 futures = "0.3"
 ignore = "0.4"

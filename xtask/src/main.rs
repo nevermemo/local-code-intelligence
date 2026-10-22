@@ -229,6 +229,14 @@ enum AcceptanceCommand {
         #[arg(long)]
         java: Option<PathBuf>,
     },
+    /// Real marksman acceptance for Markdown (headings, link definition,
+    /// references to a heading).
+    MarkdownLsp {
+        #[arg(long)]
+        marksman: Option<PathBuf>,
+    },
+    /// Markdown provider-isolation/degradation acceptance (missing marksman binary).
+    MarkdownMissing,
     /// Real clangd acceptance for C (workspace symbols, definition, references).
     CLsp {
         #[arg(long)]
@@ -296,6 +304,10 @@ async fn main() -> Result<()> {
             AcceptanceCommand::JavaLsp { java } => acceptance::java_lsp::run(java).await,
             AcceptanceCommand::JavaMissing => acceptance::java_missing::run().await,
             AcceptanceCommand::JavaRecovery { java } => acceptance::java_recovery::run(java).await,
+            AcceptanceCommand::MarkdownLsp { marksman } => {
+                acceptance::markdown_lsp::run(marksman).await
+            }
+            AcceptanceCommand::MarkdownMissing => acceptance::markdown_missing::run().await,
             AcceptanceCommand::CLsp { clangd } => acceptance::c_lsp::run(clangd).await,
             AcceptanceCommand::CMissing => acceptance::c_missing::run().await,
             AcceptanceCommand::CRecovery { clangd } => acceptance::c_recovery::run(clangd).await,
