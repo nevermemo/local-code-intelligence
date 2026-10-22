@@ -1,8 +1,9 @@
-//! Runs the full live-acceptance/evaluation suite locally: the same
-//! commands and order as `.github/workflows/live-acceptance.yml`, but with
-//! each step bounded by its own timeout instead of one blind ceiling for
-//! the whole run, and no GitHub Actions/self-hosted-runner dependency at
-//! all. See `docs/development/local-live-acceptance.md` for the rationale.
+//! Runs the full live-acceptance/evaluation suite: each step bounded by its
+//! own timeout instead of one blind ceiling for the whole run, and no GitHub
+//! Actions/self-hosted-runner dependency when run locally.
+//! `.github/workflows/live-acceptance.yml` runs this command with
+//! `--require-all` (N87). See `docs/development/local-live-acceptance.md`
+//! for the rationale.
 //!
 //! Cross-platform like the rest of `xtask` (see `AGENTS.md`): process
 //! spawning and tree-killing go through `std::process`/`sysinfo`, the same
@@ -525,8 +526,7 @@ pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()>
         results.push(run_step(spec, &log_dir, &run_root)?);
     }
 
-    // Mirrors live-acceptance.yml's cleanup step: removes only this run's
-    // fixture root. Deliberately does not kill processes by name -- this is
+    // Removes only this run's fixture root (the workflow relies on this). Deliberately does not kill processes by name -- this is
     // your own machine, not a disposable sandbox, and a crashed run's orphan
     // needs a human glance at a process list, not a script guessing by
     // process name.
@@ -746,6 +746,29 @@ mod tests {
                 assert!(write_summary(&results, require_all, &mut Vec::new()).is_err());
             }
         }
+    }
+
+    /// N87: the workflow must run the orchestrator with `--require-all`;
+    /// run step by step, a missing tool's skip exits zero and reads green.
+    #[test]
+    fn live_acceptance_workflow_requires_every_tool() {
+        let path = workspace_root().join(".github/workflows/live-acceptance.yml");
+        let workflow = std::fs::read_to_string(&path).unwrap();
+        let commands: Vec<&str> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("run:"))
+            .map(str::trim)
+            .collect();
+        assert!(
+            commands.contains(&"cargo xtask live-acceptance --require-all"),
+            "live-acceptance.yml must run `cargo xtask live-acceptance --require-all`: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.starts_with("cargo xtask acceptance ")),
+            "a step-by-step `cargo xtask acceptance <name>` run reads a skipped tool as green"
+        );
     }
 
     #[test]

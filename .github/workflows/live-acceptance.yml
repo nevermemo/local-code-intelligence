@@ -5,14 +5,16 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# Runs the live acceptance/evaluation suite (cargo xtask acceptance <name>,
-# and `evaluate ./evaluations/core.toml`) against real locally running
-# embedding/reranker services and real language-server executables. Those
-# services live on the machine registered as the self-hosted runner below,
-# not in this workflow -- see docs/development/live-acceptance-ci.md for
-# what to install and how to register the runner. Deliberately never
-# triggers on `pull_request`: a self-hosted runner must not execute code
-# from an untrusted fork PR.
+# Runs the live acceptance/evaluation suite (`cargo xtask live-acceptance`:
+# every `cargo xtask acceptance <name>` step, then `evaluate
+# ./evaluations/core.toml`) against real locally running embedding/reranker
+# services and real language-server executables. Those services live on the
+# machine registered as the self-hosted runner below, not in this workflow --
+# see docs/development/live-acceptance-ci.md for what to install and how to
+# register the runner. Deliberately never triggers on `pull_request`: a
+# self-hosted runner must not execute code from an untrusted fork PR, and the
+# `test (windows-latest)` job in ci.yml is the only merge gate, so nothing in
+# this workflow can block a pull request.
 # The job only checks out and runs cargo: a read-only token is enough.
 permissions:
   contents: read
@@ -27,110 +29,33 @@ jobs:
     # Generous headroom: a real run building from a clean checkout, then
     # indexing a real external Cargo workspace for the rust-analyzer LSP
     # flow (documented elsewhere as "2 to 10+ minutes" of embedding time
-    # alone), then all seven languages' full/isolation/recovery LSP triples
+    # alone), then all the languages' full/isolation/recovery LSP triples
     # plus the retrieval-quality evaluation, was observed taking a bit
     # over an hour end to end on first real measurement -- the original
     # 60-minute bound cut a fully-passing run off right at the finish
     # line (all acceptance steps green; only Evaluate + cleanup were cut
-    # off). 150 minutes leaves real slack over that observed number.
+    # off). 150 minutes leaves real slack over that observed number. The
+    # orchestrator also bounds each step by its own timeout.
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Every acceptance fixture goes under this run's own directory
-      # (Fixture::create reads LCI_ACCEPTANCE_FIXTURE_ROOT), so the sweep at
-      # the end removes only what this run created.
-      - name: Choose the run-unique fixture root
-        shell: pwsh
-        run: |
-          "LCI_ACCEPTANCE_FIXTURE_ROOT=$env:RUNNER_TEMP/lci-live-run-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_ENV
-
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Acceptance - core (index/search/reindex smoke test)
-        run: cargo xtask acceptance core
-
-      - name: Acceptance - multilingual (fixture indexing/search/decoy-ranking, embedding + reranker only)
-        run: cargo xtask acceptance multilingual
-
-      - name: Acceptance - rust-analyzer LSP
-        run: cargo xtask acceptance lsp
-
-      - name: Acceptance - Python LSP (pyright)
-        run: cargo xtask acceptance python-lsp
-      - name: Acceptance - Python LSP provider isolation
-        run: cargo xtask acceptance python-missing
-      - name: Acceptance - Python LSP recovery
-        run: cargo xtask acceptance python-recovery
-
-      - name: Acceptance - TypeScript/JavaScript LSP
-        run: cargo xtask acceptance typescript-lsp
-      - name: Acceptance - TypeScript/JavaScript LSP provider isolation
-        run: cargo xtask acceptance typescript-missing
-      - name: Acceptance - TypeScript/JavaScript LSP recovery
-        run: cargo xtask acceptance typescript-recovery
-
-      - name: Acceptance - Go LSP (gopls)
-        run: cargo xtask acceptance go-lsp
-      - name: Acceptance - Go LSP provider isolation
-        run: cargo xtask acceptance go-missing
-      - name: Acceptance - Go LSP recovery
-        run: cargo xtask acceptance go-recovery
-
-      - name: Acceptance - Java LSP (jdtls)
-        run: cargo xtask acceptance java-lsp
-      - name: Acceptance - Java LSP provider isolation
-        run: cargo xtask acceptance java-missing
-      - name: Acceptance - Java LSP recovery
-        run: cargo xtask acceptance java-recovery
-
-      - name: Acceptance - C# LSP (dotnet + csharp-ls)
-        run: cargo xtask acceptance csharp-lsp
-      - name: Acceptance - C# LSP provider isolation
-        run: cargo xtask acceptance csharp-missing
-      - name: Acceptance - C# LSP recovery
-        run: cargo xtask acceptance csharp-recovery
-
-      - name: Acceptance - C LSP (clangd)
-        run: cargo xtask acceptance c-lsp
-      - name: Acceptance - C LSP provider isolation
-        run: cargo xtask acceptance c-missing
-      - name: Acceptance - C LSP recovery
-        run: cargo xtask acceptance c-recovery
-
-      - name: Acceptance - C++ LSP (clangd)
-        run: cargo xtask acceptance cpp-lsp
-      - name: Acceptance - C++ LSP provider isolation
-        run: cargo xtask acceptance cpp-missing
-      - name: Acceptance - C++ LSP recovery
-        run: cargo xtask acceptance cpp-recovery
-
-      - name: Evaluate - retrieval quality (self workspace)
-        run: >
-          cargo run --bin local-code-intelligence --
-          evaluate ./evaluations/core.toml
-          --workspace "self=${{ github.workspace }}"
-          --output ./test-results/evaluation.json
-
-      # Only sweeps this run's own fixture root (lci-live-run-<run id>-<attempt>
-      # under RUNNER_TEMP, chosen above; Fixture::create in
-      # xtask/src/acceptance/mod.rs puts every fixture there), never other
-      # lci-* directories or another run's fixtures. Deliberately does NOT
-      # force-kill
-      # processes by name: this runner is this machine, not a disposable CI
-      # sandbox, and a blanket `Stop-Process -Name rust-analyzer` (etc.)
-      # would just as happily kill your editor's language servers or the
-      # long-running `local-code-intelligence serve` process alongside any
-      # genuinely orphaned one from a crashed run. Each acceptance test's
-      # own ManagedServer/Fixture cleanup already handles the normal case;
-      # a truly orphaned process from a crashed job needs a human to check
-      # Task Manager, not a workflow step guessing by process name alone.
-      - name: Sweep leftover fixture temp directories
-        if: always()
-        shell: pwsh
-        run: |
-          $root = $env:LCI_ACCEPTANCE_FIXTURE_ROOT
-          if ($root -and (Split-Path -Leaf $root) -like 'lci-live-run-*' -and (Test-Path -LiteralPath $root)) {
-            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-          }
+      # One orchestrated run instead of one workflow step per acceptance
+      # subcommand. A step whose tool is missing (rust-analyzer, pyright,
+      # gopls, jdtls, clangd, marksman, ...) prints PREREQUISITE_UNAVAILABLE
+      # and exits 0, so run one by one it read as a green step. With
+      # --require-all the orchestrator counts such a skip as a failure and
+      # exits non-zero: this runner is registered to host every tool in the
+      # docs/development/live-acceptance-ci.md prerequisites table, so a
+      # missing one is a broken runner, not an optional channel.
+      #
+      # The orchestrator builds (`build --workspace --exclude xtask`), gives
+      # every fixture a run-unique root under the temp directory and removes
+      # only that root when the run ends, writes per-step logs and
+      # summary.txt under test-results/live-acceptance-logs/, and prints the
+      # tail of every step that did not pass. Like the previous per-step
+      # workflow it never kills processes by name: this runner is a
+      # developer machine, and an orphan left by a crashed run needs a human
+      # look at the process list.
+      - name: Live acceptance and evaluation (every tool required)
+        run: cargo xtask live-acceptance --require-all
