@@ -361,6 +361,10 @@ fn git(root: &Path, args: &[&str]) {
 
 // ---- what a call showed ----------------------------------------------------
 
+/// The deadline of every walk of these cases: ten minutes, far above what a
+/// loaded machine needs, so only a map that hangs reaches it.
+const WALK_DEADLINE_MS: u64 = 600_000;
+
 type Reached = BTreeMap<String, BTreeSet<String>>;
 type Edges = BTreeMap<String, BTreeSet<(String, String)>>;
 
@@ -584,8 +588,8 @@ impl World {
         config.traverse.enabled = true;
         // The exact cards would otherwise start the walk from the probes.
         config.traverse.exact_seeds = false;
-        // The deadline only bounds a call: a language server that starts slowly
-        // on a loaded machine must not turn `lsp.live` into an empty answer.
+        // The most `validate` accepts; `World::run` lifts the deadline of the
+        // walks themselves to `WALK_DEADLINE_MS`.
         config.traverse.deadline_ms = 60_000;
         // The version probe of `lsp.live` is bounded by this (5 s failed under load).
         config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
@@ -740,12 +744,19 @@ impl World {
     }
 
     async fn run(&self, call: &Call<'_>) -> traverse::Report {
+        // A walk's deadline only bounds a call, and these cases check
+        // freshness, not speed: a loaded machine (ripgrep expansions of 10 s
+        // were seen) must not cut a map and turn it into an empty answer. A map that still runs out of time fails
+        // `assert_no_timeout` below. The lift is on the limits passed to the
+        // call; the config keeps the value `validate` accepts.
+        let mut limits = self.app.config.traverse.clone();
+        limits.deadline_ms = WALK_DEADLINE_MS;
         let mut profile = self.app.config.run_profile.clone();
         profile.traverse.map_freshness = self.labels;
         profile.freshness.verify_on_read = self.verify;
         profile.lsp.places = self.places;
         let report = traverse::run(
-            &self.app.config.traverse,
+            &limits,
             &profile,
             &Dirs::under(&self.app.config.data_dir),
             call,
