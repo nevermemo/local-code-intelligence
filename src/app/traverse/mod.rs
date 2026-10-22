@@ -98,31 +98,19 @@ mod tests;
 
 use crate::{
     app::App,
-    config::{LspPlaces, LspSessions, RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    config::{LspSessions, RunProfileConfig, TraverseConfig, TraverseFirstStage},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use first_stage::{
     BudgetedGit, EXACT_CLOSURE_ID, EXACT_PICKAXE_ID, ExactCard, FirstStage, closure_cards,
     pickaxe_cards, seed_cards,
 };
-use lci_core::{lexical, node::NodeId};
 use lci_maps::{
-    Map, MapId, Registry, SnapshotRef, SnapshotView,
-    config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
-    contains::CONTAINS_MAP_ID,
-    docs_mentions::{DOCS_MENTIONS_ID, DocsMentions},
-    git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
-    live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
-    lsp_live::{LSP_LIVE_ID, LspLive, ManagerBackend, OutlinePlaces, ScipPlaces, SymbolPlaces},
-    probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
-    scip_graph::SCIP_MAP_ID,
-    scip_impact::{ImpactMap, ImpactOptions, SCIP_IMPACT_ID},
-    scip_implements::{ImplementsMap, ImplementsOptions, SCIP_IMPLEMENTS_ID},
-    search_maps::{
-        ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
-    },
-    structural::{Ripgrep, STRUCTURAL_ID, Structural, StructuralOptions},
-    tested_by::{TESTED_BY_ID, TestedByMap},
+    MapId, SnapshotRef, SnapshotView,
+    lsp_live::LSP_LIVE_ID,
+    scip_impact::SCIP_IMPACT_ID,
+    scip_implements::SCIP_IMPLEMENTS_ID,
+    search_maps::{SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID},
     traverse::{
         Grouping, Seed, Traversal, TraversalBudget,
         frontier::HopPrice,
@@ -135,7 +123,7 @@ use lci_maps::{
         source::OnTheFly,
         steer::Steer,
         tiebreak::TieBreak,
-        trace::{self, PlanMap, PlanPolicy, StartPlan},
+        trace::{self, PlanPolicy, StartPlan},
     },
 };
 use schemars::JsonSchema;
@@ -149,21 +137,39 @@ use std::{
 };
 
 use freshness::Observer;
-use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
+use index::{Loaded, impact_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
     add_answer_labels, add_commits, add_file_changed, add_first_stage_only, add_maps, add_paths,
-    add_policy, add_sites, chunk_lines, lint_steer, no_seeds_response, response_json,
+    add_policy, add_sites, lint_steer, no_seeds_response, response_json,
 };
 pub use seeds::TraitSeedMode;
 pub use seeds::{AppSeeds, NoSearch, SeedHit, SeedSearch};
-use seeds::{SeedMap, Seeds, add_trait_seed_count, add_trait_seeds, find_seeds};
+use seeds::{Seeds, add_trait_seed_count, add_trait_seeds, find_seeds};
+
+// The names the test modules reach through `use super::*`.
+#[cfg(test)]
+use {
+    lci_core::node::NodeId,
+    lci_maps::{
+        Map,
+        config_key::CONFIG_KEY_MAP_ID,
+        contains::CONTAINS_MAP_ID,
+        docs_mentions::DOCS_MENTIONS_ID,
+        live_grep::GREP_LIVE_MAP_ID,
+        scip_graph::SCIP_MAP_ID,
+        scip_impact::{ImpactMap, ImpactOptions},
+        structural::STRUCTURAL_ID,
+        tested_by::TESTED_BY_ID,
+        traverse::trace::PlanMap,
+    },
+    response::chunk_lines,
+};
 
 pub use maps::{
     MAPS, OPT_IN_MAPS, SEEDS_BM25, SEEDS_HYBRID, SEEDS_LITERAL, SEEDS_MAP, SEEDS_REPO_MAP,
 };
-use maps::{PROBE_COMPILE_SKIPPED_NOTE, ripgrep_runs, warn_probe_compile_once};
 
 /// External calls a traversal may make; no map here makes any.
 const EXTERNAL_CALLS: u32 = 100;
@@ -772,9 +778,6 @@ pub async fn run_with_trait_seeds(
             .map_err(|e| anyhow!("{e}"))?;
     }
     let wants = |id: MapId| selection.wants(id);
-    // The maps the call asked for that could not be set up (K13: an answer that
-    // lacks one is not labelled complete). Read only under `answer_labels`.
-    let mut unavailable: Vec<MapId> = Vec::new();
 
     // `lsp.live` on a shared manager: its server passes the strict tree barrier
     // once, here, before the seed search's channel can keep a watching server
@@ -800,517 +803,23 @@ pub async fn run_with_trait_seeds(
         budget.deadline += found.search_time;
     }
 
-    let mut registry = Registry::new(60.0);
-    let mut plan_maps = Vec::new();
-    register(
-        &mut registry,
-        &mut plan_maps,
-        &observer,
-        Box::new(SeedMap::hybrid()),
-        wants(SEEDS_HYBRID),
-    )?;
-    register(
-        &mut registry,
-        &mut plan_maps,
-        &observer,
-        Box::new(SeedMap::name_tokens()),
-        wants(SEEDS_MAP),
-    )?;
-    // Registered only when the call runs it, so a call without it (the
-    // default) lists and traces the maps it always did.
-    if wants(SEEDS_BM25) {
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(SeedMap::bm25()),
-            true,
-        )?;
-    }
-    if wants(SEEDS_REPO_MAP) {
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(SeedMap::repo_map()),
-            true,
-        )?;
-    }
-    if wants(SEEDS_LITERAL) {
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(SeedMap::literal()),
-            true,
-        )?;
-    }
-    register(
-        &mut registry,
-        &mut plan_maps,
-        &observer,
-        Box::new(Shared(loaded.scip.clone())),
-        wants(SCIP_MAP_ID),
-    )?;
-    // The chunks the search maps reach have no lines in their ids: with a
-    // search map on, every chunk of the index is given to structure.contains
-    // so that it can expand them.
-    let early = Instant::now();
-    let mut lines = chunk_lines(&found);
-    let mut search_index: Option<Arc<dyn ChunkSearch + '_>> = None;
-    if wants(SEARCH_LEXICAL_ID) || wants(SEARCH_VECTOR_ID) {
-        match call.seed_search.and_then(|search| search.chunk_search()) {
-            None => {
-                notes.push(
-                    "search.lexical and search.vector need the workspace index: give --root and a question or seeds, with the application available".to_owned(),
-                );
-                unavailable.extend(
-                    [SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID]
-                        .into_iter()
-                        .filter(|id| wants(id)),
-                );
-            }
-            Some(index) => {
-                match index.chunk_lines().await {
-                    Ok(all) => {
-                        let known: HashSet<NodeId> =
-                            lines.iter().map(|(node, _)| node.clone()).collect();
-                        lines.extend(all.into_iter().filter(|(node, _)| !known.contains(node)));
-                    }
-                    Err(error) => notes.push(format!(
-                        "the search maps found no chunk lines (structure.contains cannot expand the chunks they reach): {error}"
-                    )),
-                }
-                search_index = Some(index);
-            }
-        }
-    }
-    let early = early.elapsed();
-    register(
-        &mut registry,
-        &mut plan_maps,
-        &observer,
-        Box::new(loaded.contains.with_chunk_lines(lines)),
-        wants(CONTAINS_MAP_ID),
-    )?;
-    // Building the tree maps is setup, not walking: the deadline does not run
-    // while it happens.
-    let setup = Instant::now();
-    if let (true, Some(root)) = (wants(GREP_LIVE_MAP_ID), call.scip_root) {
-        let grep = LiveGrep::new(root, Some(Arc::new(ScipSpans::from_scip(&loaded.scip))));
-        // Measure the map's cost before the walk prices a hop by it.
-        grep.calibrate(3).await;
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(grep),
-            true,
-        )?;
-    }
-    if let (true, Some(root)) = (wants(DOCS_MENTIONS_ID), call.scip_root) {
-        let docs = DocsMentions::new(root);
-        // One walk over the documentation files only: enough for the card's median.
-        docs.calibrate(1).await;
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(docs),
-            true,
-        )?;
-    }
-    if let (true, Some(root)) = (wants(STRUCTURAL_ID), call.scip_root) {
-        let configured = call.lsp.map_or("rg", |config| config.ripgrep_path.as_str());
-        let resolved = lexical::resolve_ripgrep_path(configured);
-        if ripgrep_runs(&resolved).await {
-            let structural = Structural::new(
-                root,
-                Box::new(Ripgrep::new(resolved.to_string_lossy().into_owned())),
-                loaded.places().await,
-                StructuralOptions::default(),
-            );
-            notes.extend(
-                structural
-                    .notes()
-                    .iter()
-                    .map(|dropped| format!("grep.structural: a pattern was dropped: {dropped}")),
-            );
-            // One expansion of a name that occurs nowhere: ripgrep over the
-            // tree, enough for the card's median.
-            structural.calibrate(1).await;
-            register(
-                &mut registry,
-                &mut plan_maps,
-                &observer,
-                Box::new(structural),
-                true,
-            )?;
-        } else {
-            notes.push(
-                "grep.structural needs ripgrep (`rg`; [index] ripgrep_path): it was not found, the map gives no edges"
-                    .to_owned(),
-            );
-            unavailable.push(STRUCTURAL_ID);
-        }
-    }
-    if let (true, Some(root)) = (wants(CONFIG_KEY_MAP_ID), call.scip_root) {
-        let map = match config_key_map(call.scip_index, root, &loaded).await {
-            Ok(map) => {
-                let stats = map.stats();
-                notes.push(format!(
-                    "config.key: {} keys, {} exact and {} text edges (text edges off), built in {:.0} ms",
-                    stats.keys, stats.exact, stats.text, stats.build_ms
-                ));
-                map
-            }
-            Err(error) => {
-                notes.push(format!("config.key has no edges: {error:#}"));
-                unavailable.push(CONFIG_KEY_MAP_ID);
-                Arc::new(ConfigKeyMap::empty(ConfigKeyOptions::default()))
-            }
-        };
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(Shared(map)),
-            true,
-        )?;
-    }
-    let mut git_history = None;
-    if wants(GIT_HISTORY_ID) {
-        match call.scip_root {
-            None => {
-                notes.push("git.history needs the tree: give --root".to_owned());
-                unavailable.push(GIT_HISTORY_ID);
-            }
-            Some(root) => {
-                let table = symbol_files(&loaded.scip);
-                match GitHistoryMap::open_with(root, GitHistoryConfig::default(), table) {
-                    Ok(map) => {
-                        let map = Arc::new(map);
-                        register(
-                            &mut registry,
-                            &mut plan_maps,
-                            &observer,
-                            Box::new(Shared(map.clone())),
-                            true,
-                        )?;
-                        git_history = Some(map);
-                    }
-                    Err(error) => {
-                        notes.push(format!("git.history is unavailable: {error}"));
-                        unavailable.push(GIT_HISTORY_ID);
-                    }
-                }
-            }
-        }
-    }
-    if wants(PROBE_COMPILE_ID) {
-        match call.scip_root {
-            None => {
-                notes.push("probe.compile needs the tree: give --root".to_owned());
-                unavailable.push(PROBE_COMPILE_ID);
-            }
-            Some(_) if !call.lsp.is_some_and(|config| config.rust_analyzer_trusted) => {
-                notes.push(PROBE_COMPILE_SKIPPED_NOTE.to_owned());
-                unavailable.push(PROBE_COMPILE_ID);
-                warnings.push(PROBE_COMPILE_SKIPPED_NOTE.to_owned());
-            }
-            Some(root) => {
-                notes.push(format!(
-                    "probe.compile: cargo check runs on a scratch copy of {} with --offline, build scripts and procedural macros of the tree and its dependencies execute (rust_analyzer_trusted = true)",
-                    root.display()
-                ));
-                warn_probe_compile_once();
-                let map = ProbeMap::new(loaded.scip.clone(), ProbeConfig::for_tree(root));
-                register(
-                    &mut registry,
-                    &mut plan_maps,
-                    &observer,
-                    Box::new(Shared(Arc::new(map))),
-                    true,
-                )?;
-            }
-        }
-    }
-    let mut lsp_live = None;
-    // Each server `lsp.live` runs, with the manager that runs it and the workspace id,
-    // to report after the walk how its servers stood.
-    let mut lsp_live_sessions: Vec<(&'static str, Arc<lci_core::lsp::Manager>, String)> =
-        Vec::new();
-    let mut lsp_live_workspace = String::new();
-    let mut lsp_live_walk: Option<Arc<lci_core::lsp::WalkSessions>> = None;
-    if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
-        // The servers of the call's settings; a server starts at the first
-        // expansion. `per_call`: the manager is the map's alone, so the server
-        // stops when the map drops. `shared`: a server that sees an edit on its
-        // own (or every server under `sync = "watch"`) runs on the caller's
-        // manager, whose owner stops it (idle sweeper, release, shutdown); the
-        // other servers run on the call's own manager, as under `per_call`.
-        let workspace = dunce::canonicalize(root)
-            .map(|path| lci_core::workspace::Workspace {
-                id: lci_core::workspace::hash(&path.to_string_lossy()),
-                path,
-            })
-            .map_err(|error| error.to_string());
-        let backend = match workspace {
-            Ok(workspace) => {
-                let defaults = lci_core::config::Config::default();
-                let settings = call.lsp.unwrap_or(&defaults);
-                let own = per_call_manager(call);
-                let shared = match (profile.lsp.sessions, &call.lsp_sessions) {
-                    (LspSessions::Shared, Some(shared)) => Some(Arc::clone(shared)),
-                    _ => None,
-                };
-                lsp_live_workspace = workspace.id.clone();
-                // The version probe is bounded like the readiness probes. It
-                // runs inside the setup window that `budget.deadline +=
-                // setup.elapsed()` below credits back to the walk deadline, so
-                // a slow probe costs the walk no budget.
-                let probe =
-                    std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
-                let probe_started = Instant::now();
-                let opened = match shared {
-                    Some(shared) => ManagerBackend::open_split(workspace, shared, own, probe).await,
-                    None => ManagerBackend::open_with_probe_timeout(workspace, own, probe).await,
-                };
-                // `cargo xtask maps lsp-cost` reads this line: the version probe is
-                // memoised for the process (d470), per-call managers included, so
-                // only the first probe of a binary logs real ms and later calls
-                // log about 0.
-                tracing::debug!(
-                    probe_ms = probe_started.elapsed().as_secs_f64() * 1000.0,
-                    probe_limit_ms = probe.as_millis() as u64,
-                    ok = opened.is_ok(),
-                    "lsp.live version probe"
-                );
-                opened
-            }
-            Err(error) => Err(error),
-        };
-        for restart in &walk_restarts {
-            notes.push(restart.note("lsp.live"));
-        }
-        match backend {
-            Ok(backend) => {
-                for (provider, manager) in backend.routes() {
-                    lsp_live_sessions.push((provider, manager, lsp_live_workspace.clone()));
-                }
-                for restart in backend.restarted() {
-                    notes.push(restart.note("lsp.live"));
-                }
-                // Which servers this walk found running is read when it ends
-                // (the barrier cannot say, see `WalkSessions`).
-                lsp_live_walk = Some(backend.walk());
-                let scip_places = ScipPlaces::from_scip(&loaded.scip);
-                // `outline`: the index's table first, the server's own outline
-                // for what it lacks (everything under `scip.mode = "off"`).
-                // `auto` (the default): the index's table when the graph read
-                // for this workspace has a node (then the walk is the `scip`
-                // walk), else the outline (no index is read under `scip.mode =
-                // off`, or under `cache` with no file: nothing else would
-                // place a symbol).
-                let outline = match profile.lsp.places {
-                    LspPlaces::Scip => false,
-                    LspPlaces::Outline => true,
-                    LspPlaces::Auto => loaded.scip.graph().nodes.is_empty(),
-                };
-                let places: Arc<dyn SymbolPlaces> = if outline {
-                    Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
-                } else {
-                    Arc::new(scip_places)
-                };
-                let map = Arc::new(
-                    LspLive::new(Box::new(backend), places)
-                        .implementations(profile.lsp.implementations)
-                        .call_hierarchy(profile.lsp.call_hierarchy),
-                );
-                register(
-                    &mut registry,
-                    &mut plan_maps,
-                    &observer,
-                    Box::new(Shared(map.clone())),
-                    true,
-                )?;
-                lsp_live = Some(map);
-            }
-            Err(error) => {
-                notes.push(format!("lsp.live is unavailable: {error}"));
-                unavailable.push(LSP_LIVE_ID);
-            }
-        }
-    }
-    // The maps above that read the tree and were skipped without a word for lack of one.
-    if call.scip_root.is_none() {
-        unavailable.extend(
-            [
-                GREP_LIVE_MAP_ID,
-                DOCS_MENTIONS_ID,
-                STRUCTURAL_ID,
-                CONFIG_KEY_MAP_ID,
-                LSP_LIVE_ID,
-            ]
-            .into_iter()
-            .filter(|id| wants(id)),
-        );
-    }
-    let mut impact = None;
-    if wants(SCIP_IMPACT_ID) {
-        match call.scip_root {
-            None => {
-                notes.push("scip.impact needs the tree: give --root".to_owned());
-                unavailable.push(SCIP_IMPACT_ID);
-            }
-            Some(root) => {
-                let map = match impact_map(call.scip_index, root, &loaded).await {
-                    Ok(map) => {
-                        let stats = map.stats();
-                        notes.push(format!(
-                            "scip.impact: {} definitions, {} with a node id ({} those of graph.scip), cap {} users per node",
-                            stats.defs,
-                            stats.nodes,
-                            stats.resolved,
-                            map.options().cap
-                        ));
-                        map
-                    }
-                    Err(error) => {
-                        notes.push(format!("scip.impact has no edges: {error:#}"));
-                        unavailable.push(SCIP_IMPACT_ID);
-                        Arc::new(ImpactMap::empty(ImpactOptions::default()))
-                    }
-                };
-                impact = Some(map.clone());
-                register(
-                    &mut registry,
-                    &mut plan_maps,
-                    &observer,
-                    Box::new(Shared(map)),
-                    true,
-                )?;
-            }
-        }
-    }
-    if wants(TESTED_BY_ID) {
-        match call.scip_root {
-            None => {
-                notes.push("tests.tested_by needs the tree: give --root".to_owned());
-                unavailable.push(TESTED_BY_ID);
-            }
-            Some(root) => {
-                // The index `scip.impact` reads: shared when that map was
-                // built, else built here (cached by the stamp).
-                let shared = match &impact {
-                    Some(map) => map.clone(),
-                    None => match impact_map(call.scip_index, root, &loaded).await {
-                        Ok(map) => map,
-                        Err(error) => {
-                            notes.push(format!("tests.tested_by has no edges: {error:#}"));
-                            unavailable.push(TESTED_BY_ID);
-                            Arc::new(ImpactMap::empty(ImpactOptions::default()))
-                        }
-                    },
-                };
-                let map = TestedByMap::new(shared);
-                notes.push(format!(
-                    "tests.tested_by: {} test units in the impact index, cap {} edges per node",
-                    map.test_units(),
-                    lci_maps::EXPAND_LIMIT
-                ));
-                register(
-                    &mut registry,
-                    &mut plan_maps,
-                    &observer,
-                    Box::new(map),
-                    true,
-                )?;
-            }
-        }
-    }
-    let mut implements = None;
-    let mut site_impact = None;
-    if wants(SCIP_IMPLEMENTS_ID) {
-        match call.scip_root {
-            None => {
-                notes.push("scip.implements needs the tree: give --root".to_owned());
-                unavailable.push(SCIP_IMPLEMENTS_ID);
-            }
-            Some(root) => {
-                let map = match implements_map(call.scip_index, root, &loaded).await {
-                    Ok(map) => {
-                        let stats = map.stats();
-                        let report = &loaded.scip.graph().report;
-                        notes.push(format!(
-                            "scip.implements: {} impl headers read ({} with a trait, {} external; {} macro and {} other unresolved, {} documents without source), {} type-trait and {} method pairs, {} facts dropped for lack of a node id, cap {} edges per node",
-                            report.impl_headers,
-                            report.impl_resolved,
-                            report.impl_external_trait,
-                            report.impl_unresolved_macro,
-                            report.impl_unresolved_other,
-                            report.impl_no_source,
-                            stats.type_trait,
-                            stats.methods,
-                            stats.dropped,
-                            map.options().cap
-                        ));
-                        // The types and traits it reaches are `scip.impact`
-                        // nodes, and only that map locates them; it is built
-                        // already (cached by the stamp), so sites come
-                        // without walking its edges.
-                        if impact.is_none() {
-                            match impact_map(call.scip_index, root, &loaded).await {
-                                Ok(sites) => site_impact = Some(sites),
-                                Err(error) => notes.push(format!(
-                                    "scip.implements: its types and traits have no site: {error:#}"
-                                )),
-                            }
-                        }
-                        map
-                    }
-                    Err(error) => {
-                        notes.push(format!("scip.implements has no edges: {error:#}"));
-                        unavailable.push(SCIP_IMPLEMENTS_ID);
-                        Arc::new(ImplementsMap::empty(ImplementsOptions::default()))
-                    }
-                };
-                if snapshot.is_none()
-                    && let Some(note) =
-                        add_trait_seeds(&mut found, &map, call.question, trait_seed_mode)
-                {
-                    notes.push(note);
-                }
-                implements = Some(map.clone());
-                register(
-                    &mut registry,
-                    &mut plan_maps,
-                    &observer,
-                    Box::new(Shared(map)),
-                    true,
-                )?;
-            }
-        }
-    }
-    // The exact operators are descriptor-only maps; their cards are the first
-    // stage, made once per call and not on a continuation.
-    if wants(EXACT_CLOSURE_ID) {
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(SeedMap::exact_closure()),
-            true,
-        )?;
-    }
-    if wants(EXACT_PICKAXE_ID) {
-        register(
-            &mut registry,
-            &mut plan_maps,
-            &observer,
-            Box::new(SeedMap::exact_pickaxe()),
-            true,
-        )?;
+    let cx = maps::Context {
+        call,
+        profile,
+        loaded: &loaded,
+        observer: &observer,
+        selection: &selection,
+        found: &found,
+        walk_restarts: &walk_restarts,
+    };
+    let built = maps::build(&cx, &mut notes, &mut warnings).await?;
+    // The trait and trait-method paths of the question join the start nodes
+    // (K39a: this ran inside the `scip.implements` registration).
+    if snapshot.is_none()
+        && let Some(map) = &built.implements
+        && let Some(note) = add_trait_seeds(&mut found, map, call.question, trait_seed_mode)
+    {
+        notes.push(note);
     }
     let exact_wanted = wants(EXACT_CLOSURE_ID) || wants(EXACT_PICKAXE_ID);
     let mut stage = FirstStage::off();
@@ -1411,46 +920,18 @@ pub async fn run_with_trait_seeds(
             }
         }
     }
-    let mut search_maps: (
-        Option<Arc<LexicalChunks<'_>>>,
-        Option<Arc<VectorChunks<'_>>>,
-    ) = (None, None);
-    if let Some(index) = &search_index {
-        let decls: Arc<dyn lci_maps::search_maps::DeclLocator> =
-            Arc::new(ScipDecls::from_scip(&loaded.scip));
-        if wants(SEARCH_LEXICAL_ID) {
-            let map = Arc::new(LexicalChunks::new(index.clone(), Some(decls.clone())));
-            register(
-                &mut registry,
-                &mut plan_maps,
-                &observer,
-                Box::new(Shared(map.clone())),
-                true,
-            )?;
-            search_maps.0 = Some(map);
-        }
-        if wants(SEARCH_VECTOR_ID) {
-            let map = Arc::new(VectorChunks::new(index.clone(), Some(decls)));
-            register(
-                &mut registry,
-                &mut plan_maps,
-                &observer,
-                Box::new(Shared(map.clone())),
-                true,
-            )?;
-            search_maps.1 = Some(map);
-        }
-    }
     // Setup does not run the walk's deadline, but the first stage's git calls
     // do: they were bounded by the deadline and count against it.
-    budget.deadline += setup.elapsed().saturating_sub(stage_time) + early;
+    budget.deadline += built.setup.elapsed().saturating_sub(stage_time) + built.early;
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
     // A continuation runs the weights and switches its handle replays.
     let running_maps = match &snapshot {
-        Some(snapshot) => presets::restored(&plan_maps, &snapshot.weights, &snapshot.switches),
-        None => plan_maps.clone(),
+        Some(snapshot) => {
+            presets::restored(&built.plan_maps, &snapshot.weights, &snapshot.switches)
+        }
+        None => built.plan_maps.clone(),
     };
     // The maps this call runs, in registration order, for `maps`.
     let enabled_maps: Vec<String> = running_maps
@@ -1466,7 +947,7 @@ pub async fn run_with_trait_seeds(
     );
     // The most a state can be corroborated by, which the score bound needs
     // (the seed maps only start the walk; maps over one graph count once).
-    let expanding = registry.independent_expanders();
+    let expanding = built.registry.independent_expanders();
     // A handle made without `card_paths` has no edge kind for the hops of its
     // earlier calls; their path entries say `null`.
     if profile.traverse.card_paths && snapshot.as_ref().is_some_and(|s| !s.card_paths) {
@@ -1489,7 +970,9 @@ pub async fn run_with_trait_seeds(
         })
         .unwrap_or_default();
     let traversal = match snapshot {
-        Some(snapshot) => Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget),
+        Some(snapshot) => {
+            Traversal::resumed(OnTheFly::new(&built.registry, &view), snapshot, budget)
+        }
         None => {
             if found.nodes.is_empty() {
                 let mut response = no_seeds_response(call, &found, notes);
@@ -1503,7 +986,13 @@ pub async fn run_with_trait_seeds(
                 );
                 add_file_changed(&mut response, &observer);
                 if profile.traverse.answer_labels {
-                    add_answer_labels(&mut response, None, &unavailable, &[], &HashSet::new());
+                    add_answer_labels(
+                        &mut response,
+                        None,
+                        &built.unavailable,
+                        &[],
+                        &HashSet::new(),
+                    );
                 }
                 return Ok(Report {
                     response,
@@ -1511,15 +1000,19 @@ pub async fn run_with_trait_seeds(
                 });
             }
             let plan = StartPlan {
-                maps: plan_maps,
+                maps: built.plan_maps,
                 policy: policy.unwrap_or_default(),
                 effective: Some(plan_effective),
                 seed_source: Some(found.source.to_owned()),
                 seed_hits: found.details.clone(),
             };
-            Traversal::new(OnTheFly::new(&registry, &view), found.nodes.clone(), budget)
-                .question(call.question)
-                .plan(plan)
+            Traversal::new(
+                OnTheFly::new(&built.registry, &view),
+                found.nodes.clone(),
+                budget,
+            )
+            .question(call.question)
+            .plan(plan)
         }
     };
     let traversal = traversal
@@ -1543,7 +1036,7 @@ pub async fn run_with_trait_seeds(
             ..HopPrice::default()
         })
         .trait_seeds(found.trait_nodes())
-        .expanders(registry.expanding_maps());
+        .expanders(built.registry.expanding_maps());
     let traversal = match &rescorer {
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
         None => traversal,
@@ -1580,11 +1073,13 @@ pub async fn run_with_trait_seeds(
         }
     };
     let failures = [
-        search_maps
+        built
+            .search_maps
             .0
             .as_ref()
             .map(|map| (SEARCH_LEXICAL_ID, map.failures())),
-        search_maps
+        built
+            .search_maps
             .1
             .as_ref()
             .map(|map| (SEARCH_VECTOR_ID, map.failures())),
@@ -1615,13 +1110,13 @@ pub async fn run_with_trait_seeds(
             ));
         }
     }
-    if let Some(error) = lsp_live.as_ref().and_then(|map| map.last_error()) {
+    if let Some(error) = built.lsp_live.as_ref().and_then(|map| map.last_error()) {
         notes.push(format!("lsp.live reported an error for a node: {error}"));
     }
     // A server that is not ready when the walk ends says why a node may have
     // had no edges; a ready one adds nothing, so a walk whose servers are
     // ready answers exactly as before.
-    for (provider, manager, workspace_id) in &lsp_live_sessions {
+    for (provider, manager, workspace_id) in &built.lsp_live_sessions {
         if let Some(readiness) = manager.readiness(provider, workspace_id).await
             && readiness.state != lci_core::lsp::ServerStateName::Ready
         {
@@ -1635,7 +1130,7 @@ pub async fn run_with_trait_seeds(
     }
     // An answer from a server this walk found running is not a fresh
     // server's: it is exact for what its tree stamp covers, and says so.
-    if let Some(walk) = &lsp_live_walk {
+    if let Some(walk) = &built.lsp_live_walk {
         for (provider, unchanged) in walk.reused() {
             notes.push(match unchanged {
                 Some(unchanged) => format!(
@@ -1651,16 +1146,19 @@ pub async fn run_with_trait_seeds(
     // What the new maps cost per call, measured in this run (the p50 ring the
     // map cards report).
     let costs = [
-        search_maps
+        built
+            .search_maps
             .0
             .as_ref()
             .map(|map| (SEARCH_LEXICAL_ID, map.log())),
-        search_maps
+        built
+            .search_maps
             .1
             .as_ref()
             .map(|map| (SEARCH_VECTOR_ID, map.log())),
-        impact.as_ref().map(|map| (SCIP_IMPACT_ID, map.log())),
-        implements
+        built.impact.as_ref().map(|map| (SCIP_IMPACT_ID, map.log())),
+        built
+            .implements
             .as_ref()
             .map(|map| (SCIP_IMPLEMENTS_ID, map.log())),
     ];
@@ -1689,13 +1187,13 @@ pub async fn run_with_trait_seeds(
     add_sites(
         &mut response,
         &loaded,
-        impact.as_deref().or(site_impact.as_deref()),
+        built.impact.as_deref().or(built.site_impact.as_deref()),
         &found.details,
     );
     if profile.traverse.card_paths {
         add_paths(&mut response, &result);
     }
-    if let Some(history) = &git_history {
+    if let Some(history) = &built.git_history {
         add_commits(&mut response, history);
     }
     observer.settle(call.seed_search).await;
@@ -1707,45 +1205,22 @@ pub async fn run_with_trait_seeds(
     if profile.traverse.answer_labels {
         // `lsp.live`'s evidence came from a kept server when the walk
         // found one running (see `WalkSessions`): its cards are not `fresh`.
-        let kept: Vec<MapId> = match &lsp_live_walk {
+        let kept: Vec<MapId> = match &built.lsp_live_walk {
             Some(walk) if !walk.reused().is_empty() => vec![lci_maps::lsp_live::LSP_LIVE_ID],
             _ => Vec::new(),
         };
-        add_answer_labels(&mut response, Some(&result), &unavailable, &kept, &restored);
+        add_answer_labels(
+            &mut response,
+            Some(&result),
+            &built.unavailable,
+            &kept,
+            &restored,
+        );
     }
     Ok(Report {
         response,
         trace: trace_path,
     })
-}
-
-/// Adds a map to the registry (weight 1, as every map here) and to the
-/// plan the trace records, switched off when the call did not ask for it.
-fn register<'a>(
-    registry: &mut Registry<'a>,
-    plan: &mut Vec<PlanMap>,
-    observer: &Observer,
-    map: Box<dyn Map + 'a>,
-    enabled: bool,
-) -> Result<()> {
-    // With `[run_profile.traverse] map_freshness` on, a map that states its freshness is
-    // wrapped so that its expansions are recorded; off, it is registered as is.
-    let map = observer.wrap(map);
-    let descriptor = map.describe();
-    plan.push(PlanMap {
-        id: descriptor.id.to_owned(),
-        version: descriptor.version,
-        weight: 1.0,
-        enabled,
-    });
-    let id = descriptor.id;
-    registry
-        .register(map, 1.0, 20)
-        .map_err(|e| anyhow!("{e}"))?;
-    if !enabled {
-        registry.set_enabled(id, false);
-    }
-    Ok(())
 }
 
 /// `search_code` with `mode = "traverse"`: the workspace's SCIP index
