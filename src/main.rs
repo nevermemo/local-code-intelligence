@@ -832,9 +832,12 @@ async fn run_traverse(
 }
 
 /// Whether a `traverse` call can run `lsp.live`: it reads the tree, so the
-/// call needs `--root`, and it is opt-in, so `--maps` names it or, without
-/// `--maps`, a configured `[traverse.policies]` entry lists it in
-/// `extra_maps` (the built-in policies never do).
+/// call needs `--root`, and in the one-shot it is opt-in even under
+/// `[run_profile.lsp] live = true`: a server that dies with the call cannot
+/// amortise its start (d438), so `--maps` names it or, without `--maps`, a
+/// configured `[traverse.policies]` entry lists it in `extra_maps` (the
+/// built-in policies never do). The `live` default is for the service's
+/// calls, which have a manager that outlives them.
 fn may_walk_lsp_live(config: &Config, has_root: bool, maps: Option<&[String]>) -> bool {
     let lsp_live = |id: &String| id == lci_maps::lsp_live::LSP_LIVE_ID;
     has_root

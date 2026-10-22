@@ -4227,7 +4227,11 @@ async fn single_language_search_and_navigation_keep_each_optional_lsp_optional()
 
 async fn assert_optional_server_stays_off(case: OptionalServerCase) {
     let name = case.language;
-    let (temp, config, _fake, task) = fixture().await;
+    let (temp, mut config, _fake, task) = fixture().await;
+    // The contract is what each call answers about a server that is not there
+    // ("X is disabled"); with the breaker on (the default) the second call is
+    // refused by the window the first one opened, with another message.
+    config.run_profile.lsp.breaker = false;
     let workspace = temp.path().join(case.directory);
     write(&workspace, case.file, case.source);
     let app = App::open(config).await.unwrap();
@@ -5733,6 +5737,58 @@ async fn traverse_add_full(
     (pops, handle): (Option<u32>, Option<&str>),
     tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
 ) -> Value {
+    traverse_add_maps(
+        config,
+        workspace,
+        index,
+        sessions,
+        manager,
+        (pops, handle),
+        Some(&[lci_maps::lsp_live::LSP_LIVE_ID]),
+        ADD_SEED,
+        tweak,
+    )
+    .await
+}
+
+/// [`traverse_add`] over the default map set: the call names no maps, no
+/// steering policy and no `extra_maps`, so `lsp.live` runs only through
+/// `[run_profile.lsp] live`.
+async fn traverse_add_unnamed(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    manager: Option<&Arc<Manager>>,
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Value {
+    traverse_add_maps(
+        config,
+        workspace,
+        index,
+        local_code_intelligence::config::LspSessions::Shared,
+        manager,
+        (None, None),
+        None,
+        ADD_SEED,
+        tweak,
+    )
+    .await
+}
+
+/// [`traverse_add_full`] with the call's `maps` set to `named` (`None`: the call
+/// names none, so the default set applies) and its one seed to `seed`.
+#[allow(clippy::too_many_arguments)]
+async fn traverse_add_maps(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    sessions: local_code_intelligence::config::LspSessions,
+    manager: Option<&Arc<Manager>>,
+    (pops, handle): (Option<u32>, Option<&str>),
+    named: Option<&[&str]>,
+    seed: &str,
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Value {
     use local_code_intelligence::{
         app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
         config::{LspProfile, RunProfileConfig, TraverseConfig, TraverseFirstStage},
@@ -5761,8 +5817,9 @@ async fn traverse_add_full(
         },
         SteerArgs::default(),
     );
-    let maps = [lci_maps::lsp_live::LSP_LIVE_ID.to_owned()];
-    let seeds = ["sym:rust:Calculator.cs::Add/fn".to_owned()];
+    let maps: Option<Vec<String>> =
+        named.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
+    let seeds = [seed.to_owned()];
     let call = Call {
         scip_index: index,
         scip_root: Some(&workspace.path),
@@ -5770,7 +5827,7 @@ async fn traverse_add_full(
         seeds: &seeds,
         seed_search: None,
         top_k: 8,
-        maps: Some(&maps),
+        maps: maps.as_deref(),
         budget: &budget,
         steer: &steer,
         handle,
@@ -5904,7 +5961,7 @@ fn with_lsp_live_warm_start(mut config: Config) -> Config {
 
 /// The finished outcome of the warm start `app` began for `workspace_id`,
 /// waiting at most [`LOADED_BUDGET`] on the signal itself.
-async fn finished_warm_start(
+pub(super) async fn finished_warm_start(
     app: &App,
     workspace_id: &str,
 ) -> Arc<local_code_intelligence::app::WarmOutcome> {
@@ -6185,6 +6242,9 @@ async fn the_warm_start_skips_adapters_for_languages_the_index_lacks() {
 
 #[tokio::test]
 async fn no_warm_start_under_per_call_or_without_an_lsp_live_policy() {
+    // Under the default `live = true` the map is in every call's default set,
+    // so a policy is no longer needed to warm: the second case switches `live`
+    // off as well.
     use local_code_intelligence::config::LspSessions;
 
     for (label, tweak) in [
@@ -6194,8 +6254,11 @@ async fn no_warm_start_under_per_call_or_without_an_lsp_live_policy() {
                 as Box<dyn FnOnce(&mut Config)>,
         ),
         (
-            "no policy naming lsp.live",
-            Box::new(|config: &mut Config| config.traverse.policies.clear()),
+            "no policy naming lsp.live and live = false",
+            Box::new(|config: &mut Config| {
+                config.traverse.policies.clear();
+                config.run_profile.lsp.live = false;
+            }),
         ),
     ] {
         let service = indexed_warm_service(&[], tweak).await;
@@ -8388,6 +8451,8 @@ async fn lsp_live_skips_a_dead_server_for_the_window_and_a_live_one_closes_it() 
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, _state, index) = shared_sessions_fixture(&temp);
     config.csharp.path = Some("definitely-missing-csharp-ls".to_owned());
+    // The contract of this half is the key off (it is on by default).
+    config.run_profile.lsp.breaker = false;
     let manager = indexed_manager(&config, &workspace);
     assert!(manager.breakers().is_none());
     for call in 1..=2 {
@@ -8502,6 +8567,259 @@ async fn lsp_live_skips_a_dead_server_for_the_window_and_a_live_one_closes_it() 
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     assert!(breakers.remaining("csharp-ls").is_none());
     manager_b.shutdown_all().await;
+}
+
+/// Whether the walk's `effective_policy.maps` lists `lsp.live`.
+fn policy_lists_lsp_live(answer: &Value) -> bool {
+    answer["effective_policy"]["maps"]
+        .as_array()
+        .is_some_and(|maps| maps.iter().any(|map| map["id"] == "lsp.live"))
+}
+
+/// K11b-3: `[run_profile.lsp] live = true` (the default) puts `lsp.live` in the
+/// default set of a call that names no maps, has a tree, runs under
+/// `sessions = "shared"` and was offered the service's manager. The call below
+/// names no map, no steering policy and no `extra_maps`, and the graph has no
+/// call edge from `Add` to `Run`: only the map can reach it. With the key off,
+/// with the CLI's shape (no manager) or under `per_call` the map is not part of
+/// the call.
+#[tokio::test]
+async fn lsp_live_runs_by_default_through_the_service_manager() {
+    use local_code_intelligence::config::LspSessions;
+    // No policy names the map: the default set and the warm start both come from
+    // `[run_profile.lsp] live`.
+    let service = indexed_warm_service(&[], |config| config.traverse.policies.clear()).await;
+    let (app, workspace) = (&service.app, &service.workspace);
+    let index = csharp_scip_index(&service.temp, workspace);
+    // The warm start has primed the server: the walk below needs no cold start.
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    let manager = app.language_servers();
+
+    let by_default =
+        traverse_add_unnamed(&service.config, workspace, &index, Some(&manager), |_| {}).await;
+    assert!(policy_lists_lsp_live(&by_default), "{by_default}");
+    assert!(reached_run_through_lsp_live(&by_default), "{by_default}");
+    assert!(
+        by_default["totals"]["external_calls"].as_u64().unwrap() >= 1,
+        "{by_default}"
+    );
+    assert!(
+        !notes_of(&by_default).contains("lsp.live is unavailable"),
+        "{by_default}"
+    );
+
+    // The key off: the map is not part of the call.
+    let off = traverse_add_unnamed(&service.config, workspace, &index, Some(&manager), |p| {
+        p.lsp.live = false
+    })
+    .await;
+    assert!(!policy_lists_lsp_live(&off), "{off}");
+    assert!(!reached_run_through_lsp_live(&off), "{off}");
+    assert_eq!(off["totals"]["external_calls"], 0, "{off}");
+
+    // A call that names its maps is never changed by the key.
+    let named = traverse_add_maps(
+        &service.config,
+        workspace,
+        &index,
+        LspSessions::Shared,
+        Some(&manager),
+        (None, None),
+        Some(&["graph.scip"]),
+        ADD_SEED,
+        |_| {},
+    )
+    .await;
+    assert!(!policy_lists_lsp_live(&named), "{named}");
+    assert!(!reached_run_through_lsp_live(&named), "{named}");
+
+    // The CLI's shape: no manager of the caller's, so no `lsp.live` by default.
+    let one_shot = traverse_add_unnamed(&service.config, workspace, &index, None, |_| {}).await;
+    assert!(!policy_lists_lsp_live(&one_shot), "{one_shot}");
+    assert!(!reached_run_through_lsp_live(&one_shot), "{one_shot}");
+
+    // `per_call`: the manager is offered but the servers die with the call.
+    let per_call = traverse_add_unnamed(&service.config, workspace, &index, Some(&manager), |p| {
+        p.lsp.sessions = LspSessions::PerCall
+    })
+    .await;
+    assert!(!policy_lists_lsp_live(&per_call), "{per_call}");
+    assert!(!reached_run_through_lsp_live(&per_call), "{per_call}");
+
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
+}
+
+/// The `sym:` nodes of an answer's cards whose evidence names `lsp.live`.
+fn lsp_live_symbol_cards(answer: &Value) -> Vec<String> {
+    let mut nodes: Vec<String> = answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|card| card.to_string().contains("lsp.live"))
+        .filter_map(|card| card["node"].as_str())
+        .filter(|node| node.starts_with("sym:"))
+        .map(str::to_owned)
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// K11b-3 (Sol 1): `[run_profile.lsp] places = "auto"` (the default) gives
+/// `lsp.live` its cards on a tree with no SCIP index read (`scip.mode = "off"`),
+/// where an explicit `"scip"` gives none and warms a server for nothing: the
+/// walk is the call a service makes (the shared manager, a tree), seeded at a
+/// file, and the server's own outline names the declarations. Where an index
+/// with nodes is read the default is the `"scip"` walk: the same cards and
+/// external calls, and no outline asked of the server.
+#[tokio::test]
+async fn lsp_live_default_places_follow_the_index() {
+    use local_code_intelligence::config::{LspPlaces, LspSessions, profile::ScipMode};
+    const FILE: &str = "file:src/Calculator.cs";
+    let service = indexed_warm_service(&[], |config| config.traverse.policies.clear()).await;
+    let (app, workspace, state) = (&service.app, &service.workspace, &service.state);
+    let index = csharp_scip_index(&service.temp, workspace);
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    let manager = app.language_servers();
+    let walk = |seed: &'static str, places: Option<LspPlaces>, mode: Option<ScipMode>| {
+        let (config, index, manager) = (&service.config, &index, &manager);
+        async move {
+            traverse_add_maps(
+                config,
+                workspace,
+                index,
+                LspSessions::Shared,
+                Some(manager),
+                (None, None),
+                None,
+                seed,
+                |profile| {
+                    if let Some(places) = places {
+                        profile.lsp.places = places;
+                    }
+                    if let Some(mode) = mode {
+                        profile.scip.mode = mode;
+                    }
+                },
+            )
+            .await
+        }
+    };
+
+    // No index read: the default outlines the file and reaches its
+    // declarations through `lsp.live`; the explicit `scip` places nothing.
+    assert_eq!(requests_of(state, "textDocument/documentSymbol"), 0);
+    let auto = walk(FILE, None, Some(ScipMode::Off)).await;
+    let by_auto = lsp_live_symbol_cards(&auto);
+    assert!(
+        by_auto
+            .iter()
+            .any(|node| node.starts_with("sym:csharp:Calculator.cs::")),
+        "{auto}"
+    );
+    assert!(
+        !notes_of(&auto).contains("lsp.live is unavailable"),
+        "{auto}"
+    );
+    let outlined = requests_of(state, "textDocument/documentSymbol");
+    assert!(outlined >= 1, "the default outlined the file: {outlined}");
+    let explicit = walk(FILE, Some(LspPlaces::Outline), Some(ScipMode::Off)).await;
+    assert_eq!(lsp_live_symbol_cards(&explicit), by_auto, "{explicit}");
+    let scip = walk(FILE, Some(LspPlaces::Scip), Some(ScipMode::Off)).await;
+    assert!(lsp_live_symbol_cards(&scip).is_empty(), "{scip}");
+
+    // An index with nodes: the default is the `scip` walk, byte for byte in
+    // what it reaches and pays, and in the outlines it asks (a file the walk
+    // reaches is outlined as it always was; an index symbol is not).
+    let outlines = || requests_of(state, "textDocument/documentSymbol");
+    let start = outlines();
+    let by_default = walk(ADD_SEED, None, None).await;
+    let default_outlines = outlines() - start;
+    let by_scip = walk(ADD_SEED, Some(LspPlaces::Scip), None).await;
+    let scip_outlines = outlines() - start - default_outlines;
+    assert!(reached_run_through_lsp_live(&by_default), "{by_default}");
+    assert_eq!(
+        lsp_live_symbol_cards(&by_default),
+        lsp_live_symbol_cards(&by_scip),
+        "{by_default}"
+    );
+    assert_eq!(
+        by_default["totals"]["external_calls"], by_scip["totals"]["external_calls"],
+        "{by_default}"
+    );
+    assert_eq!(default_outlines, scip_outlines, "{by_default}");
+    // The count measures something: `outline` over the same index asks more.
+    let by_outline = walk(ADD_SEED, Some(LspPlaces::Outline), None).await;
+    assert!(reached_run_through_lsp_live(&by_outline), "{by_outline}");
+    assert!(
+        outlines() - start - default_outlines - scip_outlines > scip_outlines,
+        "{by_outline}"
+    );
+
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
+}
+
+/// K11b-3: fail-open under the default. A csharp-ls that starts and exits
+/// (`--exit-at-start`, N106) costs the walk a note and the map, never the
+/// answer: the SCIP maps still answer, nothing is an error, and the second
+/// walk inside the window is refused at once without a start. `sync = "off"`
+/// keeps the warm start from touching the fake, so the walk's own manager
+/// makes the one start.
+#[tokio::test]
+async fn lsp_live_by_default_fails_open_with_a_dead_server() {
+    let service = indexed_warm_service(&["--exit-at-start"], |config| {
+        config.run_profile.lsp.sync = local_code_intelligence::config::LspSync::Off;
+    })
+    .await;
+    let (app, workspace, state) = (&service.app, &service.workspace, &service.state);
+    let index = csharp_scip_index(&service.temp, workspace);
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(
+        outcome.is_empty(),
+        "the warm start primed a server: {outcome:?}"
+    );
+    assert_eq!(spawns_started(state), 0);
+    let manager = app.language_servers();
+    let windows = manager.breakers().expect("breaker = true by default");
+
+    let first =
+        traverse_add_unnamed(&service.config, workspace, &index, Some(&manager), |_| {}).await;
+    assert!(policy_lists_lsp_live(&first), "{first}");
+    assert!(!reached_run_through_lsp_live(&first), "{first}");
+    assert!(
+        notes_of(&first).contains("lsp.live reported an error")
+            && notes_of(&first).contains("csharp-ls"),
+        "the dead server is named in a note: {first}"
+    );
+    // The SCIP maps answered: the seed is in the results.
+    assert!(
+        first["results"]
+            .as_array()
+            .is_some_and(|cards| !cards.is_empty()),
+        "{first}"
+    );
+    assert!(windows.remaining("csharp-ls").is_some(), "{first}");
+    assert_eq!(spawns_started(state), 1, "{first}");
+
+    let second =
+        traverse_add_unnamed(&service.config, workspace, &index, Some(&manager), |_| {}).await;
+    assert!(notes_of(&second).contains("lsp breaker"), "{second}");
+    assert!(
+        second["results"]
+            .as_array()
+            .is_some_and(|cards| !cards.is_empty()),
+        "{second}"
+    );
+    assert_eq!(spawns_started(state), 1, "a refused start spawns nothing");
+
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
 }
 
 /// N103: a server that is silent for longer than `lsp_timeout_seconds` while it

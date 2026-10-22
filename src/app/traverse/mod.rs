@@ -210,7 +210,9 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// file's syntax tree confirms the role; needs `rg`; in the default set of a
 /// call with a tree root only with `[run_profile.grep] structural`). `lsp.live` asks a
 /// language server for definition, references and document symbols (starts the
-/// server at the first expansion; needs its binary). The two exact operators `exact.closure` (the
+/// server at the first expansion; needs its binary; a service call with a tree
+/// and the service's manager also runs it by default, `[run_profile.lsp] live`).
+/// The two exact operators `exact.closure` (the
 /// declarations that reference the symbol the question names, from the same
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
@@ -358,7 +360,9 @@ pub struct Call<'a> {
     /// Results to return, 1 through 40.
     pub top_k: usize,
     /// The maps to use; `None` is all of [`MAPS`] (not [`OPT_IN_MAPS`]), and
-    /// [`SEEDS_BM25`] with `[run_profile.seeds] bm25`, [`SEEDS_LITERAL`]
+    /// [`LSP_LIVE_ID`] with `[run_profile.lsp] live` for a call with a tree, a
+    /// shared manager and `sessions = "shared"`, [`SEEDS_BM25`] with
+    /// `[run_profile.seeds] bm25`, [`SEEDS_LITERAL`]
     /// with `[run_profile.seeds] literal` and [`SEEDS_REPO_MAP`] with
     /// `[run_profile.seeds] repo_map`.
     pub maps: Option<&'a [String]>,
@@ -409,6 +413,37 @@ pub fn per_call_manager(call: &Call<'_>) -> Arc<lci_core::lsp::Manager> {
             None => manager,
         },
     )
+}
+
+/// The one tree barrier of a walk that runs `lsp.live` on a shared manager,
+/// taken before the seed search. The seed search runs the search channel,
+/// which keeps a watching server (rust-analyzer) through a changed tree
+/// ([`lci_core::lsp::Manager::search_barrier`]); `lsp.live` then passes the
+/// strict barrier when its backend opens and would restart that server inside
+/// the walk's deadline. Passing the strict barrier first restarts it once, up
+/// front: the seed search and `lsp.live` then find the same session (started
+/// by whichever asks first, after the edit) and the recorded stamp keeps both
+/// barriers from restarting it again. Covers the servers the backend would
+/// route to the shared manager, probed or not: with no session there is
+/// nothing to stop and the stamp is recorded for the session that starts next.
+async fn walk_tree_barrier(call: &Call<'_>) -> Vec<lci_core::lsp::Restart> {
+    let (Some(shared), Some(root)) = (&call.lsp_sessions, call.scip_root) else {
+        return Vec::new();
+    };
+    let Ok(path) = dunce::canonicalize(root) else {
+        return Vec::new();
+    };
+    let workspace = lci_core::workspace::Workspace {
+        id: lci_core::workspace::hash(&path.to_string_lossy()),
+        path,
+    };
+    let synced = shared.sync_mode() == lci_core::config::LspSync::Watch;
+    let routed: Vec<&Arc<dyn lci_core::lsp::adapter::LspAdapter>> = shared
+        .adapters()
+        .iter()
+        .filter(|adapter| adapter.enabled() && adapter.keeps_session(synced))
+        .collect();
+    shared.tree_barrier(&workspace, &routed).await
 }
 
 /// Where a call keeps what it writes.
@@ -692,10 +727,24 @@ pub async fn run_with_trait_seeds(
         }
         Some(ids) => ids.iter().map(|id| known_map(id)).collect::<Result<_>>()?,
     };
+    let mut wanted = wanted;
+    // `[run_profile.lsp] live`: `lsp.live` joins the default set of a call
+    // that has a tree and a manager that outlives it. The CLI one-shot and
+    // `sessions = "per_call"` are left out (a server that dies with the call
+    // cannot amortise its start, d438); a missing or dead server is a note and
+    // an unavailable map below, never an error.
+    if profile.lsp.live
+        && call.maps.is_none()
+        && call.scip_root.is_some()
+        && profile.lsp.sessions == LspSessions::Shared
+        && call.lsp_sessions.is_some()
+        && !wanted.contains(&LSP_LIVE_ID)
+    {
+        wanted.push(LSP_LIVE_ID);
+    }
     // `[run_profile.seeds] bm25`: the map is in the default set only when the
     // key is on; with it off a call that names the map gets a note and the
     // map is not part of the call (nothing registers, nothing seeds).
-    let mut wanted = wanted;
     if profile.seeds.bm25 {
         if call.maps.is_none() && !wanted.contains(&SEEDS_BM25) {
             wanted.push(SEEDS_BM25);
@@ -967,6 +1016,18 @@ pub async fn run_with_trait_seeds(
     // The maps the call asked for that could not be set up (K13: an answer that
     // lacks one is not labelled complete). Read only under `answer_labels`.
     let mut unavailable: Vec<MapId> = Vec::new();
+
+    // `lsp.live` on a shared manager: its server passes the strict tree barrier
+    // once, here, before the seed search's channel can keep a watching server
+    // through the same edit (see `walk_tree_barrier`). A continuation has no
+    // seed search and its backend passes the barrier itself.
+    let mut walk_restarts: Vec<lci_core::lsp::Restart> = Vec::new();
+    if snapshot.is_none() && wants(LSP_LIVE_ID) && profile.lsp.sessions == LspSessions::Shared {
+        let barrier_started = Instant::now();
+        walk_restarts = walk_tree_barrier(call).await;
+        // Setup, like the version probe below: credited back to the deadline.
+        budget.deadline += barrier_started.elapsed();
+    }
 
     // The start nodes (not on a continuation, which resumes the old ones).
     let mut found = Seeds::default();
@@ -1270,6 +1331,9 @@ pub async fn run_with_trait_seeds(
             }
             Err(error) => Err(error),
         };
+        for restart in &walk_restarts {
+            notes.push(restart.note("lsp.live"));
+        }
         match backend {
             Ok(backend) => {
                 for (provider, manager) in backend.routes() {
@@ -1284,11 +1348,20 @@ pub async fn run_with_trait_seeds(
                 let scip_places = ScipPlaces::from_scip(&loaded.scip);
                 // `outline`: the index's table first, the server's own outline
                 // for what it lacks (everything under `scip.mode = "off"`).
-                let places: Arc<dyn SymbolPlaces> = match profile.lsp.places {
-                    LspPlaces::Scip => Arc::new(scip_places),
-                    LspPlaces::Outline => {
-                        Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
-                    }
+                // `auto` (the default): the index's table when the graph read
+                // for this workspace has a node (then the walk is the `scip`
+                // walk), else the outline (no index is read under `scip.mode =
+                // off`, or under `cache` with no file: nothing else would
+                // place a symbol).
+                let outline = match profile.lsp.places {
+                    LspPlaces::Scip => false,
+                    LspPlaces::Outline => true,
+                    LspPlaces::Auto => loaded.scip.graph().nodes.is_empty(),
+                };
+                let places: Arc<dyn SymbolPlaces> = if outline {
+                    Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
+                } else {
+                    Arc::new(scip_places)
                 };
                 let map = Arc::new(
                     LspLive::new(Box::new(backend), places)
@@ -1977,4 +2050,4 @@ pub async fn search(
 }
 
 /// Text for the server instructions when the mode is on.
-pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode reads the index.scip in the workspace as a cache: when the file is missing or unreadable it walks an empty SCIP graph and says so in a note ([run_profile.scip] mode authoritative makes that an error, off never reads the file), and the search that finds the start nodes uses the same index and model services as the normal mode.";
+pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode reads the index.scip in the workspace as a cache: when the file is missing or unreadable it walks an empty SCIP graph and says so in a note ([run_profile.scip] mode authoritative makes that an error, off never reads the file), when a language server for the workspace's languages is installed and the service keeps it the walk also asks it (lsp.live) and says in notes when it could not, and the search that finds the start nodes uses the same index and model services as the normal mode.";

@@ -1803,6 +1803,48 @@ async fn persistence_incremental_isolation_deletion_and_fail_open() {
     task.abort();
 }
 
+/// Deletes `relative` from `workspace`, re-indexes, and returns the report
+/// after checking the chunk accounting by count: the file's chunks (from the
+/// listing before) leave the index, and no other file loses one. A search for
+/// the file's text proves little here: the fake embeds everything alike, so a
+/// stale chunk may simply fall outside a small top-k.
+async fn remove_file_and_reindex(
+    app: &App,
+    workspace: &Path,
+    relative: &str,
+) -> local_code_intelligence::app::IndexReport {
+    let before = app.indexed_files(workspace).await.unwrap();
+    let removed_chunks = before
+        .files
+        .iter()
+        .find(|file| file.relative_file_path == relative)
+        .unwrap_or_else(|| panic!("{relative} was not indexed"))
+        .chunks;
+    assert!(removed_chunks > 0, "{relative} had no chunks to remove");
+    let total_before: usize = before.files.iter().map(|file| file.chunks).sum();
+
+    std::fs::remove_file(workspace.join(relative)).unwrap();
+    let report = app.index(workspace).await.unwrap();
+
+    let after = app.indexed_files(workspace).await.unwrap();
+    assert!(
+        after
+            .files
+            .iter()
+            .all(|file| file.relative_file_path != relative),
+        "{relative} is still listed"
+    );
+    let total_after: usize = after.files.iter().map(|file| file.chunks).sum();
+    assert_eq!(
+        total_after,
+        total_before - removed_chunks,
+        "removing {relative} must drop exactly its {removed_chunks} chunks"
+    );
+    assert_eq!(report.chunks, total_after);
+    assert_eq!(app.status(workspace).await.unwrap().chunks, total_after);
+    report
+}
+
 #[tokio::test]
 async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot() {
     let (temp, config, fake, task) = fixture().await;
@@ -2078,8 +2120,8 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
                 && hit.chunk.code.contains("recent_count >= 0"))
     );
 
-    std::fs::remove_file(workspace.join("tests/TelemetryProcessorTests.cs")).unwrap();
-    let csharp_deleted = app.index(&workspace).await.unwrap();
+    let csharp_deleted =
+        remove_file_and_reindex(&app, &workspace, "tests/TelemetryProcessorTests.cs").await;
     assert_eq!(csharp_deleted.removed_files, 1);
     let after_csharp_delete = app
         .search(&workspace, "TelemetryProcessorTests", Some(8))
@@ -2092,8 +2134,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .all(|hit| hit.chunk.relative_file_path != "tests/TelemetryProcessorTests.cs")
     );
 
-    std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
-    let deleted = app.index(&workspace).await.unwrap();
+    let deleted = remove_file_and_reindex(&app, &workspace, "tests/feature_pipeline_test.py").await;
     assert_eq!(deleted.removed_files, 1);
     assert_eq!(deleted.files, 15);
     let after_delete = app
@@ -2107,8 +2148,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .all(|hit| hit.chunk.relative_file_path != "tests/feature_pipeline_test.py")
     );
 
-    std::fs::remove_file(workspace.join("tests/pipeline_test.go")).unwrap();
-    let deleted = app.index(&workspace).await.unwrap();
+    let deleted = remove_file_and_reindex(&app, &workspace, "tests/pipeline_test.go").await;
     assert_eq!(deleted.removed_files, 1);
     assert_eq!(deleted.files, 14);
     let after_go_delete = app
@@ -2122,8 +2162,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .all(|hit| hit.chunk.relative_file_path != "tests/pipeline_test.go")
     );
 
-    std::fs::remove_file(workspace.join("tests/OrderValidatorTest.java")).unwrap();
-    let deleted = app.index(&workspace).await.unwrap();
+    let deleted = remove_file_and_reindex(&app, &workspace, "tests/OrderValidatorTest.java").await;
     assert_eq!(deleted.removed_files, 1);
     assert_eq!(deleted.files, 13);
     let after_java_delete = app
@@ -2137,8 +2176,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .all(|hit| hit.chunk.relative_file_path != "tests/OrderValidatorTest.java")
     );
 
-    std::fs::remove_file(workspace.join("tests/cache_test.c")).unwrap();
-    let deleted = app.index(&workspace).await.unwrap();
+    let deleted = remove_file_and_reindex(&app, &workspace, "tests/cache_test.c").await;
     assert_eq!(deleted.removed_files, 1);
     assert_eq!(deleted.files, 12);
     let after_c_delete = app
@@ -2152,8 +2190,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .all(|hit| hit.chunk.relative_file_path != "tests/cache_test.c")
     );
 
-    std::fs::remove_file(workspace.join("tests/RateLimiterTest.cpp")).unwrap();
-    let deleted = app.index(&workspace).await.unwrap();
+    let deleted = remove_file_and_reindex(&app, &workspace, "tests/RateLimiterTest.cpp").await;
     assert_eq!(deleted.removed_files, 1);
     assert_eq!(deleted.files, 11);
     let after_cpp_delete = app
@@ -2646,7 +2683,10 @@ fn code_list_json(report: &local_code_intelligence::app::SearchReport) -> String
 async fn the_code_results_are_byte_identical_with_or_without_markdown_and_docs_come_separately() {
     use local_code_intelligence::{app::SearchOptions, filter::FilterRequest};
 
-    let (temp, config, fake, task) = fixture().await;
+    let (temp, mut config, fake, task) = fixture().await;
+    // Every search notes the missing rust-analyzer the same way, so the two
+    // workspaces' notes can be compared (the breaker would shorten the later ones).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     let app = App::open(config).await.unwrap();
     for rerank_fails in [false, true] {
@@ -2766,6 +2806,8 @@ async fn the_code_results_are_byte_identical_with_or_without_markdown_and_docs_c
 async fn the_code_results_stay_identical_at_the_largest_semantic_candidate_count() {
     let (temp, mut config, _fake, task) = fixture().await;
     config.semantic_candidate_count = 200;
+    // Both searches note the missing rust-analyzer the same way (see above).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     // 170 more code files, none of which the fake embedder places near the
     // query, so the Markdown chunks are the nearest rows of the mixed index.
@@ -2810,6 +2852,8 @@ async fn by_default_markdown_is_not_indexed_and_the_results_equal_a_workspace_wi
     assert!(!defaults.index.prose && !defaults.docs_lane.reranker);
     config.index.prose = defaults.index.prose;
     config.docs_lane.reranker = defaults.docs_lane.reranker;
+    // Every search notes the missing rust-analyzer the same way (see above).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     let app = App::open(config).await.unwrap();
     for query in ["translator", "run translator daily", "unrelated helper"] {
@@ -2903,7 +2947,9 @@ async fn the_prose_switch_adds_and_drops_exactly_the_markdown_files_on_the_next_
 
 #[tokio::test]
 async fn a_failing_docs_reranker_is_reported_on_the_docs_list_and_keeps_fusion_order() {
-    let (temp, config, fake, task) = fixture().await;
+    let (temp, mut config, fake, task) = fixture().await;
+    // Both searches note the missing rust-analyzer the same way (see above).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     let app = App::open(config).await.unwrap();
     // The fake answers an out-of-range index to both rerank calls.
@@ -3137,8 +3183,16 @@ async fn a_hung_reranker_is_tried_once_and_keeps_earlier_warnings() {
         1,
         "query-time reranking does not retry a timeout"
     );
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // The fake holds the request for 30 s, so a search that returned at all
+    // did so because the 1 s client timeout fired, and the warning says so
+    // (checked below). The clock is only a hang guard for that: a bound near
+    // the 1 s timeout would measure the scheduler, not the behaviour.
+    assert!(started.elapsed() < Duration::from_secs(25));
     let warning = report.warning.unwrap();
+    assert!(
+        warning.contains("reranker request failed") && warning.contains("timed out"),
+        "the reranker call ended on its timeout: {warning}"
+    );
     assert!(
         warning.contains("Optional LSP provider unavailable"),
         "{warning}"
@@ -3175,13 +3229,19 @@ async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
     app.index(&workspace).await.unwrap();
 
     // The first search really tries the reranker: one refused connection,
-    // no backoff retries (they used to add about 9 s).
-    // A refused localhost connect alone takes ~2 s on Windows; the old
-    // retried path took ~9 s, so 5 s separates them without flaking.
+    // no backoff retries (they used to add about 9 s). A refused connection
+    // is never accepted, so no server can count it; the single attempt is
+    // counted on a connection that is accepted and dropped in
+    // `a_reranker_that_drops_the_connection_is_tried_once_per_search`, and
+    // here the breaker that this one refusal tripped is what the second
+    // search below observes.
     let first = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    // Hang guard only. A refused localhost connect alone takes ~2 s on
+    // Windows and the old retried path ~9 s, so a bound that told them apart
+    // would measure the scheduler.
     assert!(
-        first.timings.reranking_ms < 5000.0,
-        "an unreachable reranker must not cost a search seconds of retries: {} ms",
+        first.timings.reranking_ms < 30_000.0,
+        "an unreachable reranker must not hang a search: {} ms",
         first.timings.reranking_ms
     );
     assert!(!first.reranked);
@@ -3224,6 +3284,76 @@ async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
             .collect()
     };
     assert_eq!(order(&first), order(&second));
+    task.abort();
+}
+
+/// A reranker that accepts a connection and closes it without answering is
+/// reachable, so it neither trips the skip window nor gets a retry: each
+/// search makes exactly one connection, counted by the listener. (Index-time
+/// embedding retries such a drop; a query-time call must not.)
+#[tokio::test]
+async fn a_reranker_that_drops_the_connection_is_tried_once_per_search() {
+    use tokio::io::AsyncReadExt;
+
+    let (temp, mut config, _fake, task) = fixture().await;
+    let listener = loopback_tokio_listener();
+    config.reranker_url = format!("http://{}/rerank", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counting = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                // Take the start of the request, then close without a reply.
+                let mut buffer = [0u8; 512];
+                let _ = stream.read(&mut buffer).await;
+                drop(stream);
+            }
+        })
+    };
+    let workspace = temp.path().join("dropping-reranker");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "indexing does not rerank"
+    );
+
+    let first = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert!(!first.reranked);
+    assert!(!first.results.is_empty());
+    let warning = first.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("fusion-ranked results returned"),
+        "{warning}"
+    );
+    assert!(!warning.contains("recently unreachable"), "{warning}");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "one search makes one connection: no retry after a dropped one"
+    );
+
+    // Not a refused connection, so the next search asks the reranker again.
+    let second = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert!(!second.reranked);
+    assert!(
+        !second
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("recently unreachable"),
+        "{:?}",
+        second.warning
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    counting.abort();
     task.abort();
 }
 
@@ -3595,6 +3725,37 @@ async fn a_traced_search_records_the_rank_each_channel_gave_every_candidate() {
     assert!(all_three.lexical_score.is_some() && all_three.lexical_match_count > 0);
     assert_eq!(all_three.relative_file_path, "src/Calculator.cs");
 
+    // Ranks are one-based: a recorded rank of 0 would feed fusion a different
+    // `rrf_k + rank` than the documented one, and the recomputation below
+    // would not notice because it reads the same recorded rank. The best
+    // candidate of each channel that answered holds rank 1, and no channel
+    // gives two candidates the same rank.
+    for row in rows {
+        for rank in [row.semantic_rank, row.lexical_rank, row.lsp_rank]
+            .into_iter()
+            .flatten()
+        {
+            assert!(rank >= 1, "ranks are one-based: {row:?}");
+        }
+    }
+    for (channel, rank_of) in [
+        (
+            "semantic",
+            (|row: &local_code_intelligence::app::CandidateTrace| row.semantic_rank)
+                as fn(&local_code_intelligence::app::CandidateTrace) -> Option<usize>,
+        ),
+        ("lexical", |row| row.lexical_rank),
+        ("lsp", |row| row.lsp_rank),
+    ] {
+        let mut ranks: Vec<usize> = rows.iter().filter_map(rank_of).collect();
+        ranks.sort_unstable();
+        let expected: Vec<usize> = (1..=ranks.len()).collect();
+        assert_eq!(
+            ranks, expected,
+            "{channel}: the ranks are the dense sequence 1..=n: {rows:?}"
+        );
+    }
+
     let (rrf_k, weights) = (config.rrf_k, &config.fusion);
     for row in rows {
         let mut score = 0.0_f32;
@@ -3690,6 +3851,15 @@ async fn an_evaluation_dump_keeps_the_note_of_a_cold_language_server() {
         .await
         .unwrap();
         let query = &report.queries[0];
+        // The count is the measurement: the fake server has read only its
+        // `initialize` (it sleeps 1.5 s in answering it), so the search gave
+        // up at its budget and never waited for the start.
+        assert!(
+            lsp_messages_read_so_far(&temp.path().join(format!("lsp-{label}"))) <= 1,
+            "{label}: the search waited for the server to start"
+        );
+        // The clock only shows the budget was waited for at all (a lower
+        // bound; an upper wall bound would measure the scheduler).
         assert!(
             query.timings.unwrap().lsp_search_ms >= 150.0,
             "{label}: the language-server channel waited out its budget: {:?}",
@@ -3733,6 +3903,28 @@ fn spawn_count(state: &Path) -> u64 {
         .trim()
         .parse()
         .unwrap()
+}
+
+/// How many messages (requests and notifications) the fake language server
+/// has read so far, from its `request_count.txt`; 0 until it has read one. A
+/// server still inside a delayed `initialize` has read exactly that one, so
+/// this tells a search that gave up at its budget from one that waited for the
+/// start: the second would have sent `initialized` and its symbol queries.
+fn lsp_messages_read_so_far(state: &Path) -> u64 {
+    std::fs::read_to_string(state.join("request_count.txt"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// How many `workspace/symbol` requests the fake language server has started
+/// on so far, from its `symbol_request_pids.txt` (one line each); 0 until it
+/// has read one. A server still inside its first (priming) request reads no
+/// second one, so more than one means a search waited for the priming.
+fn lsp_symbol_requests_read_so_far(state: &Path) -> usize {
+    std::fs::read_to_string(state.join("symbol_request_pids.txt"))
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
 }
 
 /// The note of a language server a search or a map run found running.
@@ -3798,8 +3990,20 @@ async fn a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming
         .search(&workspace, "Calculator", Some(10))
         .await
         .unwrap();
+    // The count is the measurement: the fake server has read only its
+    // `initialize` (it sleeps 4 s in answering it). A search that waited for
+    // the start would have sent `initialized` and its symbol queries.
     assert!(
-        (150.0..3000.0).contains(&cold.timings.lsp_search_ms),
+        lsp_messages_read_so_far(&state) <= 1,
+        "the search waited for the server to start: {} messages read",
+        lsp_messages_read_so_far(&state)
+    );
+    // The clock is a sanity check, not the measurement: the lower bound shows
+    // the budget was waited for, and the upper bound is only a hang guard (a
+    // bound under the 4 s start failed at 3.3 s on a loaded machine running
+    // this binary's tests in parallel; the count above tells the two apart).
+    assert!(
+        (150.0..30_000.0).contains(&cold.timings.lsp_search_ms),
         "the LSP channel waited {} ms: capped by the 200 ms budget, not the 4000 ms start",
         cold.timings.lsp_search_ms
     );
@@ -3891,6 +4095,14 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
             .search(&workspace, "Calculator", Some(10))
             .await
             .unwrap();
+        // The count is the measurement: the server is inside its first
+        // (priming) `workspace/symbol` request and reads no second one, so no
+        // search waited out the priming.
+        assert!(
+            lsp_symbol_requests_read_so_far(&state) <= 1,
+            "search {attempt} waited for the priming: {} symbol requests read",
+            lsp_symbol_requests_read_so_far(&state)
+        );
         assert!(early.warning.is_none(), "{:?}", early.warning);
         // Search 1 finds the session running but misses the budget: that is
         // the one note (no `kept session` label on an answer it never gave).
@@ -3899,6 +4111,8 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
             !channels_seen(&early).contains("lsp"),
             "search {attempt} ran during priming"
         );
+        // Hang guard only (the priming takes 15 s): the notes, the missing
+        // channel and the request count above are the measurement.
         assert!(
             early.timings.lsp_search_ms < 6000.0,
             "search {attempt} waited {} ms for priming instead of its 200 ms budget",
@@ -3915,6 +4129,9 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
         primed.notes
     );
     assert!(primed.warning.is_none(), "{:?}", primed.warning);
+    // Hang guard only: the measurement is that this search carries no budget
+    // note (`search_until_the_language_server_answers` returns only such a
+    // search) and that the lsp channel contributed above.
     assert!(
         primed.timings.lsp_search_ms < 2000.0,
         "a primed server answers inside the budget (the search had no note; 2 s only allows for a loaded scheduler): {} ms",
@@ -4191,10 +4408,12 @@ async fn the_grep_only_arm_runs_lexical_search_alone_and_leaves_indexing_untouch
     config.channels.lsp = false;
     config.channels.reranker = false;
     let workspace = temp.path().join("grep-only");
+    // The comment holds every word of the stop-word query below, so a lexical
+    // search that kept those words as terms would find this line.
     write(
         &workspace,
         "lib.rs",
-        "fn translator() {}\nfn unrelated() {}\n",
+        "fn translator() {}\n// add the fix when it fails\nfn unrelated() {}\n",
     );
     let app = App::open(config).await.unwrap();
 
@@ -4248,12 +4467,21 @@ async fn the_grep_only_arm_runs_lexical_search_alone_and_leaves_indexing_untouch
     assert!(none.warning.is_none(), "{:?}", none.warning);
 
     // A query made only of stop words has no lexical terms at all: also a
-    // clean miss, not a failure and not a warning.
+    // clean miss, not a failure and not a warning. The fixture does contain
+    // the words, so the miss is the filter's doing, not an absent match.
+    let source = std::fs::read_to_string(workspace.join("lib.rs")).unwrap();
+    for word in ["add", "fix", "when", "the"] {
+        assert!(source.contains(word), "the fixture lacks {word:?}");
+    }
     let stop_words_only = app
         .search(&workspace, "add fix when the", Some(5))
         .await
         .unwrap();
-    assert!(stop_words_only.results.is_empty());
+    assert!(
+        stop_words_only.results.is_empty(),
+        "{:?}",
+        stop_words_only.results
+    );
     assert!(
         stop_words_only.warning.is_none(),
         "{:?}",
@@ -5654,6 +5882,9 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
     );
     let state = temp.path().join("lsp-state-t0-failing");
     config.lsp_search_budget_ms = 30_000;
+    // The traced search and the map registry each start rust-analyzer and
+    // must name the same failure (the breaker would shorten the second).
+    config.run_profile.lsp.breaker = false;
     config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let app = App::open(config).await.unwrap().with_candidate_dump(None);
     app.index(&workspace).await.unwrap();

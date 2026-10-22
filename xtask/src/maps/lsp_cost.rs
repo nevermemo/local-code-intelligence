@@ -246,8 +246,8 @@ pub struct LspCostArgs {
     /// other job is running); after that the run goes on and says so.
     #[arg(long, default_value_t = 45)]
     pub max_quiet_wait_minutes: u64,
-    /// `[run_profile.lsp] places` of every arm. `scip` (the default) writes
-    /// nothing; `outline` lets `lsp.live` place symbols from the server's
+    /// `[run_profile.lsp] places` of every arm. `scip` (this harness's default) writes
+    /// `places = "scip"` (the key's own default is `auto`); `outline` lets `lsp.live` place symbols from the server's
     /// outline, which a tree without a SCIP index needs to get any card.
     #[arg(long, value_enum, default_value = "scip")]
     pub places: Places,
@@ -421,9 +421,13 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
             text.push_str(&line);
             text.push('\n');
         }
-        if ctx.places_outline {
-            text.push_str("places = \"outline\"\n");
-        }
+        // Written either way: the default is `auto`, which is not either arm
+        // on a tree with no SCIP index.
+        text.push_str(if ctx.places_outline {
+            "places = \"outline\"\n"
+        } else {
+            "places = \"scip\"\n"
+        });
     }
     text
 }
@@ -2137,7 +2141,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         (
             "places".to_owned(),
             match args.places {
-                Places::Scip => "scip (the default; not written)",
+                Places::Scip => "scip (this harness's default; written explicitly)",
                 Places::Outline => "outline (`[run_profile.lsp] places`, every arm)",
             }
             .to_owned(),
@@ -2698,7 +2702,8 @@ mod tests {
 
     #[test]
     fn arm_config_is_unchanged_for_rust() {
-        // The text of the `base` arm as written before `--adapter` existed.
+        // The text of the `base` arm as written before `--adapter` existed,
+        // plus the explicit `places = "scip"` since `auto` became the default.
         let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
         let expected = format!(
             "data_dir = '{}'\n{}",
@@ -2712,7 +2717,7 @@ mod tests {
                 "\n[index]\nfreshness = \"manual\"\n",
                 "\n[traverse]\nenabled = true\nscip_index = '@SCIP@'\ndeadline_ms = 20000\n",
                 "\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n",
-                "\n[run_profile.lsp]\nsessions = \"per_call\"\n",
+                "\n[run_profile.lsp]\nsessions = \"per_call\"\nplaces = \"scip\"\n",
             )
         )
         .replace("@SCIP@", &toml_path(&ctx.scip_index));
