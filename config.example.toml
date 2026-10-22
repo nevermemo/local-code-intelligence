@@ -369,7 +369,10 @@ max_depth = 6
 max_est_tokens = 20000
 # Longest the walk may run. The hybrid search for the start nodes does not
 # count against it (embedding_timeout_seconds and reranker_timeout_seconds
-# bound that search). Loading the index does count against it.
+# bound that search). Loading the index does count against it. Building the
+# tree maps (with lsp.live, the version probe of its server among them, bounded
+# by readiness_timeout_seconds) and the tree barrier are credited back too, so a
+# call's wall time can exceed deadline_ms by that setup.
 deadline_ms = 5000
 max_stops = 4
 # Confidence a rung of the steering ladder needs to decide a stop. Only the
@@ -615,8 +618,8 @@ pricing = "rank"
 [run_profile.scip]
 mode = "cache"
 
-# [run_profile.lsp]: whose language servers the lsp.live map asks (the map is
-# opt-in: name it in `maps`).
+# [run_profile.lsp]: whose language servers the lsp.live map asks (on by default
+# where a server is installed and the service keeps it: see `live` below).
 # sessions = "shared" (default): the calls of this process may keep a server
 # across calls, the one that navigation and the search channel use, so a cold
 # start is paid once, but only a server that lists the configuration files its
@@ -684,7 +687,10 @@ mode = "cache"
 # restarts a kept server after an edit whatever the sync did (the tree barrier
 # above), so for lsp.live the sync no longer avoids a restart. The recipes are the same
 # under both values.
-# places = "scip" (default): lsp.live places a symbol only where the SCIP index
+# places = "auto" (default): per walk, "scip" when the SCIP graph read for the
+# workspace has at least one node (that walk is the "scip" walk), else "outline",
+# so a tree with no index read (scip.mode = "off", or "cache" with no file) still
+# gets lsp.live cards. "scip": lsp.live places a symbol only where the SCIP index
 # has a node for it, so it asks nothing about a symbol the index lacks and,
 # under [run_profile.scip] mode = "off", nothing at all. "outline": the index's
 # table first, then the language server's own outline of a file
@@ -701,28 +707,52 @@ mode = "cache"
 # members, impl blocks and type parameters have no node. A seed that is a
 # symbol id of a file never outlined still has no place. Needs a server that
 # answers documentSymbol. The recipes never run lsp.live and are the same
-# under both values.
-# breaker = false (default): every call probes and starts a language server as it
-# is asked, so a server that is not there is probed again on every call. true: a
-# provider whose version probe failed, or whose server could not be started (it
-# could not be spawned, exited, or broke the protocol), is left alone for 30
-# seconds: the next probe or start of that provider is refused at once, with a
-# note that says so, and the window closes when a probe or a start succeeds. The
+# under all three values.
+# breaker = true (default): a provider whose version probe failed, or whose
+# server could not be started (it could not be spawned, exited, or broke the
+# protocol), is left alone for 30 seconds: the next probe or start of that
+# provider is refused at once, with a note that says so, and the window closes
+# when a probe or a start succeeds. A binary that is not found and a probe that
+# timed out open no window (the first costs under a millisecond per probe and its
+# note is the same on every call; the second may only be a loaded machine). The
 # windows are per provider and shared by the process's managers (the service's
 # and each call's); `lci traverse` under sessions = "per_call" has no shared
 # manager and so no window. A server that is already running is still asked, a start that
 # timed out (lsp_timeout_seconds) opens no window because the server may only be
-# slow, and /ready still probes the binaries. The recipes never run lsp.live and
-# are the same under both values.
-# All seven keys are part of the run-profile hash.
+# slow, and /ready still probes the binaries. false: every call probes and
+# starts a language server as it is asked, so a dead server is probed or started
+# again on every call. The recipes never run lsp.live and are the same under
+# both values.
+# live = true (default): a call that names no maps, has a tree, runs under
+# sessions = "shared" and has the service's manager (MCP and REST mode =
+# "traverse") also walks lsp.live, after the extra_maps of its policy (naming it
+# there is then a no-op). A language server that is not installed, will not start
+# or is refused costs the walk a note ("lsp.live is unavailable: ..") and the
+# map, never an error; rust-analyzer is enabled with
+# the bare path "rust-analyzer", the other servers need their [language] path.
+# [traverse] deadline_ms bounds the walk: the setup (building the tree maps, the
+# version probe among them, the seed search and the tree barrier) is
+# credited back, so a call's wall time can exceed deadline_ms by that setup.
+# A service with [traverse] enabled = true also warms the servers at the first
+# touch of a workspace. `lci traverse` (the one-shot) and sessions = "per_call"
+# are not changed by it: a server that dies with the call cannot amortise its
+# start, so there the map runs only when --maps or a policy names it. A call
+# that names its maps is never changed. With a SCIP index that has nodes the
+# walk places symbols by it (places = "auto"); with none read the map places
+# them by the server's own outline. For a language an index that has nodes
+# lacks, set places = "outline": under "scip" the map then asks nothing.
+# false: the map runs only when a call or a policy names it. The recipes never
+# run lsp.live and are the same under both values.
+# All eight keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "shared"
 outline_cache = false
 implementations = false
 call_hierarchy = false
 sync = "off"
-places = "scip"
-breaker = false
+places = "auto"
+breaker = true
+live = true
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against

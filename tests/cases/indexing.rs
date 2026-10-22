@@ -2720,7 +2720,10 @@ fn code_list_json(report: &local_code_intelligence::app::SearchReport) -> String
 async fn the_code_results_are_byte_identical_with_or_without_markdown_and_docs_come_separately() {
     use local_code_intelligence::{app::SearchOptions, filter::FilterRequest};
 
-    let (temp, config, fake, task) = fixture().await;
+    let (temp, mut config, fake, task) = fixture().await;
+    // Every search notes the missing rust-analyzer the same way, so the two
+    // workspaces' notes can be compared (the breaker would shorten the later ones).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     let app = App::open(config).await.unwrap();
     for rerank_fails in [false, true] {
@@ -2840,6 +2843,8 @@ async fn the_code_results_are_byte_identical_with_or_without_markdown_and_docs_c
 async fn the_code_results_stay_identical_at_the_largest_semantic_candidate_count() {
     let (temp, mut config, _fake, task) = fixture().await;
     config.semantic_candidate_count = 200;
+    // Both searches note the missing rust-analyzer the same way (see above).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     // 170 more code files, none of which the fake embedder places near the
     // query, so the Markdown chunks are the nearest rows of the mixed index.
@@ -2884,6 +2889,8 @@ async fn by_default_markdown_is_not_indexed_and_the_results_equal_a_workspace_wi
     assert!(!defaults.index.prose && !defaults.docs_lane.reranker);
     config.index.prose = defaults.index.prose;
     config.docs_lane.reranker = defaults.docs_lane.reranker;
+    // Every search notes the missing rust-analyzer the same way (see above).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     let app = App::open(config).await.unwrap();
     for query in ["translator", "run translator daily", "unrelated helper"] {
@@ -2977,7 +2984,9 @@ async fn the_prose_switch_adds_and_drops_exactly_the_markdown_files_on_the_next_
 
 #[tokio::test]
 async fn a_failing_docs_reranker_is_reported_on_the_docs_list_and_keeps_fusion_order() {
-    let (temp, config, fake, task) = fixture().await;
+    let (temp, mut config, fake, task) = fixture().await;
+    // Both searches note the missing rust-analyzer the same way (see above).
+    config.run_profile.lsp.breaker = false;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
     let app = App::open(config).await.unwrap();
     // The fake answers an out-of-range index to both rerank calls.
@@ -5910,6 +5919,9 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
     );
     let state = temp.path().join("lsp-state-t0-failing");
     config.lsp_search_budget_ms = 30_000;
+    // The traced search and the map registry each start rust-analyzer and
+    // must name the same failure (the breaker would shorten the second).
+    config.run_profile.lsp.breaker = false;
     config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let app = App::open(config).await.unwrap().with_candidate_dump(None);
     app.index(&workspace).await.unwrap();
