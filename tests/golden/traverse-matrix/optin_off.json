@@ -1,0 +1,54 @@
+{
+  "effective_policy": {
+    "hash": "abe626e6377c1a59",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "structure.contains",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "seeds.bm25 is off ([run_profile.seeds] bm25 = false): the map gives no start nodes",
+    "seeds.literal is off ([run_profile.seeds] literal = false): the map gives no start nodes",
+    "seeds.repo_map is off ([run_profile.seeds] repo_map = false): the map gives no start nodes",
+    "grep.structural is off ([run_profile.grep] structural = false): the map gives no edges",
+    "no start node: the hybrid search and the symbol names in the question found nothing in the SCIP graph, and no seeds were given; name a function or method the code defines"
+  ],
+  "question": "Combine",
+  "results": [],
+  "seed_source": "none",
+  "seeds": [],
+  "status": "no_seeds",
+  "stop_reason": "no_seeds",
+  "totals": {
+    "first_stage": {
+      "exact": 0,
+      "seeds": 0,
+      "walk": 0
+    },
+    "physical_external_calls": 0
+  }
+}

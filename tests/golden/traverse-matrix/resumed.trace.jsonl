@@ -1,0 +1,3 @@
+{"budget":{"est_tokens":20000,"external_calls":100,"max_depth":6,"pops":2,"raised_pops":0,"raised_tokens":0},"ev":"resume","handle":"<handle>","pops":2,"rank":{"corroboration_boost":0.1},"scorer":"rules","scorer_changed":false,"stops":{"budget_share":0,"every_pops":0,"likely_complete":0,"max_stops":4,"on_disagreement":0,"on_stagnation":0},"unblocked":0}
+{"checkpoint_hash":"1c5a6ebd205cb69e","ev":"return","reason":"budget","stop":0}
+{"answer_nodes":4,"ev":"end","status":"budget_exhausted","stop_reason":"pops","totals":{"cross_map_hops":0,"external_calls":0,"hops":2,"physical_external_calls":0,"physical_map_calls":4,"pops":2,"steers":0,"stops":0,"tokens":24}}

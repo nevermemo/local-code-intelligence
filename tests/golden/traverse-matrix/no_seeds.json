@@ -1,0 +1,52 @@
+{
+  "effective_policy": {
+    "hash": "cf3f55c8144165ee",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": true,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "structure.contains",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "seed_source is name_tokens, the stand-in that matches the question's words against symbol names: no search is available for this call (it has no workspace to search)",
+    "no start node: the hybrid search and the symbol names in the question found nothing in the SCIP graph, and no seeds were given; name a function or method the code defines"
+  ],
+  "question": "zzz-nothing-here",
+  "results": [],
+  "seed_fallback": "no search is available for this call (it has no workspace to search)",
+  "seed_source": "name_tokens",
+  "seeds": [],
+  "status": "no_seeds",
+  "stop_reason": "no_seeds",
+  "totals": {
+    "first_stage": {
+      "exact": 0,
+      "seeds": 0,
+      "walk": 0
+    },
+    "physical_external_calls": 0
+  }
+}

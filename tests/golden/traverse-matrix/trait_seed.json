@@ -1,0 +1,141 @@
+{
+  "effective_policy": {
+    "hash": "8a8847f5c923d85b",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "structure.contains",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "scip.implements",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "scip.implements: 1 impl headers read (1 with a trait, 0 external; 0 macro and 0 other unresolved, 0 documents without source), 1 type-trait and 1 method pairs, 0 facts dropped for lack of a node id, cap 64 edges per node",
+    "1 start nodes are the traits and trait methods the question's paths name (0 of them by the last segment alone); no other source gave start nodes; scip.implements follows their edges to the implementing types and members"
+  ],
+  "question": "`shapes::Speak`",
+  "results": [
+    {
+      "depth": 0,
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:shapes::Speak/trait",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 11,
+        "line": 2,
+        "path": "src/shapes.rs"
+      },
+      "text": "sym:rust:shapes::Speak/trait | seed | p1.00 d0",
+      "via": null,
+      "witness": null
+    },
+    {
+      "depth": 1,
+      "fanout": 1,
+      "maps": [
+        "scip.implements"
+      ],
+      "n_maps": 1,
+      "node": "sym:rust:shapes::Foo/struct",
+      "node_kind": "sym",
+      "origin": "walk",
+      "overlap": 0.5,
+      "potential": 0.9,
+      "ranked_potential": 0.9,
+      "site": {
+        "col": 12,
+        "line": 1,
+        "path": "src/shapes.rs"
+      },
+      "text": "sym:rust:shapes::Foo/struct | scip.implements/compiler | p0.90 d1",
+      "via": "scip.implements",
+      "witness": "compiler"
+    }
+  ],
+  "seed_hits": [
+    {
+      "how": "trait",
+      "kind": "symbol",
+      "node": "sym:rust:shapes::Speak/trait",
+      "retrievers": [
+        "scip.implements"
+      ],
+      "score": 1,
+      "score_kind": "path_match",
+      "written": "shapes::Speak"
+    }
+  ],
+  "seed_sites": {
+    "sym:rust:shapes::Speak/trait": {
+      "col": 11,
+      "line": 2,
+      "path": "src/shapes.rs"
+    }
+  },
+  "seed_source": "traits",
+  "seeds": [
+    "sym:rust:shapes::Speak/trait"
+  ],
+  "status": "complete",
+  "steering": [],
+  "stop_reason": "complete",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "first_stage": {
+      "exact": 0,
+      "seeds": 1,
+      "walk": 1
+    },
+    "hops": 1,
+    "per_map": {
+      "graph.scip": {
+        "expands": 2
+      },
+      "scip.implements": {
+        "expands": 2
+      }
+    },
+    "physical_external_calls": 0,
+    "physical_map_calls": 4,
+    "pops": 2,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "trace": {
+    "events": 5,
+    "hash": "057a58ed1a414d2b"
+  },
+  "trait_seeds": 1
+}

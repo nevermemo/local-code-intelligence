@@ -1,0 +1,233 @@
+{
+  "checkpoint": {
+    "answer": [],
+    "budget_left_pct": 0,
+    "calls_left": 100,
+    "cleared": 0,
+    "disagreements": [],
+    "disagreements_total": 0,
+    "frontier": [
+      {
+        "depth": 1,
+        "est_cost": 0,
+        "fanout": 1,
+        "node": "file:src/Calculator.cs",
+        "potential": 0.5,
+        "score": 0.5,
+        "seen_before": false,
+        "site": {
+          "col": 1,
+          "line": 1,
+          "path": "src/Calculator.cs"
+        },
+        "via": "structure.contains",
+        "witness": "exact"
+      },
+      {
+        "depth": 1,
+        "est_cost": 0,
+        "fanout": 2,
+        "node": "file:src/CallSite.cs",
+        "potential": 0.5,
+        "score": 0.5,
+        "seen_before": false,
+        "site": {
+          "col": 1,
+          "line": 1,
+          "path": "src/CallSite.cs"
+        },
+        "via": "structure.contains",
+        "witness": "exact"
+      }
+    ],
+    "likely_complete": null,
+    "maps": [
+      {
+        "calls": 2,
+        "edges": 0,
+        "failures": 0,
+        "map": "graph.scip",
+        "tokens": 0
+      },
+      {
+        "calls": 2,
+        "edges": 2,
+        "failures": 0,
+        "map": "structure.contains",
+        "tokens": 0
+      }
+    ],
+    "pops": 2,
+    "pops_left": 0,
+    "question": "Combine",
+    "reason": "pops",
+    "regions": {
+      "cleared": 0,
+      "explored": 2,
+      "rows": [
+        {
+          "cleared": 0,
+          "explored": 2,
+          "path": ".",
+          "seen": 0
+        },
+        {
+          "cleared": 0,
+          "explored": 0,
+          "path": "src",
+          "seen": 2
+        }
+      ],
+      "seen": 2,
+      "unknown": null
+    },
+    "seeds": [
+      "sym:rust:Calculator.cs::Combine/fn",
+      "sym:rust:CallSite.cs::Run/fn"
+    ],
+    "stop": 0,
+    "tokens_left": 19976,
+    "visited": 2,
+    "visited_cards": [
+      {
+        "depth": 0,
+        "maps": [
+          "graph.scip"
+        ],
+        "n_maps": 1,
+        "node": "sym:rust:Calculator.cs::Combine/fn",
+        "potential": 1.0,
+        "ranked_potential": 1.0,
+        "site": {
+          "col": 16,
+          "line": 4,
+          "path": "src/Calculator.cs"
+        },
+        "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+        "via": null,
+        "witness": null
+      },
+      {
+        "depth": 0,
+        "maps": [],
+        "n_maps": 0,
+        "node": "sym:rust:CallSite.cs::Run/fn",
+        "potential": 1.0,
+        "ranked_potential": 1.0,
+        "site": {
+          "col": 23,
+          "line": 4,
+          "path": "src/CallSite.cs"
+        },
+        "text": "sym:rust:CallSite.cs::Run/fn | seed | p1.00 d0",
+        "via": null,
+        "witness": null
+      }
+    ]
+  },
+  "effective_policy": {
+    "hash": "205452e65641513b",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "structure.contains",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "the first stage is not run again on a continuation: the results are the walk's alone (the first response carried the first-stage list)"
+  ],
+  "question": "Combine",
+  "results": [
+    {
+      "depth": 1,
+      "fanout": 1,
+      "maps": [
+        "structure.contains"
+      ],
+      "n_maps": 1,
+      "node": "file:src/Calculator.cs",
+      "node_kind": "file",
+      "overlap": 0.0,
+      "potential": 0.5,
+      "ranked_potential": 0.5,
+      "site": {
+        "col": 1,
+        "line": 1,
+        "path": "src/Calculator.cs"
+      },
+      "text": "file:src/Calculator.cs | structure.contains/exact | p0.50 d1",
+      "via": "structure.contains",
+      "witness": "exact"
+    },
+    {
+      "depth": 1,
+      "fanout": 2,
+      "maps": [
+        "structure.contains"
+      ],
+      "n_maps": 1,
+      "node": "file:src/CallSite.cs",
+      "node_kind": "file",
+      "overlap": 0.0,
+      "potential": 0.5,
+      "ranked_potential": 0.5,
+      "site": {
+        "col": 1,
+        "line": 1,
+        "path": "src/CallSite.cs"
+      },
+      "text": "file:src/CallSite.cs | structure.contains/exact | p0.50 d1",
+      "via": "structure.contains",
+      "witness": "exact"
+    }
+  ],
+  "seeds": [],
+  "status": "budget_exhausted",
+  "steering": [],
+  "stop_reason": "pops",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "hops": 2,
+    "per_map": {
+      "graph.scip": {
+        "expands": 2
+      },
+      "structure.contains": {
+        "expands": 2
+      }
+    },
+    "physical_external_calls": 0,
+    "physical_map_calls": 4,
+    "pops": 2,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 24
+  },
+  "trace": {
+    "events": 3
+  }
+}

@@ -404,7 +404,7 @@ mod tests {
     /// Full` (or an explicit `--test integration <name>::` run) executes them.
     /// Adding a module to `tests/integration.rs` means either a focused
     /// suite's `integration("<name>::")` filter or a row here.
-    const FULL_ONLY_CASES: &[&str] = &["recipes", "run_records"];
+    const FULL_ONLY_CASES: &[&str] = &["recipes", "run_records", "traverse_matrix"];
 
     /// The module names `tests/integration.rs` declares, in file order.
     fn integration_modules() -> Vec<String> {
