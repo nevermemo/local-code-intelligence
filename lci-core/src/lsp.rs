@@ -1341,6 +1341,13 @@ impl Manager {
         self
     }
 
+    /// The index's file list this manager reads (see
+    /// [`Self::with_indexed_files`]), to hand to the per-call managers of a
+    /// walk; `None` when it has none.
+    pub fn indexed_source(&self) -> Option<Arc<dyn stamp::IndexedFiles>> {
+        self.indexed.lock().unwrap().clone()
+    }
+
     /// This manager without `[run_profile.lsp] sync`: a per-call manager
     /// starts its servers on the tree as it is and stops them when the call
     /// ends, so it watches nothing. Call before the first request.

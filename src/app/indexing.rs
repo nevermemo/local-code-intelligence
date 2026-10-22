@@ -205,8 +205,9 @@ pub struct ServerRoster {
     /// Why `root` is what it is: `roots_workspace` (the key says so),
     /// `manifest:<file>` (the directory of the topmost manifest),
     /// `no_manifest`, `several_roots:<n>` (sibling manifests),
-    /// `files_outside_root:<n>`, `no_file_list` or `unreadable` (the last
-    /// five start at the workspace).
+    /// `files_outside_root:<n>`, `no_file_list`, `unreadable` or `not_served`
+    /// (a disabled, unconfigured or unserving server; the last six start at
+    /// the workspace).
     pub root_reason: String,
     /// The session's report, as in `analyzers`; `null` without a session.
     pub session: Option<crate::lsp::ServerReadiness>,
@@ -774,7 +775,7 @@ impl App {
                 {
                     self.analyzer.server_root(adapter, &workspace).await
                 }
-                None => Root::workspace(&workspace.path, RootReason::NoManifest),
+                None => Root::workspace(&workspace.path, RootReason::NotServed),
             };
             servers.push(ServerRoster {
                 provider: provider.to_owned(),

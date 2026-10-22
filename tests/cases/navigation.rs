@@ -9241,3 +9241,51 @@ async fn a_server_starts_at_its_manifest_root_under_roots_manifest() {
         manifest_run.after
     );
 }
+
+/// Under `roots = "manifest"` the servers of an `lsp.live` walk get the index's
+/// file list too: the per-call manager of a walk under `sessions = "per_call"`
+/// reads the shared manager's list, so csharp-ls starts at `src/`, where
+/// `app.sln` is, not at the workspace. Fails when `per_call_manager` does not
+/// pass the shared manager's file list on (the server starts at the workspace),
+/// and when the default key stops starting at the workspace.
+#[tokio::test]
+async fn an_lsp_live_walk_starts_its_server_at_the_manifest_root_under_roots_manifest() {
+    use local_code_intelligence::config::{LspRoots, LspSessions};
+
+    let mut started = Vec::new();
+    for roots in [LspRoots::Workspace, LspRoots::Manifest] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut config, workspace, state, index) = shared_sessions_fixture(&temp);
+        write(&workspace.path, "src/app.sln", "\n");
+        config.run_profile.lsp.roots = roots;
+        let manager = indexed_manager(&config, &workspace);
+        traverse_add_past_a_cold_start(
+            &config,
+            &workspace,
+            &index,
+            &state,
+            LspSessions::PerCall,
+            &manager,
+        )
+        .await;
+        let canonical = dunce::canonicalize(&workspace.path).unwrap();
+        let uri =
+            |path: &std::path::Path| reqwest::Url::from_directory_path(path).unwrap().to_string();
+        let roots_started: Vec<String> = std::fs::read_to_string(state.join("root_uri.txt"))
+            .expect("the walk started a server")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let expected = match roots {
+            LspRoots::Manifest => uri(&canonical.join("src")),
+            _ => uri(&canonical),
+        };
+        assert!(!roots_started.is_empty());
+        assert!(
+            roots_started.iter().all(|root| *root == expected),
+            "{roots:?}: started at {roots_started:?}, expected {expected}"
+        );
+        started.push(roots_started);
+    }
+    assert_ne!(started[0], started[1]);
+}

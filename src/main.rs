@@ -788,7 +788,15 @@ async fn run_traverse(
     let lsp_sessions = (config.run_profile.lsp.sessions
         == local_code_intelligence::config::LspSessions::Shared
         && may_walk_lsp_live(&config, args.root.is_some(), maps))
-    .then(|| std::sync::Arc::new(lsp::Manager::new(&config)));
+    .then(|| {
+        // The index's file list, which `roots = "manifest"` reads (as the
+        // service's manager does); the default key never reads it.
+        std::sync::Arc::new(
+            lsp::Manager::new(&config).with_indexed_files(std::sync::Arc::new(
+                local_code_intelligence::app::ManifestFiles::new(config.data_dir.clone()),
+            )),
+        )
+    });
     let report = traverse::run_with_trait_seeds(
         &config.traverse,
         &config.run_profile,

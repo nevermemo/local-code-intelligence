@@ -716,9 +716,9 @@ mode = "cache"
 # are the same under both values.
 # roots = "workspace" (default): every language server starts at the workspace
 # path. "manifest": a server starts at the directory of the topmost project file
-# its adapter names (go.mod, go.sum, go.work for gopls; pyproject.toml,
-# pyrightconfig.json, setup.py and so on for pyright; tsconfig.json, package.json
-# and so on for typescript-language-server; *.sln, *.csproj for csharp-ls) found
+# its adapter names (go.mod, go.sum, go.work for gopls; pyrightconfig.json,
+# pyproject.toml, setup.cfg for pyright; tsconfig.json, package.json and so on
+# for typescript-language-server; *.sln, *.csproj for csharp-ls) found
 # in the directories of the index's files of its languages and their ancestors
 # (one directory read each, no recursive walk), so a module under services/api/
 # is served from services/api/. The workspace is kept when no such file is found,

@@ -35,9 +35,11 @@ use std::{
 pub enum RootReason {
     /// `roots = "workspace"`: the key says the workspace.
     Workspace,
-    /// `roots = "manifest"` and the index has no file list (or the adapter
-    /// names no manifest): the workspace.
+    /// `roots = "manifest"` and the index has no file list: the workspace.
     NoFileList,
+    /// The server is not one the roster works a root out for (disabled,
+    /// unconfigured or serving no language of the workspace): the workspace.
+    NotServed,
     /// No manifest among the directories of the server's files: the
     /// workspace.
     NoManifest,
@@ -59,6 +61,7 @@ impl fmt::Display for RootReason {
             Self::Workspace => formatter.write_str("roots_workspace"),
             Self::NoFileList => formatter.write_str("no_file_list"),
             Self::NoManifest => formatter.write_str("no_manifest"),
+            Self::NotServed => formatter.write_str("not_served"),
             Self::SeveralRoots(count) => write!(formatter, "several_roots:{count}"),
             Self::LeavesFilesOut(count) => write!(formatter, "files_outside_root:{count}"),
             Self::Unreadable => formatter.write_str("unreadable"),
@@ -228,7 +231,7 @@ pub fn for_server(
     indexed: &[String],
 ) -> Root {
     if manifests.is_empty() {
-        return Root::workspace(workspace, RootReason::NoFileList);
+        return Root::workspace(workspace, RootReason::NoManifest);
     }
     let near = match manifests_near(workspace, indexed, languages, manifests) {
         Ok(near) => near,
@@ -331,6 +334,10 @@ mod tests {
         assert_eq!(root.reason, RootReason::NoManifest);
         assert_eq!(discover(workspace, &["go.mod"], &[]).relative, ".");
         assert_eq!(discover(workspace, &[], &list(&["go.mod"])).relative, ".");
+        // An adapter that names no manifest has none; it is not a missing list.
+        let nameless = for_server(workspace, &[], &["go"], &list(&["a/main.go"]));
+        assert_eq!(nameless.reason, RootReason::NoManifest);
+        assert_eq!(RootReason::NotServed.to_string(), "not_served");
     }
 
     #[test]
