@@ -611,7 +611,8 @@ mode = "cache"
 # rust-analyzer) or is told by sync = "watch". Every other server
 # (csharp-ls, typescript-language-server, pyright, gopls, clangd; jdtls always)
 # is started by each call and stopped when its walk ends, as under "per_call".
-# Before a walk uses a kept server it passes a tree barrier: a stamp of the
+# Before a walk (and before navigation and the search channel) uses a kept
+# server it passes a tree barrier: a stamp of the
 # server's indexed files, their directories and ancestors (child names too),
 # one level of child directories of those (except .git, target, node_modules,
 # obj, bin, build, dist, out and virtual environments) and the server's
