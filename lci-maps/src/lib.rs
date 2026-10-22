@@ -329,6 +329,9 @@ pub enum MapStatus {
     /// Part of the answer is missing; the hits returned are kept. A budget
     /// that ran out is a note; a source that failed while others answered
     /// (one language server of several) is a warning. At least one is set.
+    /// A map with no other field for a note about a complete answer (the LSP
+    /// map's kept-session or restart note, N110) also reports `Partial`; the
+    /// registry fuses its hits as it does `Ok`.
     Partial {
         note: Option<String>,
         warning: Option<String>,
