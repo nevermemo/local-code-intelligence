@@ -1,0 +1,131 @@
+{
+  "completeness": {
+    "complete": true,
+    "estimate": null,
+    "why": "complete"
+  },
+  "effective_policy": {
+    "hash": "cf5176ae1e54b2e1",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "structure.contains",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "lsp.live",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "question": "Combine",
+  "results": [
+    {
+      "depth": 0,
+      "freshness": "unverified",
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 16,
+        "line": 4,
+        "path": "src/Calculator.cs"
+      },
+      "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+      "via": null,
+      "witness": null
+    },
+    {
+      "depth": 1,
+      "fanout": 1,
+      "freshness": "unverified",
+      "maps": [
+        "lsp.live"
+      ],
+      "n_maps": 1,
+      "node": "sym:rust:CallSite.cs::Run/fn",
+      "node_kind": "sym",
+      "origin": "walk",
+      "overlap": 0.0,
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "site": {
+        "col": 23,
+        "line": 4,
+        "path": "src/CallSite.cs"
+      },
+      "text": "sym:rust:CallSite.cs::Run/fn | lsp.live/exact | p1.00 d1",
+      "via": "lsp.live",
+      "witness": "exact"
+    }
+  ],
+  "seed_hits": [],
+  "seed_sites": {
+    "sym:rust:Calculator.cs::Combine/fn": {
+      "col": 16,
+      "line": 4,
+      "path": "src/Calculator.cs"
+    }
+  },
+  "seed_source": "given",
+  "seeds": [
+    "sym:rust:Calculator.cs::Combine/fn"
+  ],
+  "status": "complete",
+  "steering": [],
+  "stop_reason": "complete",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 4,
+    "first_stage": {
+      "exact": 0,
+      "seeds": 1,
+      "walk": 1
+    },
+    "hops": 1,
+    "per_map": {
+      "graph.scip": {
+        "expands": 2
+      },
+      "lsp.live": {
+        "expands": 2
+      }
+    },
+    "physical_external_calls": 4,
+    "physical_map_calls": 4,
+    "pops": 2,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "trace": {
+    "events": 5,
+    "hash": "c7a460356adfb202"
+  }
+}

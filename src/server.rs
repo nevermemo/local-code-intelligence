@@ -558,6 +558,8 @@ fn mcp_service(
     )
 }
 
+/// The HTTP router. `port` is the port the listener is bound to: the Host/Origin
+/// checks and `/openapi.json` name it.
 pub fn router(
     app: Arc<App>,
     cancellation: tokio_util::sync::CancellationToken,
@@ -569,7 +571,7 @@ pub fn router(
     config.allowed_origins = loopback_origins(port);
     let ready_app = app.clone();
     let router = axum::Router::new()
-        .merge(crate::rest::routes())
+        .merge(crate::rest::routes(port))
         .merge(crate::rest::recipe_routes(&app.config))
         .route(
             "/health",

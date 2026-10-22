@@ -1407,7 +1407,7 @@ export interface TelemetryLifecycle {
     }
 
     #[test]
-    fn scans_exactly_the_registered_lowercase_extensions() {
+    fn scans_exactly_the_registered_extensions_in_any_ascii_case() {
         let temp = tempfile::tempdir().unwrap();
         for (name, source) in [
             ("lib.rs", "fn rust_item() {}\n"),
@@ -1417,11 +1417,12 @@ export interface TelemetryLifecycle {
             ("view.jsx", "export const View = () => <main />;\n"),
             ("Service.cs", "public sealed class Service {}\n"),
             ("guide.md", "# Guide\ntext\n"),
-            ("ignored.MD", "# Upper\ntext\n"),
+            ("Upper.MD", "# Upper\ntext\n"),
             ("ignored.markdown", "# Long\ntext\n"),
             ("ignored.mdx", "# Mdx\ntext\n"),
-            ("ignored.RS", "fn uppercase() {}\n"),
-            ("ignored.CS", "public sealed class Ignored {}\n"),
+            ("Shout.RS", "fn uppercase() {}\n"),
+            ("Shout.CS", "public sealed class Shouted {}\n"),
+            ("Tool.Py", "mixed = True\n"),
             ("ignored.mts", "export const ignored = 1;\n"),
             ("ignored.py", "ignored = True\n"),
         ] {
@@ -1441,6 +1442,10 @@ export interface TelemetryLifecycle {
                 "runtime.js",
                 "view.jsx",
                 "ignored.py",
+                "Upper.MD",
+                "Shout.RS",
+                "Shout.CS",
+                "Tool.Py",
                 "Service.cs",
                 "guide.md"
             ])
@@ -1464,7 +1469,7 @@ export interface TelemetryLifecycle {
             ("include/b.hpp", "int b();\n"),
             ("include/b.hh", "int bb();\n"),
             ("include/b.hxx", "int bx();\n"),
-            // Unsupported or case-variant lookalikes are ignored.
+            // Case-variant extensions are the same languages (N94).
             ("src/upper.C", "int upper() { return 1; }\n"),
             ("include/upper.H", "int upper();\n"),
             ("src/upper.CC", "int upper() { return 1; }\n"),
@@ -1499,6 +1504,10 @@ export interface TelemetryLifecycle {
                 ("include/b.hpp", "cpp"),
                 ("include/b.hh", "cpp"),
                 ("include/b.hxx", "cpp"),
+                ("src/upper.C", "c"),
+                ("include/upper.H", "c"),
+                ("src/upper.CC", "cpp"),
+                ("include/upper.HPP", "cpp"),
             ])
         );
     }

@@ -2,7 +2,7 @@
 
 ## Registration
 
-- Register exact lowercase source extensions in the central static language registry.
+- Register the source extensions, written lowercase, in the central static language registry; lookup folds ASCII case (N94).
 - Give every extension one stable serialized language identifier, extractor (a Tree-sitter grammar constructor and syntax family for code, or a prose kind such as Markdown), lexical glob, and adapter compatibility version.
 - Keep extension selection deterministic. Do not infer a language from repository type, framework, or file contents. The one content check allowed is exclusion, never selection: `LanguageAdapter::non_source` may leave out a file whose content is a known non-source format that shares the extension (a Qt Linguist `.ts` catalog). It must require a prefix the language cannot start with, and its skips are reported, not silent.
 - Update scanning, lexical globs, filtering validation, public documentation, and mixed-language fixtures together.

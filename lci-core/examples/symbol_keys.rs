@@ -60,7 +60,10 @@ fn main() -> Result<()> {
     for entry in tree.split('\0').filter(|e| !e.is_empty()) {
         let (meta, path) = entry.split_once('\t').context("ls-tree entry")?;
         let fields: Vec<&str> = meta.split(' ').collect();
-        if fields[1] != "blob" || fields[0] == "120000" || !path.ends_with(".rs") {
+        if fields[1] != "blob"
+            || fields[0] == "120000"
+            || !lci_core::path::has_extension_ignore_case(path, "rs")
+        {
             continue;
         }
         files += 1;

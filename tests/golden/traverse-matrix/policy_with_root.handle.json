@@ -1,0 +1,124 @@
+{
+  "alts": [],
+  "boost": 0.1,
+  "cleared": [],
+  "deferred": [],
+  "expanded": [
+    0
+  ],
+  "frontier": [
+    [
+      1,
+      0.5,
+      1
+    ]
+  ],
+  "in_seen": [
+    [
+      "file:src/Calculator.cs",
+      1
+    ]
+  ],
+  "last_stop_at": null,
+  "next_seq": 2,
+  "paid": [],
+  "pass_through": false,
+  "popped": [
+    0
+  ],
+  "question": "`Combine`",
+  "rerank_floor": null,
+  "returned": "fcf76a608e761a1c",
+  "score_bound": true,
+  "scorer": "rules",
+  "states": [
+    {
+      "dependent": 0,
+      "depth": 0,
+      "fanout": 1,
+      "maps": [],
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "parent": null,
+      "potential": 1.0,
+      "via": null,
+      "witness": null,
+      "witnesses": []
+    },
+    {
+      "dependent": 1,
+      "depth": 1,
+      "fanout": 1,
+      "maps": [
+        "structure.contains"
+      ],
+      "node": "file:src/Calculator.cs",
+      "parent": 0,
+      "potential": 0.5,
+      "via": "structure.contains",
+      "witness": "exact",
+      "witnesses": [
+        "exact"
+      ]
+    }
+  ],
+  "switches": [],
+  "tally": {
+    "complete_fired": false,
+    "disagreements": [],
+    "found": [
+      [
+        "structure.contains",
+        [
+          "file:src/Calculator.cs"
+        ]
+      ]
+    ],
+    "kind_cost": [
+      [
+        "sym",
+        1,
+        12
+      ]
+    ],
+    "last_fresh_pop": 1,
+    "maps": [
+      [
+        "graph.scip",
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        "structure.contains",
+        1,
+        0,
+        1,
+        0
+      ]
+    ],
+    "raised_pops": 0,
+    "raised_tokens": 0
+  },
+  "targets": [],
+  "top_k": 10,
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "hops": 1,
+    "pass_through_pops": 0,
+    "physical_external_calls": 0,
+    "physical_map_calls": 2,
+    "pops": 1,
+    "rerank_calls": 0,
+    "rerank_docs": 0,
+    "rerank_failure_reasons": {},
+    "rerank_failures": 0,
+    "rerank_skipped": 0,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "version": 10,
+  "weights": []
+}

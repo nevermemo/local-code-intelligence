@@ -1488,9 +1488,14 @@ async fn run() -> Result<()> {
             .await?,
         )?,
         Command::Serve { .. } => {
-            // The resolved port: `--port`, else `LCI_PORT`, the local
-            // overlay, the configuration file, then 8768.
-            let port = app.config.port;
+            // Bind first: the port to name in the logs, the Origin check and
+            // `/openapi.json` is the one the listener got, which is not the
+            // configured one when that is 0 (any free port). The resolved
+            // port is `--port`, else `LCI_PORT`, the local overlay, the
+            // configuration file, then 8768.
+            let listener =
+                tokio::net::TcpListener::bind(format!("127.0.0.1:{}", app.config.port)).await?;
+            let port = listener.local_addr()?.port();
             let cancellation = tokio_util::sync::CancellationToken::new();
             let profile_endpoints: Vec<String> = app
                 .config
@@ -1499,7 +1504,6 @@ async fn run() -> Result<()> {
                 .map(|name| format!("http://127.0.0.1:{port}{}", server::mcp_path(Some(name))))
                 .collect();
             let router = server::router(Arc::clone(&app), cancellation.clone(), port);
-            let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
             tracing::info!(
                 "MCP: http://127.0.0.1:{port}/mcp; health: http://127.0.0.1:{port}/health"
             );

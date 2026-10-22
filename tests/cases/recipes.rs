@@ -230,7 +230,7 @@ async fn surface_of(app: Arc<App>) -> Value {
     let listed = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
     let mut tools = listed["tools"].as_array().unwrap().clone();
     tools.sort_by_key(|tool| tool["name"].as_str().unwrap().to_owned());
-    let openapi = client
+    let mut openapi = client
         .get(format!("{base}/openapi.json"))
         .send()
         .await
@@ -238,6 +238,10 @@ async fn surface_of(app: Arc<App>) -> Value {
         .json::<Value>()
         .await
         .unwrap();
+    // The document names the port it is served on; the golden holds a
+    // placeholder for it.
+    assert_eq!(openapi["servers"][0]["url"], base.as_str());
+    openapi["servers"][0]["url"] = json!("http://127.0.0.1:<port>");
     token.cancel();
     server.abort();
     json!({"instructions": initialized["instructions"], "tools": tools, "openapi": openapi})
