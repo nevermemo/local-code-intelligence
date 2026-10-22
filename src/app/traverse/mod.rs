@@ -72,6 +72,7 @@ mod first_stage;
 mod freshness;
 mod index;
 pub mod presets;
+mod repo_map;
 mod rescore;
 mod response;
 pub(crate) mod seeds;
