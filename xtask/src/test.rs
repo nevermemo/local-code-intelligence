@@ -216,7 +216,11 @@ fn focused_invocations(suite: Suite) -> Option<Vec<Vec<&'static str>>> {
         Suite::Mcp => vec![integration("mcp::")],
         Suite::Watching => vec![integration("watching::")],
         Suite::Freshness => vec![integration("freshness::")],
-        Suite::Lsp => vec![lib("lsp::"), integration("navigation::")],
+        Suite::Lsp => vec![
+            lib("lsp::"),
+            integration("navigation::"),
+            integration("child_stdin::"),
+        ],
         Suite::Full => return None,
     };
     Some(
@@ -386,7 +390,7 @@ mod tests {
             ]]
         );
         assert_eq!(args(Suite::Config).len(), 3);
-        assert_eq!(args(Suite::Lsp).len(), 2);
+        assert_eq!(args(Suite::Lsp).len(), 3);
     }
 
     #[test]

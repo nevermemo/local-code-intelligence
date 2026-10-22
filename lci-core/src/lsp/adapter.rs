@@ -292,7 +292,11 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
     let run = async {
         let mut command = tokio::process::Command::new(&resolved);
         command.arg("--version");
+        // tokio's `output()` pipes only stdout and stderr, so without this the
+        // child inherits our stdin: under the MCP stdio transport that is the
+        // client's JSON-RPC stream (N107).
         command
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
