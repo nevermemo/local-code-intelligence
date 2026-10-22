@@ -87,17 +87,61 @@ fn evaluation_expectations_drive_reports_but_not_ranking() {
 
 #[test]
 fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
-    let query = evaluation_query();
+    // The definition goes through the real loader: `self` leaves `required` out
+    // (it defaults to true), `gust` opts out of it.
+    let temp = tempfile::tempdir().unwrap();
+    let definition_path = temp.path().join("evaluation.toml");
+    std::fs::write(
+        &definition_path,
+        r#"
+[[workspaces]]
+key = "self"
+
+[[workspaces]]
+key = "gust"
+required = false
+
+[[queries]]
+workspace = "self"
+query = "find evaluator"
+expected_paths = ["src/evaluate.rs"]
+
+[[queries]]
+workspace = "gust"
+query = "find evaluator"
+expected_paths = ["src/evaluate.rs"]
+"#,
+    )
+    .unwrap();
+    let definition = load_definition(&definition_path).unwrap();
+    assert_eq!(
+        definition
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.key.as_str(), workspace.required))
+            .collect::<Vec<_>>(),
+        [("self", true), ("gust", false)]
+    );
+    assert_eq!(definition.queries.len(), 2);
+    assert_eq!(definition.queries[0].workspace, "self");
+    assert_eq!(definition.queries[1].workspace, "gust");
+    assert_eq!(definition.queries[1].expected_paths, ["src/evaluate.rs"]);
+
     let required_failure = QueryReport::failed(
-        query.clone(),
+        definition.queries[0].clone(),
         "required workspace \"self\" not provided".to_owned(),
     );
-    let mut optional_query = query;
-    optional_query.workspace = "gust".to_owned();
-    let optional_skip = QueryReport::skipped(
-        optional_query,
+    let mut optional_skip = QueryReport::skipped(
+        definition.queries[1].clone(),
         "optional workspace \"gust\" not provided".to_owned(),
     );
+    // A skipped query is left out of every rate and of the role totals. Give it
+    // a perfect hit with three source results, so that counting it by mistake
+    // would change each figure below.
+    optional_skip.metrics.hit_at_1 = true;
+    optional_skip.metrics.reciprocal_rank = 1.0;
+    optional_skip.metrics.role_distribution =
+        std::collections::BTreeMap::from([("source".to_owned(), 3)]);
     let report = aggregate(&[required_failure, optional_skip]);
 
     assert_eq!(report.query_count, 2);
@@ -109,9 +153,14 @@ fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["queries"][0]["outcome"], "failure");
     assert_eq!(json["queries"][1]["outcome"], "skipped");
-    assert!(json.get("hit_at_1_rate").is_some());
-    assert!(json.get("mrr").is_some());
-    assert!(json.get("role_distribution").is_some());
+    // One query was executed (the failure; the skip is excluded) and it found
+    // nothing: hit@1 is 0 of 1 = 0.0, MRR is its reciprocal rank 0.0 / 1 = 0.0,
+    // and the failure has no results, so no role was seen. Counting the skip
+    // would give 1/2, (0.0 + 1.0) / 2 and {"source": 3}. The values are
+    // numbers, not null, which `get(..).is_some()` could not tell.
+    assert_eq!(json["hit_at_1_rate"], json!(0.0));
+    assert_eq!(json["mrr"], json!(0.0));
+    assert_eq!(json["role_distribution"], json!({}));
     // A report that saw no language-server budget hit and primed nothing says
     // so: the count is always there, the priming block only when it has content.
     assert_eq!(json["lsp_budget_hit_queries"], 0);
@@ -138,15 +187,6 @@ fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
         serde_json::from_value(older).unwrap();
     assert_eq!(older.lsp_budget_hit_queries, 0);
     assert!(!older.queries[0].metrics.lsp_budget_hit);
-
-    let definition = EvaluationFile {
-        workspaces: vec![EvalWorkspace {
-            key: "self".to_owned(),
-            required: true,
-        }],
-        queries: Vec::new(),
-    };
-    assert!(definition.workspaces[0].required);
 }
 
 #[test]
