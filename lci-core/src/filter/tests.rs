@@ -247,6 +247,9 @@ fn markdown_files_are_documentation_regardless_of_directory() {
         "build/notes.md",
         r"docs\sub\page.md",
         ".agents/skills/x/SKILL.md",
+        // The extension folds case (N94); the directory rules do not decide.
+        "tests/README.MD",
+        "src/Guide.Md",
     ] {
         assert_eq!(
             classify_source_role(path),
@@ -256,7 +259,6 @@ fn markdown_files_are_documentation_regardless_of_directory() {
     }
     for (path, role) in [
         // Not a registered extension: the directory rules still decide.
-        ("tests/README.MD", SourceRole::Test),
         ("tests/notes.markdown", SourceRole::Test),
         ("examples/page.mdx", SourceRole::Example),
         ("tests/md", SourceRole::Test),
@@ -270,6 +272,39 @@ fn markdown_files_are_documentation_regardless_of_directory() {
     ] {
         assert_eq!(classify_source_role(path), role, "{path}");
     }
+}
+
+/// A source file's role does not depend on the case of its extension (N94):
+/// `lib_test.RS` is a Rust test file, `api.generated.TSX` is generated. The
+/// stem and the directory names stay case-sensitive.
+#[test]
+fn a_mixed_case_extension_has_the_role_of_the_lowercase_one() {
+    for (upper, lower) in [
+        ("src/lib_test.RS", "src/lib_test.rs"),
+        ("src/tests.Rs", "src/tests.rs"),
+        ("tools/Check.Py", "tools/check.py"),
+        ("src/test_util.PY", "src/test_util.py"),
+        ("web/app.test.TS", "web/app.test.ts"),
+        ("web/api.generated.TSX", "web/api.generated.tsx"),
+        ("bench/Run.GO", "bench/run.go"),
+        ("src/widget_test.CPP", "src/widget_test.cpp"),
+        ("src/parser_bench.RS", "src/parser_bench.rs"),
+        ("config/Types.CS", "config/types.cs"),
+        ("src/Docs/Guide.MD", "src/Docs/Guide.md"),
+    ] {
+        assert_eq!(
+            classify_source_role(upper),
+            classify_source_role(lower),
+            "{upper}"
+        );
+    }
+    assert_eq!(classify_source_role("src/lib_test.RS"), SourceRole::Test);
+    assert_eq!(
+        classify_source_role("web/api.generated.TSX"),
+        SourceRole::Generated
+    );
+    // Only the extension folds: a capitalised stem marker is still not one.
+    assert_eq!(classify_source_role("src/lib_TEST.RS"), SourceRole::Source);
 }
 
 #[test]

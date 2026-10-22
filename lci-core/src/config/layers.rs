@@ -1328,6 +1328,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "`.args` and `.disabled` end a configuration key, not a file name"
+    )]
     fn every_machine_key_is_accepted_in_an_overlay() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();

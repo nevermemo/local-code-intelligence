@@ -2394,9 +2394,9 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
         "src/lib.rs",
         "pub fn quarantine_policy_checker() -> u32 {\n    1\n}\n",
     );
-    // Case variants and other prose extensions are not indexed, and the
-    // shared ignore files apply to Markdown like to code.
-    write(&workspace, "UPPER.MD", "# Upper\nnot indexed\n");
+    // Other prose extensions are not indexed (a case variant of `.md` is,
+    // N94: `chunk::tests`), and the shared ignore files apply to Markdown
+    // like to code.
     write(&workspace, "notes.markdown", "# Long\nnot indexed\n");
     write(&workspace, "page.mdx", "# Mdx\nnot indexed\n");
     write(&workspace, ".gitignore", "built/\n");
@@ -2472,7 +2472,6 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
     assert!(found.results.iter().chain(docs.results.iter()).all(|hit| {
         !hit.chunk.relative_file_path.contains("secret")
             && !hit.chunk.relative_file_path.contains("built")
-            && !hit.chunk.relative_file_path.contains("UPPER")
     }));
 
     // `markdown` is a language filter value, and the role filter agrees.
@@ -2836,7 +2835,7 @@ async fn by_default_markdown_is_not_indexed_and_the_results_equal_a_workspace_wi
         manifest
             .files
             .iter()
-            .all(|file| !file.relative_file_path.ends_with(".md"))
+            .all(|file| !lci_core::path::has_extension_ignore_case(&file.relative_file_path, "md"))
     );
     let role = app
         .search_with_filters(

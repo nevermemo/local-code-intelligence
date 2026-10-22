@@ -16,6 +16,7 @@
 use crate::config::TypeScriptLspConfig;
 use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
+use crate::path::has_extension_ignore_case;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -183,14 +184,14 @@ impl LspAdapter for TypeScriptServer {
 /// extension (matching the Tree-sitter language identifiers this adapter
 /// covers, translated to the LSP-standard `*react` ids for JSX/TSX).
 fn language_id_for(relative: &str) -> &'static str {
-    match Path::new(relative)
-        .extension()
-        .and_then(|extension| extension.to_str())
-    {
-        Some("ts") => "typescript",
-        Some("tsx") => "typescriptreact",
-        Some("jsx") => "javascriptreact",
-        _ => "javascript",
+    if has_extension_ignore_case(relative, "ts") {
+        "typescript"
+    } else if has_extension_ignore_case(relative, "tsx") {
+        "typescriptreact"
+    } else if has_extension_ignore_case(relative, "jsx") {
+        "javascriptreact"
+    } else {
+        "javascript"
     }
 }
 
@@ -233,6 +234,11 @@ mod tests {
         assert_eq!(language_id_for("src/a.tsx"), "typescriptreact");
         assert_eq!(language_id_for("src/a.jsx"), "javascriptreact");
         assert_eq!(language_id_for("src/a.js"), "javascript");
+        // The extension folds case (N94).
+        assert_eq!(language_id_for("src/A.TS"), "typescript");
+        assert_eq!(language_id_for("src/A.Tsx"), "typescriptreact");
+        assert_eq!(language_id_for("src/A.JSX"), "javascriptreact");
+        assert_eq!(language_id_for("src/A.JS"), "javascript");
         contract::assert_initialize_params_name_this_process(
             &usable,
             tempfile::tempdir().unwrap().path(),

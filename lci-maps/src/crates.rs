@@ -88,7 +88,10 @@ impl CrateNames {
     pub fn read_paths(root: &Path, paths: &[&str]) -> Self {
         Self::read_directories(
             root,
-            paths.iter().copied().filter(|path| path.ends_with(".rs")),
+            paths
+                .iter()
+                .copied()
+                .filter(|path| lci_core::path::has_extension_ignore_case(path, "rs")),
         )
     }
 

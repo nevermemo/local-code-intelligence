@@ -150,7 +150,9 @@ impl Candidates for Ripgrep {
             .map(|hit| hit.relative_path)
             .filter(|path| {
                 let extension = path.rsplit('.').next().unwrap_or_default();
-                extensions.contains(&extension)
+                extensions
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(extension))
             })
             .collect();
         if files.is_empty()

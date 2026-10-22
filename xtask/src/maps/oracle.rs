@@ -59,7 +59,7 @@ impl Region {
             if file.len() > MAX_GLOB {
                 bail!("region file path longer than {MAX_GLOB} characters: {file}");
             }
-            if !file.ends_with(".rs") {
+            if !lci_core::path::has_extension_ignore_case(file, "rs") {
                 continue;
             }
             let module = rust_module_path(file).join("/");

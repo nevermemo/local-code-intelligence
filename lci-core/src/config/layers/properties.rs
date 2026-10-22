@@ -205,6 +205,10 @@ fn toml_text(values: &BTreeMap<String, Value>) -> String {
 }
 
 #[test]
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "`.args` ends a configuration key, not a file name"
+)]
 fn each_key_takes_the_highest_layer_that_sets_it() {
     const SEEDS: u64 = 200;
     let defaults: BTreeMap<String, Value> = {

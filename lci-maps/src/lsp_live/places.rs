@@ -121,7 +121,11 @@ impl OutlinePlaces {
     /// empty for any other file, without a tree, or when the file cannot be
     /// read or parsed.
     fn declarations(&self, path: &str) -> Vec<Declared> {
-        let Some(root) = self.tree.as_deref().filter(|_| path.ends_with(".rs")) else {
+        let Some(root) = self
+            .tree
+            .as_deref()
+            .filter(|_| lci_core::path::has_extension_ignore_case(path, "rs"))
+        else {
             return Vec::new();
         };
         let Ok(bytes) = std::fs::read(root.join(path)) else {
