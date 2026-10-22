@@ -100,6 +100,30 @@ impl fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+/// A request that ended because the server sent nothing for the whole
+/// inactivity timeout (`lsp_timeout_seconds`): the root cause of the
+/// `anyhow::Error` [`JsonRpcClient::request`] returns then, and of nothing
+/// else. It tells a server that is slow (a start that outlasted the bound) from
+/// one that is gone (exited, closed its pipe, broke the protocol), which
+/// carries none: `error.chain().any(|cause| cause.is::<InactivityTimeout>())`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InactivityTimeout {
+    pub(crate) label: String,
+    pub(crate) seconds: u64,
+}
+
+impl fmt::Display for InactivityTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} request timed out after {} seconds of inactivity",
+            self.label, self.seconds
+        )
+    }
+}
+
+impl std::error::Error for InactivityTimeout {}
+
 /// Configuration for spawning a JSON-RPC over stdio process.
 pub struct TransportConfig {
     pub executable: String,
@@ -397,6 +421,19 @@ impl JsonRpcClient {
     /// entry removed and a `$/cancelRequest` sent so the server can stop the
     /// work, and the connection stays usable for the next caller.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_within(method, params, self.timeout).await
+    }
+
+    /// [`Self::request`] with `bound` as the inactivity bound in place of the
+    /// connection's own timeout. Only the server's `initialize` uses a bound of
+    /// its own (`lsp_start_timeout_seconds`); every other request keeps
+    /// [`Self::request`].
+    pub async fn request_within(
+        &self,
+        method: &str,
+        params: Value,
+        bound: Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
@@ -434,15 +471,14 @@ impl JsonRpcClient {
             let last_activity = *self.last_activity.lock().unwrap();
             // At most `LONGEST_WAIT` on: a timeout too long for the clock
             // (`Duration::MAX`) must not make the sum panic.
-            let deadline = last_activity.max(started) + self.timeout.min(LONGEST_WAIT);
+            let deadline = last_activity.max(started) + bound.min(LONGEST_WAIT);
             let now = Instant::now();
             if now >= deadline {
                 self.pending.lock().await.remove(&id);
-                break Err(anyhow::anyhow!(
-                    "{} request timed out after {} seconds of inactivity",
-                    self.label,
-                    self.timeout.as_secs()
-                ));
+                break Err(anyhow::Error::new(InactivityTimeout {
+                    label: self.label.clone(),
+                    seconds: bound.as_secs(),
+                }));
             }
             tokio::select! {
                 result = &mut receiver => {

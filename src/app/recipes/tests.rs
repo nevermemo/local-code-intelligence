@@ -1355,6 +1355,10 @@ async fn flow_from_runs_the_same_with_the_lsp_request_switches_on() {
             call_hierarchy: true,
             ..lci_core::config::LspProfile::default()
         },
+        lci_core::config::LspProfile {
+            breaker: true,
+            ..lci_core::config::LspProfile::default()
+        },
     ];
     for lsp in profiles {
         let on = Tree::new()
