@@ -365,7 +365,7 @@ impl ManagedServer {
 
     /// BFS over the process table for every descendant PID of `root`, at any
     /// depth, using one already-refreshed `System` snapshot.
-    fn descendants_of(system: &System, root: u32) -> Vec<u32> {
+    pub(crate) fn descendants_of(system: &System, root: u32) -> Vec<u32> {
         let mut frontier = vec![root];
         let mut found = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -447,11 +447,40 @@ pub struct McpSession {
     base: String,
     session_id: String,
     next_id: i64,
+    /// The `serverInfo` of the `initialize` result; `Null` after [`connect`],
+    /// read by [`connect_with`].
+    server_info: Value,
+}
+
+/// The JSON-RPC envelopes of an MCP HTTP response body: either one JSON
+/// document or an event stream whose `data:` lines hold one envelope each.
+pub fn mcp_envelopes(body: &str) -> Vec<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+        return vec![value];
+    }
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .collect()
 }
 
 impl McpSession {
     pub async fn connect(base: &str) -> Result<Self> {
-        let client = reqwest::Client::new();
+        Self::connect_inner(base, None, false).await
+    }
+
+    /// Like [`connect`], with a per-request `timeout` on the client and the
+    /// server's `serverInfo` read from the `initialize` response.
+    pub async fn connect_with(base: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_inner(base, Some(timeout), true).await
+    }
+
+    async fn connect_inner(base: &str, timeout: Option<Duration>, read_info: bool) -> Result<Self> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build().context("build the mcp http client")?;
         let response = client
             .post(format!("{base}/mcp"))
             .header("Accept", "application/json, text/event-stream")
@@ -474,11 +503,21 @@ impl McpSession {
             .context("initialize response missing mcp-session-id")?
             .to_str()?
             .to_string();
+        let server_info = if read_info {
+            let body = response.text().await.context("read the initialize body")?;
+            mcp_envelopes(&body)
+                .iter()
+                .find_map(|e| e.pointer("/result/serverInfo").cloned())
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
         let session = Self {
             client,
             base: base.to_string(),
             session_id,
             next_id: 2,
+            server_info,
         };
         session
             .client
@@ -490,6 +529,38 @@ impl McpSession {
             .await
             .context("mcp initialized notification")?;
         Ok(session)
+    }
+
+    /// The `serverInfo` the server answered `initialize` with (`Null` for a
+    /// session made by [`McpSession::connect`]).
+    pub fn server_info(&self) -> &Value {
+        &self.server_info
+    }
+
+    /// The names of the tools the server offers (`tools/list`, first page).
+    pub async fn tools_list(&mut self) -> Result<Vec<String>> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self
+            .client
+            .post(format!("{}/mcp", self.base))
+            .header("Accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &self.session_id)
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}))
+            .send()
+            .await
+            .context("mcp tools/list")?;
+        let body = response.text().await?;
+        let tools = mcp_envelopes(&body)
+            .iter()
+            .find_map(|e| e.pointer("/result/tools").cloned())
+            .with_context(|| format!("tools/list answered no tools: {body}"))?;
+        Ok(tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect())
     }
 
     /// Calls an MCP tool and returns its raw JSON-RPC response body as text.

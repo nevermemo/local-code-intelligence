@@ -170,7 +170,7 @@ pub(super) fn needles_of(question: &str) -> (Vec<String>, NeedleSource) {
 }
 
 /// The file globs of every language adapter, once each.
-fn globs() -> Vec<&'static str> {
+pub(super) fn globs() -> Vec<&'static str> {
     let mut globs: Vec<&'static str> = language::ADAPTERS.iter().map(|a| a.glob()).collect();
     globs.sort_unstable();
     globs.dedup();
@@ -351,7 +351,12 @@ pub(super) fn rank_where_to(lines: &[RgLine], top_k: usize, decl_first: bool) ->
     cut(ranked.into_iter().map(|r| answer(r.3)).collect(), top_k)
 }
 
-fn answers_for(set: Set, lines: &[RgLine], top_k: usize, decl_first: bool) -> Vec<Value> {
+pub(super) fn answers_for(
+    set: Set,
+    lines: &[RgLine],
+    top_k: usize,
+    decl_first: bool,
+) -> Vec<Value> {
     match set {
         Set::WhereTo => rank_where_to(lines, top_k, decl_first),
         _ => rank_traits(lines, top_k, decl_first),
@@ -441,7 +446,7 @@ pub(super) fn regex_query(question: &str) -> Option<RegexQuery> {
 
 /// Escapes a name for a regex: every character that is not a word character
 /// gets a backslash.
-fn regex_escape(name: &str) -> String {
+pub(super) fn regex_escape(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if !(c.is_alphanumeric() || c == '_') {
@@ -467,7 +472,7 @@ fn is_word(c: char) -> bool {
 }
 
 /// `\bword\b` occurs in `hay`.
-fn has_word(hay: &str, word: &str) -> bool {
+pub(super) fn has_word(hay: &str, word: &str) -> bool {
     hay.match_indices(word).any(|(at, _)| {
         !hay[..at].chars().next_back().is_some_and(is_word)
             && !hay[at + word.len()..].chars().next().is_some_and(is_word)
@@ -696,7 +701,7 @@ fn rg_version(rg: &Path) -> Result<String> {
 
 /// The set's gold items as the bench reads them: prepared (traits gets its
 /// `dominant_site`, so `nodom_*` scores exist) before the `--limit` cut.
-fn load_items(set: Set, gold_dir: &Path, limit: Option<usize>) -> Result<Vec<Value>> {
+pub(super) fn load_items(set: Set, gold_dir: &Path, limit: Option<usize>) -> Result<Vec<Value>> {
     let items = gold::load_gold(&gold_dir.join(format!("{}.json", set_name(set))))?;
     Ok(select_items(set, gold::prepare(set, items), limit, None))
 }
