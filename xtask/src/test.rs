@@ -219,6 +219,7 @@ fn focused_invocations(suite: Suite) -> Option<Vec<Vec<&'static str>>> {
         Suite::Lsp => vec![
             lib("lsp::"),
             integration("navigation::"),
+            integration("markdown_lsp::"),
             integration("lsp_concurrent_open::"),
             integration("navigation_barrier::"),
             integration("lsp_breaker::"),
@@ -392,7 +393,7 @@ mod tests {
             ]]
         );
         assert_eq!(args(Suite::Config).len(), 3);
-        assert_eq!(args(Suite::Lsp).len(), 5);
+        assert_eq!(args(Suite::Lsp).len(), 6);
     }
 
     #[test]

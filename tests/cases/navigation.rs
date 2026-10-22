@@ -3245,7 +3245,7 @@ async fn manager_readiness_reports_starting_then_ready_and_the_status_shows_it()
     let wire = serde_json::to_value(&status).unwrap();
     assert_eq!(wire["analyzers"]["csharp-ls"]["state"], "ready", "{wire}");
     assert!(wire["analyzers"]["rust-analyzer"].is_null(), "{wire}");
-    assert_eq!(wire["analyzers"].as_object().unwrap().len(), 7, "{wire}");
+    assert_eq!(wire["analyzers"].as_object().unwrap().len(), 8, "{wire}");
     models_task.abort();
 
     // A server that cannot be started is `failed`.
@@ -3295,6 +3295,7 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
         "csharp-ls",
         "gopls",
         "jdtls",
+        "marksman",
         "pyright",
         "rust-analyzer",
         "typescript-language-server",

@@ -185,6 +185,7 @@ impl App {
             config.go.path.as_ref(),
             config.java.path.as_ref(),
             config.clangd.path.as_ref(),
+            config.markdown.path.as_ref(),
         ];
         for executable in executables.into_iter().flatten() {
             if Path::new(executable).is_absolute() {

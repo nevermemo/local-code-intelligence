@@ -110,8 +110,8 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   term; at most 12 terms score, rarest first (`MAX_SCORING_TERMS`). Capped at `lexical_candidate_count` (40). `rg` is
   not given `--hidden` or `.lciignore`, so it skips hidden files the scanner indexes (those drop out because only lines
   inside indexed chunks count), and it reads the live tree while chunks come from the snapshot, so line ranges can drift under `manual` or `watch` freshness.
-- **LSP channel** (`lci-core` `lsp`): answers are merged query by query across providers and first-seen order decides the LSP rank (`lsp_channel` in `src/app/search.rs`). `LspAdapter` is a trait-object registry; `Manager` holds 7 adapters (rust-analyzer,
-  csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd), sessions keyed by `(provider, workspace_id)`,
+- **LSP channel** (`lci-core` `lsp`): answers are merged query by query across providers and first-seen order decides the LSP rank (`lsp_channel` in `src/app/search.rs`). `LspAdapter` is a trait-object registry; `Manager` holds 8 adapters (rust-analyzer,
+  csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, marksman), sessions keyed by `(provider, workspace_id)`,
   started on a detached task shared by concurrent callers (its `initialize` is bounded by `lsp_start_timeout_seconds`,
   default 0 = `lsp_timeout_seconds`, like every later request) and primed with one background `workspace/symbol`. Idle
   sessions are released after `lsp_idle_timeout_seconds` (1800) and a session that answers only transient errors for
@@ -120,7 +120,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   `#`, plus a singular form for plurals), providers in parallel, each under `lsp_search_budget_ms` (1500); a provider
   over budget adds a note, a provider that fails adds a warning; locations map onto chunks of the same language that
   contain `start_line`; capped at `lsp_candidate_count` (40). Navigation tools (`symbols`, `definition`, `references`)
-  are not fused, return raw `Location`s and need an index containing the file's language. The `lsp.live` map of a
+  are not fused, return raw `Location`s and need an index containing the file's language. A server whose symbols are not code names (marksman: headings) opts out of the search channel (`LspAdapter::joins_search_channel`, default true) and is reached by navigation only. The `lsp.live` map of a
   traversal (`lci-maps` `lsp_live`) asks the `Manager`s it is given: `ManagerBackend::open(workspace, Arc<Manager>)` (one for every server) or `ManagerBackend::open_split(workspace, shared, own, probe)`, which probes through `shared` and routes each server to `shared` when `LspAdapter::watches_workspace()` (rust-analyzer alone: it runs its own file watcher) or `shared` syncs (`sync = "watch"`), else to `own`; a server routed to `shared` first passes `Manager::tree_barrier` once per walk, which stats the server's indexed files, their directories and ancestors and its manifests (`lsp::stamp`, from the index's file list that `App` supplies through `stamp::IndexedFiles` over the workspace manifest) and stops the session when the stamp changed, so the walk starts one that reads the disk. Navigation and the search channel pass the same barrier, once per call, and carry the same notes (`lsp:` for `lsp.live:`; `NavigationReport.notes`, `SearchReport.notes`). Under
   `[run_profile.lsp] sessions = "per_call"` `app::traverse::run` builds one per call, so the map owns it and its
   server dies with the map; under `"shared"` (default) it uses `Call.lsp_sessions` as `shared` and a per-call manager as `own`, so a server that does not see an edit on its own (or lists no configuration files for the tree stamp) starts per call, and a reused server is never staler than `per_call` for any change inside the tree stamp's coverage (its residuals are in the README; the walk labels a reused server's answer with a `kept session` note); `Call.lsp_sessions` is the `Arc<Manager>` that `App::language_servers()`
@@ -137,7 +137,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   one call is skipped by the next; `/ready` probes the adapters directly and never reads them. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
   `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the
   manager an outline cache, used only for adapters whose `LspAdapter::opens_documents()` is true (pyright, gopls,
-  jdtls, clangd: the hook resends the disk text and the server takes it): `Manager::document_symbols` keys each
+  jdtls, clangd, marksman: the hook resends the disk text and the server takes it): `Manager::document_symbols` keys each
   non-empty answer by (provider, workspace id, path),
   `lsp::content_hash` of the file (`workspace::hash`, as the manifest) and the id of the server session that gave it,
   at most `MAX_CACHED_OUTLINES` (4096) entries. With `[run_profile.lsp] implementations = true`
