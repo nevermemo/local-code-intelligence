@@ -421,6 +421,19 @@ impl JsonRpcClient {
     /// entry removed and a `$/cancelRequest` sent so the server can stop the
     /// work, and the connection stays usable for the next caller.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_within(method, params, self.timeout).await
+    }
+
+    /// [`Self::request`] with `bound` as the inactivity bound in place of the
+    /// connection's own timeout. Only the server's `initialize` uses a bound of
+    /// its own (`lsp_start_timeout_seconds`); every other request keeps
+    /// [`Self::request`].
+    pub async fn request_within(
+        &self,
+        method: &str,
+        params: Value,
+        bound: Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
@@ -458,13 +471,13 @@ impl JsonRpcClient {
             let last_activity = *self.last_activity.lock().unwrap();
             // At most `LONGEST_WAIT` on: a timeout too long for the clock
             // (`Duration::MAX`) must not make the sum panic.
-            let deadline = last_activity.max(started) + self.timeout.min(LONGEST_WAIT);
+            let deadline = last_activity.max(started) + bound.min(LONGEST_WAIT);
             let now = Instant::now();
             if now >= deadline {
                 self.pending.lock().await.remove(&id);
                 break Err(anyhow::Error::new(InactivityTimeout {
                     label: self.label.clone(),
-                    seconds: self.timeout.as_secs(),
+                    seconds: bound.as_secs(),
                 }));
             }
             tokio::select! {
