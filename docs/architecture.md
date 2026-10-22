@@ -112,7 +112,8 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   inside indexed chunks count), and it reads the live tree while chunks come from the snapshot, so line ranges can drift under `manual` or `watch` freshness.
 - **LSP channel** (`lci-core` `lsp`): answers are merged query by query across providers and first-seen order decides the LSP rank (`lsp_channel` in `src/app/search.rs`). `LspAdapter` is a trait-object registry; `Manager` holds 8 adapters (rust-analyzer,
   csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, marksman), sessions keyed by `(provider, workspace_id)`,
-  started on a detached task shared by concurrent callers and primed with one background `workspace/symbol`. Idle
+  started on a detached task shared by concurrent callers (its `initialize` is bounded by `lsp_start_timeout_seconds`,
+  default 0 = `lsp_timeout_seconds`, like every later request) and primed with one background `workspace/symbol`. Idle
   sessions are released after `lsp_idle_timeout_seconds` (1800) and a session that answers only transient errors for
   `lsp_stuck_seconds` (900) is replaced. Requests: `symbols` (`workspace/symbol`), `definition`, `references`, all
   returning `Location` (path, range, name, kind, language, provider). Search use: up to 8 symbol queries (a term plus

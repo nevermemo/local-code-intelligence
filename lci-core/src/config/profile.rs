@@ -523,6 +523,7 @@ pub const EXCLUDED_KEYS: &[&str] = &[
     "reranker_timeout_seconds",
     "readiness_timeout_seconds",
     "lsp_timeout_seconds",
+    "lsp_start_timeout_seconds",
     "lsp_search_budget_ms",
     "lsp_idle_timeout_seconds",
     "lsp_stuck_seconds",
@@ -732,6 +733,7 @@ mod tests {
         config.rust_analyzer_path = "ra2".into();
         config.rust_analyzer_trusted = true;
         config.lsp_timeout_seconds = 11;
+        config.lsp_start_timeout_seconds = 19;
         config.lsp_search_budget_ms = 12;
         config.lsp_idle_timeout_seconds = 13;
         config.lsp_stuck_seconds = 14;

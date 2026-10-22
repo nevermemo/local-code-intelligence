@@ -58,15 +58,142 @@ pub enum LoadChoice {
     Both,
 }
 
+/// The language adapter whose server `lsp.live` is measured on (K11d-2a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Adapter {
+    Rust,
+    Python,
+    Go,
+    Typescript,
+    Java,
+    C,
+    Cpp,
+    Csharp,
+}
+
+impl Adapter {
+    #[cfg(test)]
+    pub const ALL: [Adapter; 8] = [
+        Adapter::Rust,
+        Adapter::Python,
+        Adapter::Go,
+        Adapter::Typescript,
+        Adapter::Java,
+        Adapter::C,
+        Adapter::Cpp,
+        Adapter::Csharp,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Adapter::Rust => "rust",
+            Adapter::Python => "python",
+            Adapter::Go => "go",
+            Adapter::Typescript => "typescript",
+            Adapter::Java => "java",
+            Adapter::C => "c",
+            Adapter::Cpp => "cpp",
+            Adapter::Csharp => "csharp",
+        }
+    }
+
+    /// The config section holding the adapter's `path` (the acceptance fixtures
+    /// write the same sections); rust has none, it uses `rust_analyzer_path`.
+    pub fn section(self) -> Option<&'static str> {
+        match self {
+            Adapter::Rust => None,
+            Adapter::Python => Some("python"),
+            Adapter::Go => Some("go"),
+            Adapter::Typescript => Some("typescript"),
+            Adapter::Java => Some("java"),
+            Adapter::C | Adapter::Cpp => Some("clangd"),
+            Adapter::Csharp => Some("csharp"),
+        }
+    }
+
+    /// The `which` name used when `--server` is not given (jdtls has none: it
+    /// is an install directory).
+    pub fn default_server(self) -> Option<&'static str> {
+        match self {
+            Adapter::Rust => Some("rust-analyzer"),
+            Adapter::Python => Some("pyright-langserver"),
+            Adapter::Go => Some("gopls"),
+            Adapter::Typescript => Some("typescript-language-server"),
+            Adapter::Java => None,
+            Adapter::C | Adapter::Cpp => Some("clangd"),
+            Adapter::Csharp => Some("csharp-ls"),
+        }
+    }
+
+    /// Process names (substring, case-insensitive) of the language server in
+    /// the process tree of `serve`: pyright and typescript-language-server run
+    /// on `node`, jdtls on `java`.
+    pub fn rss_names(self) -> &'static [&'static str] {
+        match self {
+            Adapter::Rust => &["rust-analyzer"],
+            Adapter::Python | Adapter::Typescript => &["node"],
+            Adapter::Go => &["gopls"],
+            Adapter::C | Adapter::Cpp => &["clangd"],
+            Adapter::Csharp => &["csharp-ls"],
+            Adapter::Java => &["java"],
+        }
+    }
+
+    /// Whether `<server> --version` is a real probe: pyright-langserver has no
+    /// such flag and jdtls is a directory.
+    pub fn has_version_flag(self) -> bool {
+        !matches!(self, Adapter::Python | Adapter::Java)
+    }
+}
+
+/// The server the arms configure: `--server`, else the adapter's default name
+/// (rust: `--rust-analyzer`); jdtls has no default.
+pub fn resolve_server(
+    adapter: Adapter,
+    server: Option<&str>,
+    rust_analyzer: &str,
+) -> Result<String> {
+    if let Some(server) = server {
+        return Ok(server.to_owned());
+    }
+    if adapter == Adapter::Rust {
+        return Ok(rust_analyzer.to_owned());
+    }
+    adapter.default_server().map(str::to_owned).ok_or_else(|| {
+        anyhow!(
+            "--adapter {} has no default server: pass --server <path> (jdtls: its install directory)",
+            adapter.name()
+        )
+    })
+}
+
+/// True when a process named `process_name` is one of `names` (substring,
+/// case-insensitive).
+pub fn rss_name_matches(process_name: &str, names: &[&str]) -> bool {
+    let lower = process_name.to_ascii_lowercase();
+    names.iter().any(|name| lower.contains(name))
+}
+
 #[derive(Args, Debug)]
 pub struct LspCostArgs {
     /// Tree to walk and serve (default: this repository).
     #[arg(long)]
     pub tree: Option<PathBuf>,
     /// SCIP index of the tree. Missing: `rust-analyzer scip` writes it into the
-    /// output directory (the report says so). Default: `<tree>/index.scip`.
+    /// output directory (the report says so); for a non-rust `--adapter` an
+    /// empty `index.scip` is written there instead (scip maps give nothing).
+    /// Default: `<tree>/index.scip`.
     #[arg(long)]
     pub scip: Option<PathBuf>,
+    /// Language adapter whose server is measured. The tree must hold that
+    /// language's files; the arms write `[<section>] path = '<server>'`.
+    #[arg(long, value_enum, default_value = "rust")]
+    pub adapter: Adapter,
+    /// The adapter's server, the `[<section>] path` of the arms (default: its
+    /// name on PATH; jdtls has none and needs its install directory). For rust
+    /// it overrides `--rust-analyzer`.
+    #[arg(long)]
+    pub server: Option<String>,
     /// JSON list of `{id, question}` (default: the committed list).
     #[arg(long)]
     pub questions: Option<PathBuf>,
@@ -90,7 +217,7 @@ pub struct LspCostArgs {
     /// Request deadline of every call, ms (the config cap is the same).
     #[arg(long, default_value_t = 20_000)]
     pub deadline_ms: u64,
-    /// Timed `<rust-analyzer> --version` runs per condition.
+    /// Timed `<server> --version` runs per condition (none for pyright and jdtls).
     #[arg(long, default_value_t = 20)]
     pub probe_runs: usize,
     /// Calls of the N8 window (the first calls of the `shared` arm).
@@ -235,6 +362,9 @@ pub struct ConfigCtx {
     pub scip_index: PathBuf,
     pub rust_analyzer: String,
     pub deadline_ms: u64,
+    /// The measured adapter and its server (`--server`, else the default).
+    pub adapter: Adapter,
+    pub server: String,
 }
 
 fn toml_path(path: &Path) -> String {
@@ -263,6 +393,13 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
         ctx.deadline_ms
     );
     text.push_str("\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n");
+    if let Some(section) = ctx.adapter.section() {
+        let _ = write!(
+            text,
+            "\n[{section}]\npath = '{}'\n",
+            ctx.server.replace('\\', "/")
+        );
+    }
     let overlay = arm_overlay_lines(arm);
     if !overlay.is_empty() {
         text.push_str("\n[run_profile.lsp]\n");
@@ -668,7 +805,7 @@ pub fn report_table(rows: &[ArmSummary]) -> String {
     let base = rows.iter().find(|row| row.arm == "base");
     let mut out = String::new();
     out.push_str(
-        "| arm | calls (failed) | cold lsp ms/exp | warm p50 | warm p95 | diff p50 vs base | repeat p50 | exp/call | ext/call | ext/exp | pops/call | pops per 5 s | RA RSS MB | server RSS MB | deadline | lsp deadline | unavailable | fail-open | probe ms p50/p95/max (n) |\n",
+        "| arm | calls (failed) | cold lsp ms/exp | warm p50 | warm p95 | diff p50 vs base | repeat p50 | exp/call | ext/call | ext/exp | pops/call | pops per 5 s | server RSS MB | serve RSS MB | deadline | lsp deadline | unavailable | fail-open | probe ms p50/p95/max (n) |\n",
     );
     out.push_str(
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
@@ -908,9 +1045,9 @@ async fn spawn_server(binary: &Path, config: &Path, dir: &Path) -> Result<Server
     })
 }
 
-/// RSS in MB of the server and of every descendant whose name contains
-/// `rust-analyzer`.
-fn sample_rss(system: &mut System, server_pid: u32) -> (f64, f64) {
+/// RSS in MB of the server (`serve`) and of every descendant whose name
+/// contains one of `names` (the adapter's language server).
+fn sample_rss(system: &mut System, server_pid: u32, names: &[&str]) -> (f64, f64) {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -923,12 +1060,7 @@ fn sample_rss(system: &mut System, server_pid: u32) -> (f64, f64) {
     let ra = descendants_of(system, server_pid)
         .into_iter()
         .filter_map(|pid| system.process(Pid::from_u32(pid)))
-        .filter(|p| {
-            p.name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("rust-analyzer")
-        })
+        .filter(|p| rss_name_matches(&p.name().to_string_lossy(), names))
         .map(|p| mb(p.memory()))
         .sum();
     (ra, server)
@@ -953,7 +1085,7 @@ struct RssSampler {
 }
 
 impl RssSampler {
-    fn start(server_pid: u32) -> Self {
+    fn start(server_pid: u32, names: &'static [&'static str]) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(std::sync::Mutex::new(SamplerPeak::default()));
         let (stop_flag, peak_cell) = (Arc::clone(&stop), Arc::clone(&peak));
@@ -962,7 +1094,7 @@ impl RssSampler {
             system.refresh_cpu_usage();
             while !stop_flag.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
-                let (ra, server) = sample_rss(&mut system, server_pid);
+                let (ra, server) = sample_rss(&mut system, server_pid, names);
                 system.refresh_cpu_usage();
                 let cpu = f64::from(system.global_cpu_usage());
                 if let Ok(mut peak) = peak_cell.lock() {
@@ -980,7 +1112,7 @@ impl RssSampler {
         }
     }
 
-    /// (rust-analyzer family MB peak, server MB peak, mean machine CPU percent)
+    /// (language-server family MB peak, `serve` MB peak, mean machine CPU percent)
     /// since the last call, then reset.
     fn take(&self) -> (f64, f64, f64) {
         let peak = self
@@ -1037,7 +1169,19 @@ async fn wait_for_quiet(label: &str, threshold: f64, max_wait: Duration) -> (f64
     }
 }
 
-/// Times `<rust-analyzer> --version` `runs` times, ms.
+/// The program to run for `server`: a path as given, a name resolved through
+/// PATH (so npm `.cmd` shims work on Windows), else the name itself.
+fn probe_program(server: &str) -> String {
+    if Path::new(server).components().count() > 1 {
+        return server.to_owned();
+    }
+    crate::acceptance::which(server).map_or_else(
+        || server.to_owned(),
+        |path| path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Times `<server> --version` `runs` times, ms.
 fn time_version_probe(binary: &str, runs: usize) -> Vec<f64> {
     (0..runs)
         .filter_map(|_| {
@@ -1095,6 +1239,8 @@ struct RunContext {
     work: PathBuf,
     scip: PathBuf,
     rust_analyzer: String,
+    adapter: Adapter,
+    server: String,
     calls_file: std::fs::File,
 }
 
@@ -1123,12 +1269,14 @@ async fn run_arm(ctx: &mut RunContext, arm: &Arm, condition: &str) -> Result<Vec
                 scip_index: ctx.scip.clone(),
                 rust_analyzer: ctx.rust_analyzer.clone(),
                 deadline_ms: ctx.deadline_ms,
+                adapter: ctx.adapter,
+                server: ctx.server.clone(),
             },
         ),
     )?;
     let mut server = spawn_server(&ctx.binary, &config_path, &arm_dir).await?;
     let base = format!("http://127.0.0.1:{PORT}");
-    let sampler = RssSampler::start(server.pid);
+    let sampler = RssSampler::start(server.pid, ctx.adapter.rss_names());
     let outcome = run_arm_calls(ctx, arm, condition, &tag, &base, &mut server, &sampler).await;
     drop(sampler);
     server.stop().await;
@@ -1520,7 +1668,7 @@ fn deadline_split_lines(arms: &[(Arm, std::result::Result<Vec<Sample>, String>)]
         };
         let rss = |group: &[&Sample]| med(group, &|s| s.rust_analyzer_rss_mb);
         lines.push(format!(
-            "`{}`: {} of {} calls ended before the deadline (median {:.0} expansions, walk {:.1} s, rust-analyzer {:.0} MB); {} ended on it (median {:.0} expansions, walk {:.1} s, rust-analyzer {:.0} MB). Read the row above with the two groups in mind.",
+            "`{}`: {} of {} calls ended before the deadline (median {:.0} expansions, walk {:.1} s, server {:.0} MB); {} ended on it (median {:.0} expansions, walk {:.1} s, server {:.0} MB). Read the row above with the two groups in mind.",
             arm.name,
             finished.len(),
             ok.len(),
@@ -1574,7 +1722,7 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
     for note in &meta.notes {
         let _ = writeln!(out, "- {note}");
     }
-    out.push_str("\nMethod: `serve` on 127.0.0.1:8769 per arm (copied binary, own data dir, vectorless index, semantic/LSP-search/reranker channels off, freshness manual). `lsp.live` joins the walk through `[traverse.policies.explore] extra_maps`. Cold = first call of the arm; warm = every later call; `repeat` = warm calls of round 2 and later (a question asked again). Under `per_call` every call starts its own server, so its cold and warm figures are both cold starts (`base` and `per_call+sync` write `sessions = \"per_call\"`, since the default is `shared`). `ms/exp` = `totals.per_map[\"lsp.live\"].ms / expands`. `pops per 5 s` = total pops / total walk `elapsed_ms` x 5000. RA RSS = peak sum of RSS of the server's descendants named rust-analyzer, max over calls. `fail-open` = calls with a result but no result card naming `lsp.live`. `deadline` = stop_reason deadline; `lsp deadline` = the `lsp.live` deadline note; `unavailable` = the `lsp.live is unavailable` note. `machine CPU %` = mean CPU use of the whole machine while the calls ran (the server and its language server included); `idle CPU` below = the machine's CPU use over 10 s just before the arm's server started, a reading of whatever else runs: above 20% the quiet condition is not quiet. The version probe is memoised for the server's process (d470), so only the first probe of a binary logs a real ms and every arm's later calls log about 0: the older comparison of one probe per call under `base` and one under `shared` no longer applies.\n");
+    out.push_str("\nMethod: `serve` on 127.0.0.1:8769 per arm (copied binary, own data dir, vectorless index, semantic/LSP-search/reranker channels off, freshness manual). `lsp.live` joins the walk through `[traverse.policies.explore] extra_maps`. Cold = first call of the arm; warm = every later call; `repeat` = warm calls of round 2 and later (a question asked again). Under `per_call` every call starts its own server, so its cold and warm figures are both cold starts (`base` and `per_call+sync` write `sessions = \"per_call\"`, since the default is `shared`). `ms/exp` = `totals.per_map[\"lsp.live\"].ms / expands`. `pops per 5 s` = total pops / total walk `elapsed_ms` x 5000. server RSS = peak sum of RSS of the descendants of `serve` named by the adapter (rust-analyzer; `node` for pyright and typescript-language-server; gopls; clangd; csharp-ls; `java` for jdtls), max over calls; serve RSS = the `serve` process itself. `fail-open` = calls with a result but no result card naming `lsp.live`. `deadline` = stop_reason deadline; `lsp deadline` = the `lsp.live` deadline note; `unavailable` = the `lsp.live is unavailable` note. `machine CPU %` = mean CPU use of the whole machine while the calls ran (the server and its language server included); `idle CPU` below = the machine's CPU use over 10 s just before the arm's server started, a reading of whatever else runs: above 20% the quiet condition is not quiet. The version probe is memoised for the server's process (d470), so only the first probe of a binary logs a real ms and every arm's later calls log about 0: the older comparison of one probe per call under `base` and one under `shared` no longer applies.\n");
     for result in results {
         let _ = writeln!(
             out,
@@ -1584,14 +1732,18 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
                 " ({t} busy CPU threads, no disk load)"
             ))
         );
-        let _ = writeln!(
-            out,
-            "`<rust-analyzer> --version`, {} runs: p50 {} ms, p95 {} ms, max {} ms (limit 5000 ms).\n",
-            result.version_probe.len(),
-            fmt_opt(percentile(&result.version_probe, 50.0)),
-            fmt_opt(percentile(&result.version_probe, 95.0)),
-            fmt_opt(percentile(&result.version_probe, 100.0)),
-        );
+        if result.version_probe.is_empty() {
+            out.push_str("`<server> --version`: no timing (the adapter has no `--version` flag, or the run did not time it).\n\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "`<server> --version`, {} runs: p50 {} ms, p95 {} ms, max {} ms (limit 5000 ms).\n",
+                result.version_probe.len(),
+                fmt_opt(percentile(&result.version_probe, 50.0)),
+                fmt_opt(percentile(&result.version_probe, 95.0)),
+                fmt_opt(percentile(&result.version_probe, 100.0)),
+            );
+        }
         let rows: Vec<ArmSummary> = result
             .arms
             .iter()
@@ -1646,7 +1798,7 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
     }
     out.push_str("\n## Skipped\n\n");
     if meta.skipped_servers.is_empty() {
-        out.push_str("- every known language server is on PATH\n");
+        out.push_str("- no language server was found missing from PATH at the start of the run (a non-rust `--adapter` run checks none: its server is the one it was given)\n");
     }
     for server in &meta.skipped_servers {
         let _ = writeln!(
@@ -1704,11 +1856,66 @@ pub fn run(args: LspCostArgs) -> Result<()> {
 
 /// `--report-from`: renders one report from the run directories given.
 fn report_from(dirs: &[PathBuf], out: Option<&Path>) -> Result<()> {
+    let mut loaded = Vec::new();
+    for dir in dirs {
+        loaded.push((dir, read_run_dir(dir)?));
+    }
+    // Arms are merged by name, so runs of different adapters (each has its own
+    // `base`) must not be merged into one another: one report per adapter.
+    let keys: Vec<String> = loaded
+        .iter()
+        .map(|(_, (_, meta))| adapter_key(meta))
+        .collect();
+    let groups = group_indices_by_key(&keys);
+    let mut sections = Vec::new();
+    let mut slots: Vec<Option<(&PathBuf, (RunData, ReportMeta))>> =
+        loaded.into_iter().map(Some).collect();
+    for (key, indices) in &groups {
+        let members: Vec<(&PathBuf, (RunData, ReportMeta))> =
+            indices.iter().filter_map(|i| slots[*i].take()).collect();
+        let mut report = merged_report(members);
+        if groups.len() > 1 {
+            report = report.replacen(" (merged)\n", &format!(" (merged, adapter {key})\n"), 1);
+        }
+        sections.push(report);
+    }
+    let out = out
+        .map(Path::to_path_buf)
+        .or_else(|| dirs.last().cloned())
+        .context("--report-from needs a run directory")?;
+    std::fs::create_dir_all(&out)?;
+    let report = out.join("report-merged.md");
+    std::fs::write(&report, sections.join("\n\n---\n\n"))?;
+    println!("report: {}", report.display());
+    Ok(())
+}
+
+/// The adapter a run directory measured (`rust` for runs before `--adapter`).
+fn adapter_key(meta: &ReportMeta) -> String {
+    meta.summary
+        .iter()
+        .find(|(key, _)| key == "adapter")
+        .map_or_else(|| "rust".to_owned(), |(_, value)| value.clone())
+}
+
+/// Indices grouped by equal key, in the order the keys first appear.
+fn group_indices_by_key(keys: &[String]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        match groups.iter_mut().find(|(k, _)| k == key) {
+            Some((_, indices)) => indices.push(index),
+            None => groups.push((key.clone(), vec![index])),
+        }
+    }
+    groups
+}
+
+/// The merged report text of run directories of one adapter.
+fn merged_report(members: Vec<(&PathBuf, (RunData, ReportMeta))>) -> String {
     let mut runs = Vec::new();
     let mut meta = ReportMeta::default();
     let mut notes = Vec::new();
-    for dir in dirs {
-        let (data, run_meta) = read_run_dir(dir)?;
+    for (dir, (data, run_meta)) in members {
         let arms: Vec<String> = data
             .samples
             .keys()
@@ -1734,15 +1941,17 @@ fn report_from(dirs: &[PathBuf], out: Option<&Path>) -> Result<()> {
     meta.notes = notes;
     meta.stamp = format!("{} (merged)", meta.stamp);
     let results = merge_runs(&runs);
-    let out = out
-        .map(Path::to_path_buf)
-        .or_else(|| dirs.last().cloned())
-        .context("--report-from needs a run directory")?;
-    std::fs::create_dir_all(&out)?;
-    let report = out.join("report-merged.md");
-    std::fs::write(&report, render_report(&meta, &results))?;
-    println!("report: {}", report.display());
-    Ok(())
+    render_report(&meta, &results)
+}
+
+/// The report's SCIP line when a non-rust adapter has no index to walk.
+pub const EMPTY_SCIP_NOTE: &str = "no SCIP index (empty file; scip maps give nothing)";
+
+/// Writes the 0-byte `index.scip` of a non-rust adapter and returns the report's
+/// note for it.
+pub fn write_empty_scip(target: &Path) -> Result<String> {
+    std::fs::write(target, b"").context("write the empty index.scip")?;
+    Ok(EMPTY_SCIP_NOTE.to_owned())
 }
 
 /// The quiet threshold: machine CPU use (percent) below which nothing else is running.
@@ -1784,6 +1993,14 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         bail!("no questions or --repeat 0");
     }
     let arms = select_arms(&args.arms)?;
+    let server = resolve_server(args.adapter, args.server.as_deref(), &args.rust_analyzer)?;
+    // For rust the resolved server is rust-analyzer: it writes the SCIP index
+    // and is the arms' `rust_analyzer_path`, so `--server` overrides both.
+    let rust_analyzer = if args.adapter == Adapter::Rust {
+        server.clone()
+    } else {
+        args.rust_analyzer.clone()
+    };
 
     let binary_source =
         args.binary
@@ -1810,18 +2027,23 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         None => tree.join("index.scip"),
     };
     let scip = if scip.is_file() {
-        scip_note
-            .push_str("an existing index (written earlier by `rust-analyzer scip` for this tree)");
+        scip_note.push_str(if args.adapter == Adapter::Rust {
+            "an existing index (written earlier by `rust-analyzer scip` for this tree)"
+        } else {
+            "an existing index given for this tree"
+        });
         dunce_like(&scip)?
+    } else if args.adapter != Adapter::Rust {
+        // Only rust-analyzer writes a SCIP index here; the other adapters walk
+        // without one (the config needs a non-empty `scip_index` path).
+        let target = out.join("index.scip");
+        scip_note.push_str(&write_empty_scip(&target)?);
+        target
     } else {
         let target = out.join("index.scip");
-        println!(
-            "writing {} with `{} scip`",
-            target.display(),
-            args.rust_analyzer
-        );
+        println!("writing {} with `{} scip`", target.display(), rust_analyzer);
         let started = Instant::now();
-        let status = std::process::Command::new(&args.rust_analyzer)
+        let status = std::process::Command::new(&rust_analyzer)
             .arg("scip")
             .arg(&tree)
             .arg("--output")
@@ -1843,50 +2065,63 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
     let thread_count = args.load_threads.unwrap_or_else(|| {
         (std::thread::available_parallelism().map_or(4, usize::from) / 2).max(2)
     });
-    let skipped_servers: Vec<String> = [
-        "pyright-langserver",
-        "gopls",
-        "typescript-language-server",
-        "jdtls",
-        "csharp-ls",
-        "clangd",
-    ]
-    .into_iter()
-    .filter(|name| !which_on_path(name))
-    .map(str::to_owned)
-    .collect();
+    let skipped_servers: Vec<String> = if args.adapter == Adapter::Rust {
+        [
+            "pyright-langserver",
+            "gopls",
+            "typescript-language-server",
+            "jdtls",
+            "csharp-ls",
+            "clangd",
+        ]
+        .into_iter()
+        .filter(|name| !which_on_path(name))
+        .map(str::to_owned)
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let server_version = if args.adapter.has_version_flag() {
+        command_text(&probe_program(&server), "--version")
+    } else {
+        format!(
+            "{} has no `--version` (probe skipped)",
+            args.adapter.default_server().unwrap_or("jdtls")
+        )
+    };
+    let mut summary = vec![
+        ("tree".to_owned(), format!("HEAD {}", git_head(&tree))),
+        ("adapter".to_owned(), args.adapter.name().to_owned()),
+        (
+            "binary".to_owned(),
+            format!(
+                "copy of {} (as built: debug unless the path says otherwise)",
+                file_name(&binary_source)
+            ),
+        ),
+        ("server".to_owned(), server_version),
+        ("scip index".to_owned(), scip_note),
+        ("questions".to_owned(), questions.len().to_string()),
+        (
+            "arms of this run".to_owned(),
+            arms.iter().map(|a| a.name).collect::<Vec<_>>().join(", "),
+        ),
+    ];
+    if args.adapter == Adapter::Rust {
+        summary.push((
+            "rust_analyzer_trusted".to_owned(),
+            "false (the default: build scripts and proc macros are off)".to_owned(),
+        ));
+    }
+    summary.push((
+        "logical cores".to_owned(),
+        std::thread::available_parallelism()
+            .map_or(0, usize::from)
+            .to_string(),
+    ));
     let meta = ReportMeta {
         stamp: stamp.clone(),
-        summary: vec![
-            ("tree".to_owned(), format!("HEAD {}", git_head(&tree))),
-            (
-                "binary".to_owned(),
-                format!(
-                    "copy of {} (as built: debug unless the path says otherwise)",
-                    file_name(&binary_source)
-                ),
-            ),
-            (
-                "rust-analyzer".to_owned(),
-                command_text(&args.rust_analyzer, "--version"),
-            ),
-            ("scip index".to_owned(), scip_note),
-            ("questions".to_owned(), questions.len().to_string()),
-            (
-                "arms of this run".to_owned(),
-                arms.iter().map(|a| a.name).collect::<Vec<_>>().join(", "),
-            ),
-            (
-                "rust_analyzer_trusted".to_owned(),
-                "false (the default: build scripts and proc macros are off)".to_owned(),
-            ),
-            (
-                "logical cores".to_owned(),
-                std::thread::available_parallelism()
-                    .map_or(0, usize::from)
-                    .to_string(),
-            ),
-        ],
+        summary,
         repeat: args.repeat,
         deadline_ms: args.deadline_ms,
         n8_window: args.n8_window,
@@ -1904,7 +2139,9 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         out: out.clone(),
         work: work.clone(),
         scip,
-        rust_analyzer: args.rust_analyzer.clone(),
+        rust_analyzer,
+        adapter: args.adapter,
+        server: server.clone(),
         calls_file,
     };
     let conditions: Vec<(&str, bool)> = match args.load {
@@ -1932,7 +2169,15 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             println!("[{condition}] {thread_count} busy threads started");
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        let version_probe = time_version_probe(&args.rust_analyzer, args.probe_runs);
+        let version_probe = if args.adapter.has_version_flag() {
+            time_version_probe(&probe_program(&server), args.probe_runs)
+        } else {
+            println!(
+                "[{condition}] the {} server has no --version: probe skipped",
+                args.adapter.name()
+            );
+            Vec::new()
+        };
         println!(
             "[{condition}] --version p50 {} ms p95 {} ms",
             fmt_opt(percentile(&version_probe, 50.0)),
@@ -2109,6 +2354,8 @@ mod tests {
             scip_index: std::env::temp_dir().join("index.scip"),
             rust_analyzer: "rust-analyzer".into(),
             deadline_ms: 20_000,
+            adapter: Adapter::Rust,
+            server: "rust-analyzer".into(),
         };
         for arm in ARMS {
             let text = arm_config(&arm, &ctx);
@@ -2338,6 +2585,167 @@ mod tests {
         meta.idle_cpu.insert("base".into(), (3.5, true));
         meta.arm_errors.insert("lifecycle".into(), "no".into());
         assert_eq!(cond_meta_from_json(&cond_meta_json(&meta)).unwrap(), meta);
+    }
+
+    fn test_ctx(adapter: Adapter, server: &str) -> ConfigCtx {
+        ConfigCtx {
+            data_dir: std::env::temp_dir().join("lci-lsp-cost-test-data"),
+            scip_index: std::env::temp_dir().join("index.scip"),
+            rust_analyzer: "rust-analyzer".into(),
+            deadline_ms: 20_000,
+            adapter,
+            server: server.into(),
+        }
+    }
+
+    #[test]
+    fn arm_config_is_unchanged_for_rust() {
+        // The text of the `base` arm as written before `--adapter` existed.
+        let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
+        let expected = format!(
+            "data_dir = '{}'\n{}",
+            toml_path(&ctx.data_dir),
+            concat!(
+                "rust_analyzer_path = 'rust-analyzer'\n",
+                "lsp_timeout_seconds = 120\n",
+                "embedding_url = \"http://127.0.0.1:18766/v1\"\n",
+                "reranker_url = \"http://127.0.0.1:18767/rerank\"\n",
+                "\n[channels]\nsemantic = false\nlsp = false\nreranker = false\n",
+                "\n[index]\nfreshness = \"manual\"\n",
+                "\n[traverse]\nenabled = true\nscip_index = '@SCIP@'\ndeadline_ms = 20000\n",
+                "\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n",
+                "\n[run_profile.lsp]\nsessions = \"per_call\"\n",
+            )
+        )
+        .replace("@SCIP@", &toml_path(&ctx.scip_index));
+        assert_eq!(arm_config(&ARMS[0], &ctx), expected);
+    }
+
+    #[test]
+    fn a_non_rust_adapter_adds_exactly_its_section_and_path() {
+        let cases = [
+            (Adapter::Python, "python", "pyright-langserver"),
+            (Adapter::Go, "go", "gopls"),
+            (
+                Adapter::Typescript,
+                "typescript",
+                "typescript-language-server",
+            ),
+            (Adapter::Java, "java", "C:\\tools\\jdtls"),
+            (Adapter::C, "clangd", "clangd"),
+            (Adapter::Cpp, "clangd", "clangd"),
+            (Adapter::Csharp, "csharp", "csharp-ls"),
+        ];
+        for (adapter, section, server) in cases {
+            for arm in ARMS {
+                let text = arm_config(&arm, &test_ctx(adapter, server));
+                let rust_text = arm_config(&arm, &test_ctx(Adapter::Rust, "rust-analyzer"));
+                let added: Vec<&str> = text.lines().filter(|l| !rust_text.contains(l)).collect();
+                let slashed = server.replace('\\', "/");
+                let path_line = format!("path = '{slashed}'");
+                let section_line = format!("[{section}]");
+                assert_eq!(
+                    added,
+                    vec![section_line.as_str(), path_line.as_str()],
+                    "{adapter:?} {}",
+                    arm.name
+                );
+                // Nothing the rust config has is lost.
+                assert!(rust_text.lines().all(|l| text.contains(l)));
+                let config: lci_core::config::Config = toml::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{adapter:?} {}: {e}\n{text}", arm.name));
+                config.validate().unwrap();
+                let wrote = match adapter {
+                    Adapter::Python => config.python.path,
+                    Adapter::Go => config.go.path,
+                    Adapter::Typescript => config.typescript.path,
+                    Adapter::Java => config.java.path,
+                    Adapter::C | Adapter::Cpp => config.clangd.path,
+                    Adapter::Csharp => config.csharp.path,
+                    Adapter::Rust => unreachable!(),
+                };
+                assert_eq!(wrote.as_deref(), Some(slashed.as_str()));
+            }
+        }
+        assert!(
+            !arm_config(&ARMS[0], &test_ctx(Adapter::Rust, "rust-analyzer")).contains("\npath = ")
+        );
+    }
+
+    #[test]
+    fn the_server_defaults_to_the_adapter_and_jdtls_needs_one() {
+        let pick = |adapter, server: Option<&str>| resolve_server(adapter, server, "ra-custom");
+        assert_eq!(pick(Adapter::Rust, None).unwrap(), "ra-custom");
+        assert_eq!(pick(Adapter::Rust, Some("x")).unwrap(), "x");
+        assert_eq!(pick(Adapter::Python, None).unwrap(), "pyright-langserver");
+        assert_eq!(pick(Adapter::Cpp, None).unwrap(), "clangd");
+        assert_eq!(pick(Adapter::Go, Some("/bin/gopls")).unwrap(), "/bin/gopls");
+        let error = pick(Adapter::Java, None).unwrap_err().to_string();
+        assert!(error.contains("--server"), "{error}");
+        assert_eq!(pick(Adapter::Java, Some("/jdtls")).unwrap(), "/jdtls");
+        assert_eq!(Adapter::ALL.len(), 8);
+    }
+
+    #[test]
+    fn an_empty_scip_is_written_and_said_so() {
+        let dir = std::env::temp_dir().join(format!("lci-lsp-cost-scip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("index.scip");
+        let note = write_empty_scip(&target).unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+        assert_eq!(note, "no SCIP index (empty file; scip maps give nothing)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rss_counts_the_process_names_of_the_adapter() {
+        assert!(rss_name_matches(
+            "rust-analyzer.exe",
+            Adapter::Rust.rss_names()
+        ));
+        assert!(rss_name_matches("Node.EXE", Adapter::Python.rss_names()));
+        assert!(rss_name_matches("node", Adapter::Typescript.rss_names()));
+        assert!(rss_name_matches("gopls.exe", Adapter::Go.rss_names()));
+        assert!(rss_name_matches("clangd.exe", Adapter::C.rss_names()));
+        assert!(rss_name_matches("clangd", Adapter::Cpp.rss_names()));
+        assert!(rss_name_matches(
+            "csharp-ls.exe",
+            Adapter::Csharp.rss_names()
+        ));
+        assert!(rss_name_matches("java.exe", Adapter::Java.rss_names()));
+        // A server of another adapter, or `serve` itself, is not counted.
+        assert!(!rss_name_matches(
+            "rust-analyzer.exe",
+            Adapter::Python.rss_names()
+        ));
+        assert!(!rss_name_matches("node.exe", Adapter::Go.rss_names()));
+        assert!(!rss_name_matches(
+            "lci-lsp-cost.exe",
+            Adapter::Rust.rss_names()
+        ));
+        for adapter in Adapter::ALL {
+            assert!(!adapter.rss_names().is_empty(), "{adapter:?}");
+        }
+    }
+
+    #[test]
+    fn runs_of_different_adapters_get_their_own_report() {
+        let keys: Vec<String> = ["rust", "python", "rust", "go"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        assert_eq!(
+            group_indices_by_key(&keys),
+            vec![
+                ("rust".to_owned(), vec![0, 2]),
+                ("python".to_owned(), vec![1]),
+                ("go".to_owned(), vec![3]),
+            ]
+        );
+        let mut meta = ReportMeta::default();
+        assert_eq!(adapter_key(&meta), "rust");
+        meta.summary.push(("adapter".to_owned(), "go".to_owned()));
+        assert_eq!(adapter_key(&meta), "go");
     }
 
     #[test]

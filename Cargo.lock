@@ -3686,6 +3686,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6941,6 +6942,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "csv",
  "dirs",
  "lci-core",
  "lci-maps",

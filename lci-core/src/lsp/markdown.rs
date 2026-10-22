@@ -29,9 +29,9 @@
 //! [`joins_search_channel`]: LspAdapter::joins_search_channel
 
 use crate::config::MarkdownLspConfig;
-use crate::lsp::adapter::{LspAdapter, read_for_did_open};
+use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -134,8 +134,8 @@ impl LspAdapter for MarkdownServer {
         Box::new(|_| false)
     }
 
-    // The hook sends the current disk text on every request, and marksman
-    // re-reads an open document from the didOpen text, so the manager's
+    // The hook sends the current disk text whenever it differs from what this
+    // session sent, and marksman re-reads an open document from the didOpen text, so the manager's
     // outline cache may key an answer on the bytes on disk.
     fn opens_documents(&self) -> bool {
         true
@@ -144,28 +144,15 @@ impl LspAdapter for MarkdownServer {
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
+        sent: &SentTexts,
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let Some(content) = read_for_did_open(file, relative, "marksman").await? else {
-            return Ok(());
-        };
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?
-            .to_string();
-        // No head start: marksman answers from the opened text at once.
-        rpc.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": LANGUAGE_IDENTIFIER,
-                    "version": 1,
-                    "text": content
-                }
-            }),
-        )
-        .await
+        // No head start: marksman answers from the opened text at once, so
+        // the opened-document gate is dropped as soon as the open is sent.
+        open_if_changed(rpc, sent, file, relative, "marksman", LANGUAGE_IDENTIFIER)
+            .await
+            .map(|_| ())
     }
 
     fn joins_search_channel(&self) -> bool {
