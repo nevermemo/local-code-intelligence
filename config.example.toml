@@ -369,10 +369,10 @@ max_depth = 6
 max_est_tokens = 20000
 # Longest the walk may run. The hybrid search for the start nodes does not
 # count against it (embedding_timeout_seconds and reranker_timeout_seconds
-# bound that search). Loading the index does count against it. With lsp.live
-# the version probe of its server (bounded by readiness_timeout_seconds) and the
-# tree barrier are credited back too, so a call's wall time can exceed
-# deadline_ms by that setup.
+# bound that search). Loading the index does count against it. Building the
+# tree maps (with lsp.live, the version probe of its server among them, bounded
+# by readiness_timeout_seconds) and the tree barrier are credited back too, so a
+# call's wall time can exceed deadline_ms by that setup.
 deadline_ms = 5000
 max_stops = 4
 # Confidence a rung of the steering ladder needs to decide a stop. Only the
@@ -730,8 +730,8 @@ mode = "cache"
 # or is refused costs the walk a note ("lsp.live is unavailable: ..") and the
 # map, never an error; rust-analyzer is enabled with
 # the bare path "rust-analyzer", the other servers need their [language] path.
-# [traverse] deadline_ms bounds the walk: the setup (the version probe, bounded
-# by its own readiness_timeout_seconds, the seed search and the tree barrier) is
+# [traverse] deadline_ms bounds the walk: the setup (building the tree maps, the
+# version probe among them, the seed search and the tree barrier) is
 # credited back, so a call's wall time can exceed deadline_ms by that setup.
 # A service with [traverse] enabled = true also warms the servers at the first
 # touch of a workspace. `lci traverse` (the one-shot) and sessions = "per_call"
