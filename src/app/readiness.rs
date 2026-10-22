@@ -362,12 +362,25 @@ pub(crate) fn model_listing_url(url: &reqwest::Url) -> reqwest::Url {
     models_url
 }
 
+/// The model listing at the configured URL's origin: `/v1/models`, whatever
+/// path prefix the URL has. The fallback for a gateway that lists models only
+/// there.
+fn origin_listing_url(url: &reqwest::Url) -> reqwest::Url {
+    let mut models_url = url.clone();
+    models_url.set_path("/v1/models");
+    models_url.set_query(None);
+    models_url.set_fragment(None);
+    models_url
+}
+
 /// Reads the model ids the OpenAI-compatible listing endpoint derived from
-/// the configured URL (see [`model_listing_url`]) reports. A 404/405 means
-/// the listing is not exposed. Errors identify the dependency generically via
-/// `label` (with HTTP status where relevant) because configured URLs may
-/// contain credentials or query secrets that must not be echoed into
-/// readiness reports.
+/// the configured URL (see [`model_listing_url`]) reports. When that answers
+/// 404/405 and differs from the origin's `/v1/models`, the origin's listing
+/// is tried too (a gateway may list models only there); the listing is not
+/// exposed only when both answer 404/405 or the origin cannot be reached.
+/// Errors identify the dependency generically via `label` (with HTTP status
+/// where relevant) because configured URLs may contain credentials or query
+/// secrets that must not be echoed into readiness reports.
 pub(crate) async fn fetch_model_ids(
     client: &reqwest::Client,
     url: &str,
@@ -378,15 +391,27 @@ pub(crate) async fn fetch_model_ids(
         Ok(u) => u,
         Err(e) => return ModelIds::Failed(format!("invalid {label} URL: {e}")),
     };
-    let models_url = model_listing_url(&parsed);
-    let response = match client.get(models_url).timeout(timeout).send().await {
+    let not_exposed = |status: reqwest::StatusCode| matches!(status.as_u16(), 404 | 405);
+    let prefixed = model_listing_url(&parsed);
+    let origin = origin_listing_url(&parsed);
+    let fallback = (origin != prefixed).then_some(origin);
+    let response = match client.get(prefixed).timeout(timeout).send().await {
         Ok(r) => r,
         Err(e) => {
             return ModelIds::Failed(format!("connect to {label}: {}", reqwest_error_class(&e)));
         }
     };
+    let response = match fallback {
+        Some(origin) if not_exposed(response.status()) => {
+            match client.get(origin).timeout(timeout).send().await {
+                Ok(r) => r,
+                Err(_) => return ModelIds::NotExposed,
+            }
+        }
+        _ => response,
+    };
     let status = response.status();
-    if status.as_u16() == 404 || status.as_u16() == 405 {
+    if not_exposed(status) {
         return ModelIds::NotExposed;
     }
     if !status.is_success() {
@@ -394,7 +419,9 @@ pub(crate) async fn fetch_model_ids(
     }
     let body: serde_json::Value = match response.json().await {
         Ok(b) => b,
-        Err(e) => return ModelIds::Failed(format!("invalid {label} response: {e:#}")),
+        Err(e) => {
+            return ModelIds::Failed(format!("invalid {label} response: {:#}", e.without_url()));
+        }
     };
     let ids = body
         .get("data")
@@ -410,7 +437,8 @@ pub(crate) async fn fetch_model_ids(
 }
 
 /// Derives the likely OpenAI-compatible model listing endpoint from the
-/// configured URL origin and checks that the configured model is present
+/// configured URL (path prefix first, then the origin) and checks that the
+/// configured model is present
 /// (see [`fetch_model_ids`]).
 pub(crate) async fn probe_model_listing(
     client: &reqwest::Client,
@@ -496,6 +524,76 @@ mod tests {
             derive("https://gateway.test/team/v1/embeddings"),
             "https://gateway.test/team/v1/models"
         );
+    }
+
+    /// An in-process listing server on `127.0.0.1:0` that lists `models` at
+    /// each of `listed_at` and answers 404 everywhere else. Returns its base
+    /// URL and the task serving it.
+    async fn listing_server(
+        listed_at: &[&str],
+        models: &[&str],
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let body = serde_json::json!({
+            "data": models.iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>()
+        });
+        let mut router = axum::Router::new();
+        for path in listed_at {
+            let body = body.clone();
+            router = router.route(
+                path,
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (base, task)
+    }
+
+    async fn listing_of(url: &str) -> ModelIds {
+        let client = reqwest::Client::new();
+        fetch_model_ids(&client, url, "test", std::time::Duration::from_secs(30)).await
+    }
+
+    #[tokio::test]
+    async fn model_listing_is_read_under_the_configured_path_prefix() {
+        let (base, task) = listing_server(&["/gw/embed/v1/models"], &["m1"]).await;
+        let listed = listing_of(&format!("{base}/gw/embed/v1")).await;
+        assert!(
+            matches!(&listed, ModelIds::Listed(ids) if ids == &["m1"]),
+            "{listed:?}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn model_listing_falls_back_to_the_origin_when_the_prefix_has_none() {
+        let (base, task) = listing_server(&["/v1/models"], &["m1"]).await;
+        let listed = listing_of(&format!("{base}/gw/embed/v1")).await;
+        assert!(
+            matches!(&listed, ModelIds::Listed(ids) if ids == &["m1"]),
+            "{listed:?}"
+        );
+        // The reranker's endpoint URL takes the same path.
+        let listed = listing_of(&format!("{base}/gw/rerank")).await;
+        assert!(
+            matches!(&listed, ModelIds::Listed(ids) if ids == &["m1"]),
+            "{listed:?}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn model_listing_is_not_exposed_when_neither_path_lists() {
+        let (base, task) = listing_server(&[], &[]).await;
+        let listed = listing_of(&format!("{base}/gw/embed/v1")).await;
+        assert!(matches!(listed, ModelIds::NotExposed), "{listed:?}");
+        task.abort();
     }
 
     #[test]

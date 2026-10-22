@@ -565,6 +565,7 @@ impl Serve {
         let sink = std::fs::File::create(&log).unwrap();
         let mut command = sandbox.command(args, envs);
         let child = command
+            .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(sink)
