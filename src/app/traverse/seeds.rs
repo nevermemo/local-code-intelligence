@@ -2,7 +2,9 @@
 //! search hits to graph nodes, and the descriptor-only seed maps.
 
 use super::first_stage::{EXACT_CLOSURE_ID, EXACT_PICKAXE_ID};
-use super::{Call, SEEDS_BM25, SEEDS_HYBRID, SEEDS_LITERAL, SEEDS_MAP, chunks, index::Loaded};
+use super::{
+    Call, SEEDS_BM25, SEEDS_HYBRID, SEEDS_LITERAL, SEEDS_MAP, SEEDS_REPO_MAP, chunks, index::Loaded,
+};
 use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
 use anyhow::{Context, Result, anyhow};
 use lci_core::{
@@ -938,6 +940,16 @@ impl SeedMap {
         )
     }
 
+    /// The symbols the SCIP graph's calls lead to from the entities the
+    /// question's words name (personalized PageRank over the graph).
+    pub(super) fn repo_map() -> Self {
+        Self::new(
+            SEEDS_REPO_MAP,
+            vec![NodeKind::Symbol],
+            vec![SourceLabel::Prior, SourceLabel::Lexical],
+        )
+    }
+
     /// The nodes of the lines that hold a name of the question's code spans
     /// as a whole word (ripgrep, placed in the SCIP graph).
     pub(super) fn literal() -> Self {
@@ -992,6 +1004,9 @@ pub(super) struct Seeds {
     /// Where the start nodes came from: `given`, `hybrid`, `name_tokens`,
     /// `hybrid+bm25` (the hybrid search's nodes, then those of `seeds.bm25`),
     /// `bm25` (`seeds.bm25` answered where the hybrid search did not),
+    /// `hybrid+repo_map`, `hybrid+bm25+repo_map`, `bm25+repo_map`, `repo_map`
+    /// (the nodes of `seeds.repo_map` after those, or alone), each also with
+    /// `+literal` (see [`join_source`]),
     /// `traits` (the traits and trait methods the question's paths name, with
     /// `scip.implements` on), `traits+hybrid`, `traits+hybrid+bm25`,
     /// `traits+bm25`, `traits+name_tokens` or
@@ -1031,6 +1046,34 @@ impl Seeds {
             .chain(self.given_traits.iter().cloned())
     }
 }
+
+/// The `seed_source` after `part` (`repo_map` or `literal`) added nodes to the
+/// start nodes of `current`: one of a closed list of strings, in the order the
+/// sources run (hybrid, `bm25`, `repo_map`, `literal`). `current` empty (no
+/// earlier source answered) gives `part` alone.
+pub(super) fn join_source(current: &'static str, part: &'static str) -> &'static str {
+    match (current, part) {
+        ("", "repo_map") => "repo_map",
+        ("hybrid", "repo_map") => "hybrid+repo_map",
+        ("bm25", "repo_map") => "bm25+repo_map",
+        ("hybrid+bm25", "repo_map") => "hybrid+bm25+repo_map",
+        ("", "literal") => "literal",
+        ("hybrid", "literal") => "hybrid+literal",
+        ("bm25", "literal") => "bm25+literal",
+        ("hybrid+bm25", "literal") => "hybrid+bm25+literal",
+        ("repo_map", "literal") => "repo_map+literal",
+        ("hybrid+repo_map", "literal") => "hybrid+repo_map+literal",
+        ("bm25+repo_map", "literal") => "bm25+repo_map+literal",
+        ("hybrid+bm25+repo_map", "literal") => "hybrid+bm25+repo_map+literal",
+        _ => part,
+    }
+}
+
+/// The note of `seeds.repo_map` on a graph with no nodes.
+const REPO_MAP_EMPTY_NOTE: &str =
+    "seeds.repo_map: the SCIP graph is empty ([run_profile.scip] mode or no index): no start nodes";
+/// The note of `seeds.repo_map` when no entity matches the question's words.
+const REPO_MAP_NO_MATCH_NOTE: &str = "seeds.repo_map: no entity matches the question's words, so the PageRank has nothing to personalise on: no start nodes";
 
 /// Finds the start nodes: the caller's, else the hybrid search's, then (when
 /// `seeds.bm25` is wanted) the entities it adds after them, else (when none of
@@ -1152,6 +1195,63 @@ pub(super) async fn find_seeds(
             }
         }
     }
+    // `seeds.repo_map` (only in `wanted` under `[run_profile.seeds]
+    // repo_map`): personalized PageRank over the SCIP graph, the jump on the
+    // entities `seeds.bm25`'s index finds for the question, after the earlier
+    // sources' nodes. The index is the entity index of `seeds.bm25`, built
+    // whether or not that map is wanted.
+    if wanted.contains(&SEEDS_REPO_MAP) && !call.question.trim().is_empty() {
+        let repo = loaded.repo_map().await;
+        if repo.is_empty() {
+            found.notes.push(REPO_MAP_EMPTY_NOTE.to_owned());
+        } else {
+            let known: HashSet<NodeId> = found.nodes.iter().map(|seed| seed.node.clone()).collect();
+            let index = loaded.bm25().await;
+            let (question, limit) = (call.question.to_owned(), limits.seed_k as usize);
+            let (ranked, stats) = {
+                let repo = repo.clone();
+                tokio::task::spawn_blocking(move || repo.matches(&index, &question, limit))
+                    .await
+                    .expect("the PageRank does not panic")
+            };
+            if stats.personalised == 0 {
+                found.notes.push(REPO_MAP_NO_MATCH_NOTE.to_owned());
+            }
+            let mut added = 0;
+            for (node, name, score) in ranked {
+                if known.contains(&node) {
+                    continue;
+                }
+                found.details.push(json!({
+                    "node": node.to_string(),
+                    "kind": "symbol",
+                    "how": "repo_map",
+                    "symbol": name,
+                    "retrievers": ["repo_map"],
+                    "score": score,
+                    "score_kind": "pagerank",
+                    "personalised": stats.personalised,
+                    "iterations": stats.iterations,
+                }));
+                found.nodes.push(Seed {
+                    node,
+                    map: Some(SEEDS_REPO_MAP),
+                });
+                added += 1;
+            }
+            if added > 0 {
+                if found.source.is_empty()
+                    && let Some(reason) = reason.take()
+                {
+                    found.notes.push(format!(
+                        "seed_source is repo_map, the PageRank over the SCIP graph from the entities the question's words name: {reason}"
+                    ));
+                    found.fallback = Some(reason);
+                }
+                found.source = join_source(found.source, "repo_map");
+            }
+        }
+    }
     // `seeds.literal` (only in `wanted` under `[run_profile.seeds] literal`):
     // the nodes of the lines that hold a name of the question's code spans as
     // a whole word, after the hybrid search's and `seeds.bm25`'s nodes. Not
@@ -1169,20 +1269,15 @@ pub(super) async fn find_seeds(
         if !seeds.is_empty() {
             found.nodes.extend(seeds);
             found.details.extend(details);
-            found.source = match found.source {
-                "hybrid" => "hybrid+literal",
-                "hybrid+bm25" => "hybrid+bm25+literal",
-                "bm25" => "bm25+literal",
-                _ => {
-                    if let Some(reason) = reason.take() {
-                        found.notes.push(format!(
-                            "seed_source is literal, the exact occurrences of the names in code spans: {reason}"
-                        ));
-                        found.fallback = Some(reason);
-                    }
-                    "literal"
-                }
-            };
+            if found.source.is_empty()
+                && let Some(reason) = reason.take()
+            {
+                found.notes.push(format!(
+                    "seed_source is literal, the exact occurrences of the names in code spans: {reason}"
+                ));
+                found.fallback = Some(reason);
+            }
+            found.source = join_source(found.source, "literal");
         }
     } else if wanted.contains(&SEEDS_LITERAL) {
         found.notes.push(NO_LITERAL_NAMES_NOTE.to_owned());
@@ -1191,8 +1286,8 @@ pub(super) async fn find_seeds(
         return Ok(found);
     }
     if !found.nodes.is_empty() {
-        // `seeds.bm25` or `seeds.literal` answered where the hybrid search
-        // did not; the stand-in is reached only when none did.
+        // `seeds.bm25`, `seeds.repo_map` or `seeds.literal` answered where the
+        // hybrid search did not; the stand-in is reached only when none did.
     } else if wanted.contains(&SEEDS_MAP) {
         found.source = "name_tokens";
         for (node, matched) in loaded.names.matches(call.question, SEED_COUNT) {
@@ -1368,6 +1463,14 @@ pub(super) fn add_trait_seeds(
             "hybrid+literal" => "traits+hybrid+literal",
             "hybrid+bm25+literal" => "traits+hybrid+bm25+literal",
             "bm25+literal" => "traits+bm25+literal",
+            "hybrid+repo_map" => "traits+hybrid+repo_map",
+            "hybrid+bm25+repo_map" => "traits+hybrid+bm25+repo_map",
+            "bm25+repo_map" => "traits+bm25+repo_map",
+            "repo_map" => "traits+repo_map",
+            "hybrid+repo_map+literal" => "traits+hybrid+repo_map+literal",
+            "hybrid+bm25+repo_map+literal" => "traits+hybrid+bm25+repo_map+literal",
+            "bm25+repo_map+literal" => "traits+bm25+repo_map+literal",
+            "repo_map+literal" => "traits+repo_map+literal",
             "literal" => "traits+literal",
             "name_tokens" => "traits+name_tokens",
             "exact" => "traits+exact",

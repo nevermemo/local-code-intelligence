@@ -593,6 +593,8 @@ async fn run_ripgrep(
     command
         .arg("--")
         .arg(root)
+        // tokio's `output()` leaves stdin inherited; ripgrep must not read ours (N107).
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

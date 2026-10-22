@@ -124,7 +124,12 @@ pub fn wait_limited(child: Child, limit: Duration, scope: KillScope) -> io::Resu
 fn kill_pid(pid: u32, scope: KillScope) {
     let pid = pid.to_string();
     let quiet = |mut command: Command| {
-        let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+        // std's `status()` inherits stdin (unlike `output()`), so null it (N107).
+        let _ = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     };
     #[cfg(windows)]
     {
