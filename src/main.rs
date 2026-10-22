@@ -1215,8 +1215,31 @@ async fn run_init(config_path: Option<PathBuf>, options: init::Options, json: bo
 /// Default log filter (used when `RUST_LOG` is unset); `lci_core` is listed because LSP restart, readiness-timeout, and JSON-RPC reader events come from that crate.
 const DEFAULT_LOG_FILTER: &str = "local_code_intelligence=info,lci_core=info";
 
-#[tokio::main]
-async fn main() -> Result<std::process::ExitCode> {
+/// Stack of the thread that drives the CLI's async main. A debug build's
+/// futures are large (a `traverse` call that creates the index inline reaches
+/// 1 to 1.25 MiB on the polling thread), and Windows gives the main thread
+/// 1 MiB (N105). Only address space is reserved; pages are committed on use.
+const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<std::process::ExitCode> {
+    let driver = std::thread::Builder::new()
+        .name("main".to_owned())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("start the async runtime")?
+                .block_on(async_main())
+        })
+        .context("spawn the main thread")?;
+    match driver.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn async_main() -> Result<std::process::ExitCode> {
     match run().await {
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
         Err(error) => match error.downcast_ref::<ShutdownSignalError>() {
@@ -1292,8 +1315,8 @@ async fn run() -> Result<()> {
         );
     }
     if let Command::Traverse(args) = command {
-        // Boxed: the traversal future is large, and `run` shares the main
-        // thread's stack (1 MiB on Windows) with it in a debug build.
+        // Boxed: the traversal future is large; it stays off `run`'s frame
+        // (the main thread's stack is `MAIN_STACK_BYTES`, N105).
         return Box::pin(run_traverse(cli.config, cli.no_local_config, *args)).await;
     }
     if let Command::Recipe(args) = command {
