@@ -440,6 +440,12 @@ pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()>
             10,
         ),
         ("Acceptance - Java LSP recovery", "java-recovery", 10),
+        ("Acceptance - Markdown LSP (marksman)", "markdown-lsp", 10),
+        (
+            "Acceptance - Markdown LSP provider isolation",
+            "markdown-missing",
+            10,
+        ),
         ("Acceptance - C# LSP (dotnet + csharp-ls)", "csharp-lsp", 10),
         (
             "Acceptance - C# LSP provider isolation",

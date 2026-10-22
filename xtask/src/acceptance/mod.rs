@@ -22,6 +22,8 @@ pub mod java_missing;
 pub mod java_recovery;
 pub mod lsp;
 mod lsp_full;
+pub mod markdown_lsp;
+pub mod markdown_missing;
 mod missing;
 pub mod multilingual;
 pub mod python_lsp;

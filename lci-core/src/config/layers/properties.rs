@@ -97,6 +97,7 @@ fn overrides(rng: &mut Rng) -> LocalOverrides {
         go: lsp(rng),
         java: lsp(rng),
         clangd: lsp(rng),
+        markdown: lsp(rng),
     }
 }
 

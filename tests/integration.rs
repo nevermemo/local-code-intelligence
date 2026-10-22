@@ -10,6 +10,8 @@ mod freshness;
 mod indexing;
 #[path = "cases/lsp_concurrent_open.rs"]
 mod lsp_concurrent_open;
+#[path = "cases/markdown_lsp.rs"]
+mod markdown_lsp;
 #[path = "cases/mcp.rs"]
 mod mcp;
 #[path = "cases/navigation.rs"]
