@@ -506,10 +506,10 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
             .kill_on_drop(true);
         let output = match tokio::time::timeout(timeout, command.output()).await {
             Err(_) => {
-                return Err(anyhow::Error::new(ProbeFailure::TimedOut).context(format!(
-                    "timed out running {} --version",
-                    executable.display()
-                )));
+                return Err(ProbeError::error(
+                    ProbeFailure::TimedOut,
+                    format!("timed out running {} --version", executable.display()),
+                ));
             }
             Ok(Err(error)) => {
                 let cause = if error.kind() == std::io::ErrorKind::NotFound {
@@ -517,24 +517,26 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
                 } else {
                     ProbeFailure::Failed
                 };
-                return Err(anyhow::Error::new(cause)
-                    .context(format!("start {}: {error}", executable.display())));
+                return Err(ProbeError::error(
+                    cause,
+                    format!("start {}: {error}", executable.display()),
+                ));
             }
             Ok(Ok(output)) => output,
         };
         if !output.status.success() {
-            return Err(anyhow::Error::new(ProbeFailure::Failed).context(format!(
-                "subprocess {} --version failed",
-                executable.display()
-            )));
+            return Err(ProbeError::error(
+                ProbeFailure::Failed,
+                format!("subprocess {} --version failed", executable.display()),
+            ));
         }
         Ok(())
     };
     probe_through(&resolved, run).await
 }
 
-/// Why [`probe_subprocess_version`] failed, as the root cause of its error (the
-/// readable text stays in the context above it). `[run_profile.lsp] breaker`
+/// Why [`probe_subprocess_version`] failed, carried by its [`ProbeError`]
+/// beside the readable text. `[run_profile.lsp] breaker`
 /// opens a window on [`Self::Failed`] only: a window opens on evidence of a
 /// dead server, never on absence or silence (see `Manager::probe_once`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,6 +561,36 @@ impl std::fmt::Display for ProbeFailure {
 }
 
 impl std::error::Error for ProbeFailure {}
+
+/// The error [`probe_subprocess_version`] returns: its readable text (the
+/// text before the failure was typed, so notes read as they did) and the
+/// typed [`ProbeFailure`] beside it, which `Manager::probe_once` reads by
+/// downcasting. The failure's own text never joins the chain, so a note
+/// does not say the same thing twice.
+#[derive(Debug)]
+pub struct ProbeError {
+    /// Why the probe failed.
+    pub failure: ProbeFailure,
+    message: String,
+}
+
+impl ProbeError {
+    /// An error carrying `failure` that displays `message`.
+    pub fn error(failure: ProbeFailure, message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            failure,
+            message: message.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProbeError {}
 
 #[cfg(test)]
 mod tests {
@@ -647,12 +679,12 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 3);
     }
 
-    /// The root cause of a probe error, `None` when the chain holds no
-    /// [`ProbeFailure`].
+    /// The typed failure of a probe error, `None` when the chain holds no
+    /// [`ProbeError`].
     fn failure_of(error: &anyhow::Error) -> Option<ProbeFailure> {
         error
             .chain()
-            .find_map(|cause| cause.downcast_ref::<ProbeFailure>().copied())
+            .find_map(|cause| cause.downcast_ref::<ProbeError>().map(|e| e.failure))
     }
 
     #[tokio::test]
