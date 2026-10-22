@@ -29,8 +29,10 @@ pub struct NavigationReport {
     pub warnings: Vec<String>,
     /// What the tree barrier did for the servers this call asked, which is
     /// information about the answer, not a failure (see [`barrier_notes`]):
-    /// `lsp: <provider> restarted: the tree changed since its last call` for a
-    /// kept server the barrier stopped (the answer is from a fresh one), then
+    /// `lsp: <provider> restarted: <reason>` for a kept server the barrier
+    /// stopped (the answer is from a fresh one; the reason is `the tree changed
+    /// since its last call`, `the index has no file list to stamp` or `the tree
+    /// stamp failed (<cause>)`), then
     /// `lsp: <provider> kept session; tree stamp unchanged since <n> s ago`
     /// (or `; no tree stamp was recorded for it`) for a server this call found
     /// running (exact for what the stamp covers). A server this call started
@@ -46,12 +48,10 @@ pub struct NavigationReport {
 /// whose answers came from a session the call found running. The wording is
 /// the traversal's `lsp.live` notes with `lsp:` as the prefix.
 pub(crate) fn barrier_notes(
-    restarted: &[&'static str],
+    restarted: &[lsp::Restart],
     reused: &[(&'static str, Option<std::time::Duration>)],
 ) -> Vec<String> {
-    let restarted = restarted
-        .iter()
-        .map(|provider| format!("lsp: {provider} restarted: the tree changed since its last call"));
+    let restarted = restarted.iter().map(|restart| restart.note("lsp"));
     let reused = reused.iter().map(|(provider, unchanged)| match unchanged {
         Some(unchanged) => format!(
             "lsp: {provider} kept session; tree stamp unchanged since {} s ago",
@@ -403,7 +403,10 @@ mod tests {
         assert!(barrier_notes(&[], &[]).is_empty());
         assert_eq!(
             barrier_notes(
-                &["csharp-ls"],
+                &[lsp::Restart {
+                    provider: "csharp-ls",
+                    reason: lsp::RestartReason::TreeChanged,
+                }],
                 &[("pyright", Some(Duration::from_secs(7))), ("clangd", None)]
             ),
             [
@@ -411,6 +414,32 @@ mod tests {
                 "lsp: pyright kept session; tree stamp unchanged since 7 s ago",
                 "lsp: clangd kept session; no tree stamp was recorded for it",
             ]
+        );
+    }
+
+    /// A restart says why it happened: a changed tree is not the only cause.
+    #[test]
+    fn a_restart_note_names_its_reason() {
+        let note = |reason| {
+            barrier_notes(
+                &[lsp::Restart {
+                    provider: "csharp-ls",
+                    reason,
+                }],
+                &[],
+            )
+        };
+        assert_eq!(
+            note(lsp::RestartReason::TreeChanged),
+            ["lsp: csharp-ls restarted: the tree changed since its last call"]
+        );
+        assert_eq!(
+            note(lsp::RestartReason::NoFileList),
+            ["lsp: csharp-ls restarted: the index has no file list to stamp"]
+        );
+        assert_eq!(
+            note(lsp::RestartReason::StampFailed("src/x.cs: denied".into())),
+            ["lsp: csharp-ls restarted: the tree stamp failed (src/x.cs: denied)"]
         );
     }
 
