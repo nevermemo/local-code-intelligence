@@ -349,6 +349,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ast-grep-core"
+version = "0.40.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd97b166e4a9b45b0337cad09f849607018c820489865488dd1cd0e7059c4f16"
+dependencies = [
+ "bit-set",
+ "regex",
+ "thiserror 2.0.20",
+ "tree-sitter",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -589,6 +601,21 @@ dependencies = [
  "num-integer",
  "num-traits",
 ]
+
+[[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
@@ -3676,6 +3703,7 @@ dependencies = [
 name = "lci-maps"
 version = "0.1.0"
 dependencies = [
+ "ast-grep-core",
  "async-trait",
  "futures",
  "ignore",
@@ -3686,6 +3714,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@ use crate::{
     config::{Config, LspSync},
     language,
     lsp::{
-        adapter::LspAdapter,
+        adapter::{LspAdapter, SentTexts},
         clangd::ClangdServer,
         csharp::CSharpServer,
         go::GoServer,
@@ -130,6 +130,10 @@ pub struct ServerReadiness {
 /// A live JSON-RPC session with one spawned, initialized language server.
 struct GenericClient {
     rpc: Arc<JsonRpcClient>,
+    /// The texts this session has sent in `didOpen` (see [`SentTexts`]). It
+    /// lives and dies with the server process, so a restarted server is sent
+    /// its files again.
+    sent: SentTexts,
 }
 
 impl GenericClient {
@@ -159,7 +163,10 @@ impl GenericClient {
             .with_context(|| format!("initialize {}", adapter.provider()))?;
         rpc.notify("initialized", json!({})).await?;
         adapter.after_initialized(&rpc).await?;
-        Ok(Arc::new(Self { rpc }))
+        Ok(Arc::new(Self {
+            rpc,
+            sent: SentTexts::default(),
+        }))
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -1657,8 +1664,9 @@ impl Manager {
 
     /// Same retry contract as [`Self::request`], but runs the adapter's
     /// `before_position_request` hook (e.g. TypeScript's `textDocument/
-    /// didOpen`) against the client before the request on each client (the
-    /// repeats of [`Self::send`] on one server do not run it again).
+    /// didOpen`, sent once per changed text, see [`SentTexts`]) against the
+    /// client before the request on each client (the repeats of
+    /// [`Self::send`] on one server do not run it again).
     async fn position_request(
         &self,
         adapter: &Arc<dyn LspAdapter>,
@@ -1693,7 +1701,7 @@ impl Manager {
             };
             let result = async {
                 adapter
-                    .before_position_request(&client.rpc, file, relative)
+                    .before_position_request(&client.rpc, &client.sent, file, relative)
                     .await?;
                 self.send(adapter, workspace, &session, &client, method, &params)
                     .await
@@ -1717,7 +1725,7 @@ impl Manager {
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
                 adapter
-                    .before_position_request(&client.rpc, file, relative)
+                    .before_position_request(&client.rpc, &client.sent, file, relative)
                     .await?;
                 self.send(adapter, workspace, &session, &client, method, &params)
                     .await

@@ -1285,6 +1285,28 @@ async fn flow_from_runs_the_same_with_seeds_literal_on() {
     assert!(!on.to_string().contains("literal"), "{on}");
 }
 
+/// `[run_profile.grep] structural` reaches the recipes' walk (the profile is
+/// the one they run under) and changes nothing there: the walk names its maps
+/// ([`FLOW_WALK_MAPS`]), and the key adds `grep.structural` only to the default
+/// set of a call that names none, so the map is neither listed nor run, and
+/// ripgrep is not started, under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_grep_structural_on() {
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::structural::STRUCTURAL_ID));
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.grep.structural = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("grep.structural"), "{on}");
+}
+
 /// `[run_profile.lsp] places` reaches the recipes' walk (the profile is the
 /// one they run under) and changes nothing there: the walk has no `lsp.live`,
 /// so no outline is asked under either value.

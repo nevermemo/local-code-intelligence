@@ -793,6 +793,24 @@ bm25 = false
 # same under both values. Part of the run-profile hash.
 literal = false
 
+# [run_profile.grep]: switches of the grep-style maps.
+# structural = false (default): the opt-in map grep.structural does not run; naming
+# it in `maps` gives a note and no edges, ripgrep is not started for it, it is not
+# in the default set, and every answer is as without the key. true: the map is in
+# the default set of a call that has a tree root and names no maps, and runs when
+# named. From a symbol it asks ripgrep for the files that hold the name as a whole
+# word (`rg --fixed-strings --word-regexp`; at most 200 files), parses each with
+# the chunker's tree-sitter grammar (files over 1 MiB are skipped) and keeps the
+# occurrences that an ast-grep pattern finds in a header (`impl .. for ..`,
+# `extends`, `implements`: an Implements edge to the other party) or as a call (a
+# CallsOrRefs edge to the enclosing function). A name in a comment or a string
+# gives no edge. Not seen: derive and macro impls, Go and duck-typed headers, Rust headers
+# with a `where` clause, a generic seed type (`impl Shape for Wrapper<T>` is not found from
+# `Wrapper`), C and C++ member calls (`a.f()`, `p->f()`), calls inside a Rust macro.
+# Part of the run-profile hash.
+[run_profile.grep]
+structural = false
+
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and
 # the typed service behind `rescorer = "system_one"`. Off when the section is
