@@ -2,6 +2,7 @@
 //! key `[run_profile.grep] structural`, the note when it is off, and the
 //! default set when it is on.
 
+use super::maps::ripgrep_runs;
 use super::*;
 
 /// The walk alone, as `tests.rs` runs it.
