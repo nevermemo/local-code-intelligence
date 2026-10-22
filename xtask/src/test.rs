@@ -394,8 +394,89 @@ mod tests {
                 "--lib"
             ]]
         );
-        assert_eq!(args(Suite::Config).len(), 3);
-        assert_eq!(args(Suite::Lsp).len(), 8);
+        // How many filters a suite runs is not pinned by a literal: the
+        // coverage tests below derive it from `tests/integration.rs`.
+        assert!(args(Suite::Config).iter().any(|a| a.contains(&"config::")));
+        assert!(args(Suite::Lsp).iter().any(|a| a.contains(&"lsp::")));
+    }
+
+    /// Integration case modules that no focused suite names: only `--suite
+    /// Full` (or an explicit `--test integration <name>::` run) executes them.
+    /// Adding a module to `tests/integration.rs` means either a focused
+    /// suite's `integration("<name>::")` filter or a row here.
+    const FULL_ONLY_CASES: &[&str] = &["recipes", "run_records"];
+
+    /// The module names `tests/integration.rs` declares, in file order.
+    fn integration_modules() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/integration.rs");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        let modules: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix("mod ")?.strip_suffix(';')?;
+                Some(name.trim().to_owned())
+            })
+            .collect();
+        assert!(!modules.is_empty(), "no `mod <name>;` line in {path:?}");
+        modules
+    }
+
+    /// The module names the focused suites' `--test integration <name>::`
+    /// filters select, as `(suite, module)`.
+    fn suite_integration_filters() -> Vec<(Suite, String)> {
+        let mut named = Vec::new();
+        for suite in Suite::value_variants() {
+            for args in focused_invocations(*suite).into_iter().flatten() {
+                let Some(at) = args.windows(2).position(|p| p == ["--test", "integration"]) else {
+                    continue;
+                };
+                let filter = args
+                    .get(at + 2)
+                    .unwrap_or_else(|| panic!("{suite:?}: {args:?} has no filter"));
+                let module = filter
+                    .strip_suffix("::")
+                    .unwrap_or_else(|| panic!("{suite:?}: filter {filter:?} lacks `::`"));
+                named.push((*suite, module.to_owned()));
+            }
+        }
+        named
+    }
+
+    #[test]
+    fn every_integration_case_module_is_in_a_focused_suite_or_the_full_only_list() {
+        let named = suite_integration_filters();
+        for module in integration_modules() {
+            let in_a_suite = named.iter().any(|(_, name)| *name == module);
+            let full_only = FULL_ONLY_CASES.contains(&module.as_str());
+            assert!(
+                in_a_suite || full_only,
+                "tests/integration.rs declares `{module}`, which no focused suite filters on \
+                 and FULL_ONLY_CASES does not list: add `integration(\"{module}::\")` to a suite \
+                 in focused_invocations or list it in FULL_ONLY_CASES"
+            );
+            assert!(
+                !(in_a_suite && full_only),
+                "`{module}` is in a focused suite and in FULL_ONLY_CASES: drop it from the list"
+            );
+        }
+    }
+
+    #[test]
+    fn every_integration_filter_names_an_existing_module_and_the_full_only_list_is_real() {
+        let modules = integration_modules();
+        for (suite, name) in suite_integration_filters() {
+            assert!(
+                modules.contains(&name),
+                "{suite:?} filters on `{name}::`, but tests/integration.rs declares no module `{name}` \
+                 (declared: {modules:?})"
+            );
+        }
+        for name in FULL_ONLY_CASES {
+            assert!(
+                modules.iter().any(|module| module == name),
+                "FULL_ONLY_CASES lists `{name}`, which tests/integration.rs does not declare"
+            );
+        }
     }
 
     #[test]
