@@ -769,11 +769,10 @@ fn relative_to_root(root: &Path, reported: &Path) -> String {
     } else {
         root.join(reported)
     };
-    let relative = normalized
-        .strip_prefix(root)
-        .unwrap_or(&normalized)
-        .to_string_lossy();
-    normalize_path_separators(&relative)
+    // `dunce` keeps the `\\?\` prefix of a path of 260 characters or more
+    // while `root` has none (N48), so compare without it.
+    let relative = crate::path::strip_root(&normalized, root).unwrap_or(normalized);
+    normalize_path_separators(&relative.to_string_lossy())
 }
 
 /// A credited line already attributed to an indexed chunk and its file.
@@ -942,6 +941,22 @@ mod tests {
 
         // ripgrep reports absolute paths, so take the canonicalizing branch.
         assert_eq!(relative_to_root(&root, &root.join(r"a\b.rs")), r"a\b.rs");
+    }
+
+    /// N48: ripgrep's path, once canonicalized, can carry `\\?\` while the root
+    /// does not; the match still comes out relative to the root.
+    #[cfg(windows)]
+    #[test]
+    fn relative_path_ignores_a_verbatim_prefix_on_either_side() {
+        let root = Path::new(r"C:\ws");
+        assert_eq!(
+            relative_to_root(root, Path::new(r"\\?\C:\ws\src\a.rs")),
+            "src/a.rs"
+        );
+        assert_eq!(
+            relative_to_root(Path::new(r"\\?\C:\ws"), Path::new(r"C:\ws\src\a.rs")),
+            "src/a.rs"
+        );
     }
 
     #[cfg(unix)]
