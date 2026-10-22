@@ -14,7 +14,7 @@
 //! being present.
 
 use crate::config::TypeScriptLspConfig;
-use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
+use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -114,7 +114,12 @@ impl LspAdapter for TypeScriptServer {
                 "textDocument": {
                     "definition": {},
                     "references": {},
-                    "synchronization": {}
+                    "synchronization": {},
+                    // typescript-language-server publishes diagnostics only to
+                    // a client that declares it takes them; the hook waits for
+                    // the publication of a file it opened (measured against a
+                    // real server: none without this, one with it).
+                    "publishDiagnostics": {}
                 },
                 "workspace": { "symbol": {}, "workspaceFolders": true }
             },
@@ -164,9 +169,11 @@ impl LspAdapter for TypeScriptServer {
             // especially for a freshly spawned, one-shot-CLI-invocation
             // process with no warm project state to reuse. It publishes
             // diagnostics for the file once it has analysed it: wait for
-            // that, bounded by the configured request timeout. Only a newly
+            // that, bounded by the configured request timeout, at most 3 s. Only a newly
             // sent text needs it.
-            opened.wait_for_diagnostics(rpc, self.timeout).await;
+            opened
+                .wait_for_diagnostics(rpc, self.timeout.min(MAX_DIAGNOSTICS_WAIT))
+                .await;
         }
         Ok(())
     }
@@ -230,5 +237,9 @@ mod tests {
             &usable,
             tempfile::tempdir().unwrap().path(),
         );
+        // Without this capability the server never publishes, and the wait
+        // after a `didOpen` would only ever end at its cap.
+        let params = usable.initialize_params(tempfile::tempdir().unwrap().path());
+        assert!(params.unwrap()["capabilities"]["textDocument"]["publishDiagnostics"].is_object());
     }
 }

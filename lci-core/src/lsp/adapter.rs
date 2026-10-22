@@ -180,6 +180,13 @@ pub trait LspAdapter: Send + Sync {
 /// a per-file size cap to share (roadmap N18 part f).
 pub const MAX_DID_OPEN_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The longest a hook waits for the server's `publishDiagnostics` after a
+/// `didOpen` (the wait is also bounded by the configured request timeout, and
+/// is the smaller of the two): the worst case of the fixed head start it
+/// replaced. To be lifted once a real-server run shows
+/// `diagnostics_wait_timeouts == 0` for the servers that wait (K11d-2).
+pub const MAX_DIAGNOSTICS_WAIT: Duration = Duration::from_secs(3);
+
 /// Reads `file` for a `textDocument/didOpen` to `server`, or `None` when it is
 /// larger than [`MAX_DID_OPEN_BYTES`]. The read itself stops one byte past
 /// the cap, so no separate size check is needed (and a file that grows

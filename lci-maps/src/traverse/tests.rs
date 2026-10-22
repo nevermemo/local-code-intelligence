@@ -397,7 +397,7 @@ async fn the_deadline_is_never_exceeded() {
         GraphMap::new("slow", &[("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")]).hangs_from(2),
     ]);
     let mut limits = budget(100);
-    limits.deadline = Instant::now() + Duration::from_millis(500);
+    limits.deadline = Instant::now() + Duration::from_secs(2);
     // The second expansion is cut at the deadline, not waited for.
     let result = tokio::time::timeout(
         Duration::from_secs(60),

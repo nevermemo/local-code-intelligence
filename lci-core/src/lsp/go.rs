@@ -13,7 +13,7 @@
 //! `publishDiagnostics` for it before a position request.
 
 use crate::config::GoLspConfig;
-use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
+use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -144,9 +144,11 @@ impl LspAdapter for GoServer {
             // asynchronously, so a request issued immediately after didOpen
             // can race ahead and see no definition/references yet. It
             // publishes diagnostics for the file when it has taken it in:
-            // wait for that, bounded by the configured request timeout. Only
+            // wait for that, bounded by the configured request timeout, at most 3 s. Only
             // a newly sent text needs it.
-            opened.wait_for_diagnostics(rpc, self.timeout).await;
+            opened
+                .wait_for_diagnostics(rpc, self.timeout.min(MAX_DIAGNOSTICS_WAIT))
+                .await;
         }
         Ok(())
     }

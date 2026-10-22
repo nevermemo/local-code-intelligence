@@ -218,14 +218,55 @@ pub struct Diagnostics {
     gave_up: AtomicBool,
 }
 
+/// The key a document is counted under: the same file spelled two ways is one
+/// key. Our URIs come from `Url::from_file_path` (`file:///C:/w/a.py`), while a
+/// server written on `vscode-uri` publishes `file:///c%3A/w/a.py`. A `file`
+/// URI is percent-decoded and its drive letter is lower-cased; any other URI
+/// (or text that is not a URI) is its own key.
+fn canonical_uri(uri: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(uri) else {
+        return uri.to_owned();
+    };
+    if url.scheme() != "file" {
+        return uri.to_owned();
+    }
+    let raw = url.path().as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while at < raw.len() {
+        let hex = |digit: u8| char::from(digit).to_digit(16);
+        match raw.get(at..at + 3) {
+            Some([b'%', high, low]) if hex(*high).is_some() && hex(*low).is_some() => {
+                bytes.push((hex(*high).unwrap_or(0) * 16 + hex(*low).unwrap_or(0)) as u8);
+                at += 3;
+            }
+            _ => {
+                bytes.push(raw[at]);
+                at += 1;
+            }
+        }
+    }
+    // `/C:/w/a.py` and `/c:/w/a.py` name one file on Windows.
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        bytes[1] = bytes[1].to_ascii_lowercase();
+    }
+    format!(
+        "file://{}{}",
+        url.host_str().unwrap_or_default(),
+        String::from_utf8_lossy(&bytes)
+    )
+}
+
 impl Diagnostics {
-    /// Counts one publication for `uri` and wakes the waiters.
+    /// Counts one publication for `uri` and wakes the waiters. The document is
+    /// identified by [`canonical_uri`], not by the spelling the server used.
     pub fn note(&self, uri: &str) {
+        tracing::debug!(uri, "publishDiagnostics");
         *self
             .by_uri
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(uri.to_owned())
+            .entry(canonical_uri(uri))
             .or_default() += 1;
         self.notify.notify_waiters();
     }
@@ -233,10 +274,15 @@ impl Diagnostics {
     /// How many publications for `uri` have arrived so far; 0 for a URI never
     /// published.
     pub fn seen(&self, uri: &str) -> u64 {
+        self.count(&canonical_uri(uri))
+    }
+
+    /// [`Self::seen`] for a key already made by [`canonical_uri`].
+    fn count(&self, key: &str) -> u64 {
         self.by_uri
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(uri)
+            .get(key)
             .copied()
             .unwrap_or(0)
     }
@@ -248,6 +294,7 @@ impl Diagnostics {
     /// would only cost the cap again. A publication already counted past
     /// `seen_before` answers `true` whatever the latch says.
     pub async fn wait_after(&self, uri: &str, seen_before: u64, cap: Duration) -> bool {
+        let key = canonical_uri(uri);
         let published = async {
             loop {
                 // Registered before the count is read, so a publication in
@@ -255,13 +302,13 @@ impl Diagnostics {
                 let notified = self.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.seen(uri) > seen_before {
+                if self.count(&key) > seen_before {
                     return;
                 }
                 notified.await;
             }
         };
-        if self.seen(uri) > seen_before {
+        if self.count(&key) > seen_before {
             return true;
         }
         if self.gave_up.load(Ordering::Acquire) {
@@ -1335,6 +1382,46 @@ mod tests {
             wait.await.unwrap(),
             "a publication for its own document ends it"
         );
+        assert_eq!(diagnostics.wait_timeouts(), 0);
+    }
+
+    /// The same file spelled two ways is one document: ours comes from
+    /// `Url::from_file_path` (`file:///C:/...`), a `vscode-uri` server
+    /// publishes `file:///c%3A/...`.
+    #[tokio::test(start_paused = true)]
+    async fn a_publication_is_matched_to_its_file_whatever_the_spelling() {
+        let ours = "file:///C:/w/my%20dir/a.py";
+        let theirs = "file:///c%3A/w/my%20dir/a.py";
+        let other = "file:///c%3A/w/my%20dir/b.py";
+        assert_eq!(canonical_uri(ours), canonical_uri(theirs));
+        assert_ne!(canonical_uri(ours), canonical_uri(other));
+        // A non-file URI is its own key, and so is text that is no URI.
+        assert_eq!(canonical_uri("untitled:Untitled-1"), "untitled:Untitled-1");
+        assert_eq!(canonical_uri("not a uri"), "not a uri");
+
+        let diagnostics = Arc::new(Diagnostics::default());
+        let wait = tokio::spawn({
+            let diagnostics = Arc::clone(&diagnostics);
+            async move {
+                diagnostics
+                    .wait_after(ours, 0, Duration::from_secs(3600))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        diagnostics.note(other);
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "another file's publication ended the wait"
+        );
+        diagnostics.note(theirs);
+        assert!(
+            wait.await.unwrap(),
+            "the other spelling of its file ends it"
+        );
+        assert_eq!(diagnostics.seen(ours), 1);
+        assert_eq!(diagnostics.seen(theirs), 1);
         assert_eq!(diagnostics.wait_timeouts(), 0);
     }
 

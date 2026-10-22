@@ -391,7 +391,7 @@ mod tests {
             ]]
         );
         assert_eq!(args(Suite::Config).len(), 3);
-        assert_eq!(args(Suite::Lsp).len(), 3);
+        assert_eq!(args(Suite::Lsp).len(), 4);
     }
 
     #[test]

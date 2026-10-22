@@ -217,11 +217,13 @@ async fn a_second_request_for_the_file_waits_out_the_diagnostics_wait() {
     .expect("within the outer bound");
 }
 
-/// A publication that follows the `didOpen` at once is still the one the hook
-/// waits for: the count it compares against is read before the `didOpen` is
-/// written, so a server that answers faster than the hook gets back from the
-/// write does not make the hook wait out its cap (here 5 s, the wait would be
-/// counted as a timeout).
+/// A regression guard, not a pin: a publication that follows the `didOpen` at
+/// once is still the one the hook waits for, because the count it compares
+/// against is read before the `didOpen` is written. A hook that read it after
+/// the write would lose a publication that beat it back from the write and
+/// wait out its cap; this test passed against such an ordering in practice (the
+/// server answers much later than the write returns), so it only catches a
+/// change that breaks the wait or the uri matching for a fast server.
 #[tokio::test]
 async fn a_publication_that_beats_the_hook_back_from_the_write_still_ends_its_wait() {
     tokio::time::timeout(LOADED_BUDGET, async {
