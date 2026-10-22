@@ -831,6 +831,13 @@ struct LspChannel {
     failures: Vec<String>,
     /// Providers that did not answer within `lsp_search_budget_ms`.
     over_budget: Vec<&'static str>,
+    /// Providers whose kept session the tree barrier stopped because the tree
+    /// changed since its last check (see [`App::lsp_channel`]).
+    restarted: Vec<&'static str>,
+    /// Providers whose answers came from a session this search found running,
+    /// each with how long its tree stamp had been unchanged (`None`: no stamp
+    /// was recorded for it).
+    reused: Vec<(&'static str, Option<Duration>)>,
     elapsed_ms: f64,
 }
 
@@ -1298,6 +1305,11 @@ impl App {
         } else {
             ChannelOutcome::Failed
         };
+        // Informational, like the over-budget note: nothing failed.
+        report.notes.extend(super::navigation::barrier_notes(
+            &lsp_result.restarted,
+            &lsp_result.reused,
+        ));
         if !lsp_result.over_budget.is_empty() {
             // Not a warning: nothing failed, the server is just not ready
             // yet. A warning would also count the search as a fallback.
@@ -1805,6 +1817,14 @@ impl App {
     /// ran out are kept, and merged query by query across providers, as one
     /// sequential pass would: first-seen order decides the LSP rank. The
     /// returned channel's `elapsed_ms` is left for the caller to set.
+    ///
+    /// Before the requests, the providers' kept sessions pass the tree barrier
+    /// (`Manager::tree_barrier`): one whose tree changed since its last check
+    /// is stopped and the search starts a fresh one (inside the budget, so a
+    /// slow start reads as an over-budget note). The channel lists those
+    /// restarts and the sessions the search found running whose requests
+    /// completed (one that missed the budget or failed is not an answer from
+    /// a kept session).
     async fn lsp_channel(
         &self,
         providers: &[Arc<dyn LspAdapter>],
@@ -1812,23 +1832,43 @@ impl App {
         symbol_queries: &[String],
     ) -> LspChannel {
         let budget = Duration::from_millis(self.config.lsp_search_budget_ms);
-        let answers = futures::future::join_all(providers.iter().map(|adapter| async move {
-            let gathered = std::sync::Mutex::new(Vec::new());
-            let answer = tokio::time::timeout(
-                budget,
-                self.provider_symbols(adapter, workspace, symbol_queries, &gathered),
-            )
+        // A kept session passes the tree barrier once, before the providers'
+        // requests and outside their budget (a stamp, not a request); the
+        // requests run in one scope that records which sessions the search
+        // found running.
+        let provider_refs: Vec<&Arc<dyn LspAdapter>> = providers.iter().collect();
+        let restarted = self.analyzer.tree_barrier(workspace, &provider_refs).await;
+        let walk = Arc::new(crate::lsp::WalkSessions::default());
+        let answers = walk
+            .scope(futures::future::join_all(providers.iter().map(
+                |adapter| async move {
+                    let gathered = std::sync::Mutex::new(Vec::new());
+                    let answer = tokio::time::timeout(
+                        budget,
+                        self.provider_symbols(adapter, workspace, symbol_queries, &gathered),
+                    )
+                    .await;
+                    let gathered = gathered.into_inner().unwrap_or_else(|p| p.into_inner());
+                    (adapter.provider(), gathered, answer)
+                },
+            )))
             .await;
-            let gathered = gathered.into_inner().unwrap_or_else(|p| p.into_inner());
-            (adapter.provider(), gathered, answer)
-        }))
-        .await;
-        let mut channel = LspChannel::default();
+        let mut channel = LspChannel {
+            restarted,
+            ..LspChannel::default()
+        };
+        // The providers whose requests all completed: the session is recorded
+        // when a request acquires it, so a provider that then missed the
+        // budget or failed is not labelled as an answer from a kept session.
+        let mut completed: Vec<&'static str> = Vec::new();
         let mut per_provider = Vec::new();
         for (provider, gathered, answer) in answers {
             per_provider.push(gathered);
             match answer {
-                Ok(failure) => channel.failures.extend(failure),
+                Ok(failure) => {
+                    completed.extend(failure.is_none().then_some(provider));
+                    channel.failures.extend(failure);
+                }
                 Err(_) => {
                     tracing::debug!(
                         provider,
@@ -1839,6 +1879,11 @@ impl App {
                 }
             }
         }
+        channel.reused = walk
+            .reused()
+            .into_iter()
+            .filter(|(provider, _)| completed.contains(provider))
+            .collect();
         for index in 0..symbol_queries.len() {
             for locations in &mut per_provider {
                 if let Some(found) = locations.get_mut(index) {

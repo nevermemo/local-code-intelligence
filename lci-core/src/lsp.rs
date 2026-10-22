@@ -762,8 +762,9 @@ tokio::task_local! {
 /// before either starts a server. So the manager records it when a request
 /// acquires its session ([`Manager::session`]), for the requests made inside
 /// [`WalkSessions::scope`]; the walk reads [`Self::reused`] when it ends and
-/// labels the answers of a reused server. Requests made outside a scope (the
-/// warm start, navigation, the search channel) are not recorded.
+/// labels the answers of a reused server. Navigation and the search channel
+/// make their requests inside a scope too. Requests made outside a scope (the
+/// warm start) are not recorded.
 #[derive(Default)]
 pub struct WalkSessions {
     seen: std::sync::Mutex<Vec<SessionUse>>,
