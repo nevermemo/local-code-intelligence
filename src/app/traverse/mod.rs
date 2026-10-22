@@ -76,6 +76,8 @@ mod rescore;
 mod response;
 pub(crate) mod seeds;
 #[cfg(test)]
+mod structural_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::{
@@ -209,15 +211,17 @@ pub const OPT_IN_MAPS: [MapId; 16] = [
     SEEDS_BM25,
     SEEDS_LITERAL,
 ];
+/// The longest the `rg --version` probe of `grep.structural` waits.
+const RIPGREP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Whether `rg --version` runs for the resolved ripgrep path: `grep.structural`
-/// asks ripgrep for its candidate files and has no other source.
+/// asks ripgrep for its candidate files and has no other source. The probe is
+/// bounded and memoised per binary for the process (d470), as the readiness
+/// check's is.
 async fn ripgrep_runs(resolved: &Path) -> bool {
-    tokio::process::Command::new(resolved)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
+    lci_core::lsp::adapter::probe_subprocess_version(resolved, RIPGREP_PROBE_TIMEOUT)
         .await
-        .is_ok_and(|output| output.status.success())
+        .is_ok()
 }
 
 /// The note of a call that names `probe.compile` without the trust grant.

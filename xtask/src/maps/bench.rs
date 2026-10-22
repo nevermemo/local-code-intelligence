@@ -558,20 +558,21 @@ impl ConfigOverlay {
     }
 }
 
-/// The opt-in seed maps `--maps` names, each with its `[run_profile.seeds]`
-/// key.
-fn named_opt_in_seed_maps(maps: &[String]) -> Vec<(&'static str, &'static str)> {
+/// The opt-in maps `--maps` names that have a profile key (the seed maps, each
+/// with its `[run_profile.seeds]` key, and `grep.structural` with `[run_profile.grep]
+/// structural`), as (map, table, key).
+fn named_opt_in_seed_maps(maps: &[String]) -> Vec<(&'static str, &'static str, &'static str)> {
     OPT_IN_SEED_KEYS
         .iter()
-        .filter(|(map, _)| maps.iter().any(|named| named == map))
+        .filter(|(map, _, _)| maps.iter().any(|named| named == map))
         .copied()
         .collect()
 }
 
-/// `base` (the text of an overlay, or none) with `[run_profile.seeds] <key> =
-/// true` for each key; the rest of the table stays. `None` when every key is
+/// `base` (the text of an overlay, or none) with `[run_profile.<table>] <key> =
+/// true` for each (table, key); the rest of the table stays. `None` when every key is
 /// already true. Comments of `base` are not kept.
-fn with_seed_keys_on(base: Option<&str>, keys: &[&str]) -> Result<Option<String>> {
+fn with_seed_keys_on(base: Option<&str>, keys: &[(&str, &str)]) -> Result<Option<String>> {
     let mut table: toml::Table = match base {
         Some(text) => toml::from_str(text).context("parse the --config overlay as TOML")?,
         None => toml::Table::new(),
@@ -581,27 +582,34 @@ fn with_seed_keys_on(base: Option<&str>, keys: &[&str]) -> Result<Option<String>
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .context("[run_profile] of the --config overlay is not a table")?;
-    let seeds = profile
-        .entry("seeds")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .context("[run_profile.seeds] of the --config overlay is not a table")?;
-    if keys
-        .iter()
-        .all(|key| seeds.get(*key).and_then(toml::Value::as_bool) == Some(true))
-    {
+    let is_on = |profile: &toml::Table, (section, key): &(&str, &str)| {
+        profile
+            .get(*section)
+            .and_then(toml::Value::as_table)
+            .and_then(|section| section.get(*key))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    };
+    if keys.iter().all(|key| is_on(profile, key)) {
         return Ok(None);
     }
-    for key in keys {
-        seeds.insert((*key).to_owned(), toml::Value::Boolean(true));
+    for (section, key) in keys {
+        profile
+            .entry(*section)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .with_context(|| {
+                format!("[run_profile.{section}] of the --config overlay is not a table")
+            })?
+            .insert((*key).to_owned(), toml::Value::Boolean(true));
     }
     Ok(Some(
         toml::to_string(&table).context("render the derived overlay")?,
     ))
 }
 
-/// Naming `seeds.bm25` or `seeds.literal` in `--maps` turns its
-/// `[run_profile.seeds]` key on for the run (d461), since the map gives no
+/// Naming `seeds.bm25`, `seeds.literal` or `grep.structural` in `--maps` turns its
+/// profile key (`[run_profile.seeds]`, `[run_profile.grep]`) on for the run (d461, d483), since the map gives no
 /// start nodes while the key is off. When the `--config` overlay (if any) does
 /// not already have the key on, the effective overlay becomes a file written to
 /// `dir`: the user's overlay with the key on, or only the key when there is
@@ -624,7 +632,7 @@ fn seed_map_overlay(
         ),
         None => None,
     };
-    let keys: Vec<&str> = named.iter().map(|(_, key)| *key).collect();
+    let keys: Vec<(&str, &str)> = named.iter().map(|(_, table, key)| (*table, *key)).collect();
     let Some(text) = with_seed_keys_on(base.as_deref(), &keys)? else {
         return Ok(overlay);
     };
@@ -638,7 +646,7 @@ fn seed_map_overlay(
     std::fs::write(&path, text)
         .with_context(|| format!("write the derived overlay {}", path.display()))?;
     let mut derived = ConfigOverlay::load(&path)?;
-    derived.seed_maps_on = named.iter().map(|(map, _)| (*map).to_owned()).collect();
+    derived.seed_maps_on = named.iter().map(|(map, _, _)| (*map).to_owned()).collect();
     derived.derived_from = overlay.map(|user| user.sha256);
     Ok(Some(derived))
 }
@@ -821,9 +829,13 @@ const SEED_MAPS: [&str; 4] = [
     "seeds.literal",
 ];
 
-/// The seed maps that are off until their `[run_profile.seeds]` key is on,
-/// each with that key (d461).
-const OPT_IN_SEED_KEYS: [(&str, &str); 2] = [("seeds.bm25", "bm25"), ("seeds.literal", "literal")];
+/// The maps that are off until their profile key is on (the seed maps, K19),
+/// each as (map, table, key) (d461, d483).
+const OPT_IN_SEED_KEYS: [(&str, &str, &str); 3] = [
+    ("seeds.bm25", "seeds", "bm25"),
+    ("seeds.literal", "seeds", "literal"),
+    ("grep.structural", "grep", "structural"),
+];
 
 /// The node kinds a known map emits (the `emits` of its descriptor); `None`
 /// for a map this runner does not know (it is run and judged by its results).
@@ -3408,6 +3420,70 @@ pub fn free_two() {}
         assert!(can_answer(Set::History, &with_git));
         // A map this runner does not know is run and judged by its results.
         assert!(can_answer(Set::History, &strings(&["git.log"])));
+    }
+
+    #[test]
+    fn naming_grep_structural_turns_its_grep_key_on_in_that_arms_overlay() {
+        let dir = std::env::temp_dir().join(format!("xtask-grep-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let strings = |maps: &[&str]| maps.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parse = |text: &str| -> lci_core::config::Config { toml::from_str(text).unwrap() };
+        assert!(
+            !lci_core::config::Config::default()
+                .run_profile
+                .grep
+                .structural
+        );
+
+        // Named with no overlay: a file with `[run_profile.grep] structural`
+        // on and the seeds keys untouched.
+        let named = strings(&["graph.scip", "scip.implements", "grep.structural"]);
+        let derived = seed_map_overlay(&named, None, &dir.join("arm"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived.seed_maps_on, ["grep.structural"]);
+        let config = parse(&std::fs::read_to_string(&derived.path).unwrap());
+        assert!(config.run_profile.grep.structural);
+        assert!(!config.run_profile.seeds.bm25 && !config.run_profile.seeds.literal);
+        config.validate().unwrap();
+
+        // Next to a seeds map and a user overlay: both keys on, the user's
+        // other keys stay.
+        let user = dir.join("pricing.toml");
+        std::fs::write(&user, "[run_profile.walk]\npricing = \"relative\"\n").unwrap();
+        let user = ConfigOverlay::load(&user).unwrap();
+        let both = strings(&["seeds.bm25", "grep.structural"]);
+        let derived = seed_map_overlay(&both, Some(user.clone()), &dir.join("arm2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived.seed_maps_on, ["seeds.bm25", "grep.structural"]);
+        assert_eq!(derived.derived_from.as_deref(), Some(user.sha256.as_str()));
+        let config = parse(&std::fs::read_to_string(&derived.path).unwrap());
+        assert!(config.run_profile.grep.structural && config.run_profile.seeds.bm25);
+        assert_eq!(
+            config.run_profile.walk.pricing,
+            lci_core::config::WalkPricing::Relative
+        );
+
+        // An overlay with the key on already is used as it is; a run that
+        // does not name the map leaves the overlay alone.
+        let on = dir.join("on.toml");
+        std::fs::write(&on, "[run_profile.grep]\nstructural = true\n").unwrap();
+        let on = ConfigOverlay::load(&on).unwrap();
+        let same = seed_map_overlay(&named, Some(on.clone()), &dir.join("on")).unwrap();
+        assert_eq!(same, Some(on.clone()));
+        assert!(!dir.join("on").exists());
+        let unnamed = seed_map_overlay(&strings(&["graph.scip"]), None, &dir.join("none")).unwrap();
+        assert_eq!(unnamed, None);
+
+        // `[run_profile.grep]` that is not a table is an error.
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[run_profile]\ngrep = 3\n").unwrap();
+        let bad = ConfigOverlay::load(&bad).unwrap();
+        let err = seed_map_overlay(&named, Some(bad), &dir.join("bad")).unwrap_err();
+        assert!(format!("{err:#}").contains("not a table"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

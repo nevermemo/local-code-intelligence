@@ -803,7 +803,9 @@ literal = false
 # occurrences that an ast-grep pattern finds in a header (`impl .. for ..`,
 # `extends`, `implements`: an Implements edge to the other party) or as a call (a
 # CallsOrRefs edge to the enclosing function). A name in a comment or a string
-# gives no edge. No derive or macro impl, and no Go or duck-typed header, is seen.
+# gives no edge. Not seen: derive and macro impls, Go and duck-typed headers, Rust headers
+# with a `where` clause, a generic seed type (`impl Shape for Wrapper<T>` is not found from
+# `Wrapper`), C and C++ member calls (`a.f()`, `p->f()`), calls inside a Rust macro.
 # Part of the run-profile hash.
 [run_profile.grep]
 structural = false
