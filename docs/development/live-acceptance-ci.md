@@ -21,10 +21,11 @@ Why a self-hosted runner is the only complete option: hosted runners cannot reac
 
 ## Workflow properties
 
-- Triggers: `push` to `main` and manual `workflow_dispatch`; never `pull_request`, because a self-hosted runner must
-  not execute code from a fork PR. With no runner registered, a push to `main` leaves the job queued.
+- Triggers: manual `workflow_dispatch` only (d538). With no runner registered, a push trigger only queued runs that
+  never started; add `push` to `main` back once the `lci-live` runner exists. Never `pull_request`, because a
+  self-hosted runner must not execute code from a fork PR.
 - `runs-on: [self-hosted, lci-live]`.
-- `concurrency: { group: live-acceptance, cancel-in-progress: false }`: pushes queue on the one runner.
+- `concurrency: { group: live-acceptance, cancel-in-progress: false }`: runs queue on the one runner.
 - `timeout-minutes: 150`. The first real run took a little over an hour end to end, and the original 60-minute bound
   cut off a run that had passed every acceptance step; a single job bound cannot tell a slow healthy step from a dead
   one, which is why the orchestrator also gives each step its own timeout.

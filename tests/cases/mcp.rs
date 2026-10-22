@@ -4212,3 +4212,170 @@ async fn index_status_lists_a_server_per_language_and_the_languages_without_one(
     server.abort();
     models_task.abort();
 }
+
+/// An embedding service whose first request never answers and whose later
+/// ones do, and what it saw: the signals of the cancellation tests.
+struct StallingEmbedder {
+    /// The base URL (`.../v1`) to put in `embedding_url`.
+    url: String,
+    /// Notified when the first request reaches the service.
+    started: Arc<tokio::sync::Notify>,
+    /// Notified when that request's handler is dropped, which hyper does when
+    /// the client closes the connection, that is, when LCI drops the
+    /// request future it was awaiting.
+    abandoned: Arc<tokio::sync::Notify>,
+    /// How many requests were abandoned.
+    abandoned_count: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct AbandonGuard(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        self.1.notify_one();
+    }
+}
+
+fn stalling_embedder() -> StallingEmbedder {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let abandoned = Arc::new(tokio::sync::Notify::new());
+    let abandoned_count = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let router = Router::new().route(
+        "/v1/embeddings",
+        post({
+            let (started, abandoned) = (started.clone(), abandoned.clone());
+            let (abandoned_count, requests) = (abandoned_count.clone(), requests.clone());
+            move |Json(body): Json<Value>| {
+                let (started, abandoned) = (started.clone(), abandoned.clone());
+                let (abandoned_count, requests) = (abandoned_count.clone(), requests.clone());
+                async move {
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let _guard = AbandonGuard(abandoned_count, abandoned);
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    let data: Vec<_> = (0..body["input"].as_array().unwrap().len())
+                        .map(|index| json!({"index": index, "embedding": [1.0, 0.0, 0.0]}))
+                        .collect();
+                    Json(json!({"data": data}))
+                }
+            }
+        }),
+    );
+    let listener = loopback_tokio_listener();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    StallingEmbedder {
+        url,
+        started,
+        abandoned,
+        abandoned_count,
+        task,
+    }
+}
+
+/// Starts `tool` over MCP while the embedder stalls, cancels it with a
+/// `notifications/cancelled`, and checks that the handler let go of its work:
+/// the embedding request it was awaiting is abandoned, and the same server
+/// then runs `index_workspace` and `search_code` to the end (so the workspace
+/// write lock and the index lock were released and the index is whole).
+/// The outer timeouts only end a hung wait; no assertion depends on a time.
+async fn assert_a_cancelled_call_stops_its_work(tool: &str, arguments: impl Fn(&Path) -> Value) {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    let embedder = stalling_embedder();
+    config.embedding_url = embedder.url.clone();
+    // High, so a loaded machine cannot pass by a timeout and a retry instead
+    // of the cancel.
+    config.embedding_timeout_seconds = 3600;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("cancelled-mcp-call");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let guard = Duration::from_secs(60);
+
+    let request_id = 41;
+    let call = {
+        let (client, url, session) = (client.clone(), format!("{base}/mcp"), session.clone());
+        let message = json!({"jsonrpc":"2.0","id":request_id,"method":"tools/call","params":{"name":tool,"arguments":arguments(&workspace)}});
+        tokio::spawn(async move { mcp_post(&client, &url, Some(&session), &message).await })
+    };
+    tokio::time::timeout(guard, embedder.started.notified())
+        .await
+        .expect("the call did not reach the embedding service");
+    assert_eq!(embedder.abandoned_count.load(Ordering::SeqCst), 0);
+
+    let cancelled = mcp_post(
+        &client,
+        &format!("{base}/mcp"),
+        Some(&session),
+        &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id,"reason":"test"}}),
+    )
+    .await;
+    assert!(cancelled.status().is_success(), "{}", cancelled.status());
+    tokio::time::timeout(guard, embedder.abandoned.notified())
+        .await
+        .expect("the cancelled call still holds its embedding request");
+    assert_eq!(embedder.abandoned_count.load(Ordering::SeqCst), 1);
+
+    // The released locks: a later call indexes and searches to the end.
+    let index = tokio::time::timeout(
+        guard,
+        mcp_call(
+            &client,
+            &base,
+            "/mcp",
+            &session,
+            "index_workspace",
+            json!({"workspace_path": workspace}),
+        ),
+    )
+    .await
+    .expect("index_workspace after the cancel waits for the cancelled call");
+    assert_eq!(structured(&index)["chunks"], 1, "{index}");
+    let search = tokio::time::timeout(
+        guard,
+        mcp_search_everything(&client, &base, "/mcp", &session, &workspace),
+    )
+    .await
+    .expect("search_code after the cancel hangs");
+    assert_eq!(
+        structured(&search)["results"].as_array().unwrap().len(),
+        1,
+        "{search}"
+    );
+    // Only the first request was abandoned: the cancelled call did not go on
+    // to send another embedding request.
+    assert_eq!(embedder.abandoned_count.load(Ordering::SeqCst), 1);
+
+    call.abort();
+    token.cancel();
+    server.abort();
+    embedder.task.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn a_cancelled_mcp_index_workspace_drops_its_work_and_frees_the_index() {
+    assert_a_cancelled_call_stops_its_work(
+        "index_workspace",
+        |workspace| json!({"workspace_path": workspace}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_cancelled_mcp_search_code_drops_its_work_and_frees_the_index() {
+    assert_a_cancelled_call_stops_its_work(
+        "search_code",
+        |workspace| json!({"workspace_path": workspace, "query": "translator", "top_k": 8}),
+    )
+    .await;
+}

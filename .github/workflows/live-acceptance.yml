@@ -1,8 +1,9 @@
 name: Live Acceptance
 
 on:
-  push:
-    branches: [main]
+  # By hand only (d538): no self-hosted runner is registered, and a push
+  # trigger only queued runs that never started. Add `push: branches: [main]`
+  # back once the `lci-live` runner exists.
   workflow_dispatch: {}
 
 # Runs the live acceptance/evaluation suite (`cargo xtask live-acceptance`:
