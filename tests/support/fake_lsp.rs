@@ -431,15 +431,15 @@ fn record_event(state_dir: Option<&Path>, name: &str) {
 /// fallen due and records each as `diagnostics_sent.txt`, before the write, so
 /// a client that has read the notification finds the record.
 fn send_due_diagnostics<W: Write>(
-    pending: &mut VecDeque<(Instant, String)>,
+    pending: &mut VecDeque<(Instant, String, Option<i64>)>,
     stdout: &mut W,
     config: &FakeLspConfig,
 ) -> io::Result<()> {
     while pending
         .front()
-        .is_some_and(|(due, _)| *due <= Instant::now())
+        .is_some_and(|(due, ..)| *due <= Instant::now())
     {
-        let Some((_, uri)) = pending.pop_front() else {
+        let Some((_, uri, version)) = pending.pop_front() else {
             break;
         };
         record_event(config.state_dir.as_deref(), "diagnostics_sent.txt");
@@ -447,7 +447,7 @@ fn send_due_diagnostics<W: Write>(
             stdout,
             &json_notification(
                 "textDocument/publishDiagnostics",
-                json!({"uri": uri, "diagnostics": []}),
+                json!({"uri": uri, "version": version, "diagnostics": []}),
             ),
         )?;
     }
@@ -527,7 +527,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     // order of the `didOpen`s. With a delay the input is read on a thread, so
     // a publication that falls due while the server waits is sent then and a
     // request that arrives first is read first.
-    let mut pending_diagnostics: VecDeque<(Instant, String)> = VecDeque::new();
+    let mut pending_diagnostics: VecDeque<(Instant, String, Option<i64>)> = VecDeque::new();
     let threaded_input = (config.diagnostics_delay_ms > 0 && !config.no_diagnostics).then(|| {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -550,7 +550,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 break read_frame(&mut stdin)?;
             };
             let received = match pending_diagnostics.front() {
-                Some((due, _)) => input.recv_timeout(due.saturating_duration_since(Instant::now())),
+                Some((due, ..)) => {
+                    input.recv_timeout(due.saturating_duration_since(Instant::now()))
+                }
                 None => input
                     .recv()
                     .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
@@ -780,6 +782,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 pending_diagnostics.push_back((
                     Instant::now() + Duration::from_millis(config.diagnostics_delay_ms),
                     uri.to_owned(),
+                    request["params"]["textDocument"]["version"].as_i64(),
                 ));
                 send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
             }

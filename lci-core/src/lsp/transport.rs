@@ -194,6 +194,14 @@ impl TransportConfig {
     }
 }
 
+/// What the server has published for one document: how many publications, and
+/// the `version` the latest carried (`None` when it carried none).
+#[derive(Debug, Default, Clone, Copy)]
+struct Published {
+    count: u64,
+    version: Option<i64>,
+}
+
 /// How many `textDocument/publishDiagnostics` notifications the server has
 /// sent for each document URI, and the wait on them. A server that publishes
 /// diagnostics for a document it was just sent has taken the text in and
@@ -201,21 +209,20 @@ impl TransportConfig {
 /// adapters wait for after a `textDocument/didOpen`, in place of a fixed head
 /// start.
 ///
-/// Only counts are kept, never the diagnostics. The count of a URI is read
-/// before the `didOpen` goes out ([`Self::seen`]) and the wait ends when the
-/// count passes that reading ([`Self::wait_after`]), so a publication for an
-/// earlier text of the document cannot end the wait for a later one.
+/// Only counts and versions are kept, never the diagnostics. The count of a
+/// URI is read before the `didOpen` goes out ([`Self::seen`]) and the wait ends
+/// when the count passes that reading ([`Self::wait_after`]) with a
+/// publication that is not for an older text: one that carries a `version`
+/// below the version the wait opened is not an answer to this open. It is a
+/// best-effort signal, not proof that the server holds the current text: a
+/// server that publishes without a version, or a late publication for the
+/// previous text that carries the same version, can still end a wait early.
 #[derive(Debug, Default)]
 pub struct Diagnostics {
-    by_uri: std::sync::Mutex<HashMap<String, u64>>,
+    by_uri: std::sync::Mutex<HashMap<String, Published>>,
     notify: tokio::sync::Notify,
-    /// How many waits ended at their cap.
+    /// How many waits ended at their cap (each one is counted).
     wait_timeouts: AtomicU64,
-    /// Set by the first wait that ended at its cap: a server that did not
-    /// publish for a document it was sent is taken not to publish for opened
-    /// documents at all, and no later wait is made (it would cost the cap
-    /// again for nothing). Cleared by nothing: one bounded wait per session.
-    gave_up: AtomicBool,
 }
 
 /// The key a document is counted under: the same file spelled two ways is one
@@ -258,42 +265,61 @@ fn canonical_uri(uri: &str) -> String {
 }
 
 impl Diagnostics {
-    /// Counts one publication for `uri` and wakes the waiters. The document is
-    /// identified by [`canonical_uri`], not by the spelling the server used.
-    pub fn note(&self, uri: &str) {
-        tracing::debug!(uri, "publishDiagnostics");
-        *self
+    /// Counts one publication for `uri`, which carried `version` when the
+    /// server sent one, and wakes the waiters. The document is identified by
+    /// [`canonical_uri`], not by the spelling the server used.
+    pub fn note(&self, uri: &str, version: Option<i64>) {
+        tracing::debug!(uri, ?version, "publishDiagnostics");
+        let mut by_uri = self
             .by_uri
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(canonical_uri(uri))
-            .or_default() += 1;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let published = by_uri.entry(canonical_uri(uri)).or_default();
+        published.count += 1;
+        published.version = version;
+        drop(by_uri);
         self.notify.notify_waiters();
     }
 
     /// How many publications for `uri` have arrived so far; 0 for a URI never
     /// published.
     pub fn seen(&self, uri: &str) -> u64 {
-        self.count(&canonical_uri(uri))
+        self.published(&canonical_uri(uri)).count
     }
 
-    /// [`Self::seen`] for a key already made by [`canonical_uri`].
-    fn count(&self, key: &str) -> u64 {
+    /// What the server has published for a key already made by
+    /// [`canonical_uri`].
+    fn published(&self, key: &str) -> Published {
         self.by_uri
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
-    /// Waits until more than `seen_before` publications have arrived for
-    /// `uri`, for at most `cap`. `true` when they have. `false` when the cap
-    /// passed first, or at once when an earlier wait already ended at its cap
-    /// (see the `gave_up` latch): the server does not publish, and the wait
-    /// would only cost the cap again. A publication already counted past
-    /// `seen_before` answers `true` whatever the latch says.
-    pub async fn wait_after(&self, uri: &str, seen_before: u64, cap: Duration) -> bool {
+    /// Whether a publication for `key` after the reading `seen_before` answers
+    /// the open of `version`: one has arrived, and the latest does not carry
+    /// an older version.
+    fn answers(&self, key: &str, seen_before: u64, version: i64) -> bool {
+        let published = self.published(key);
+        published.count > seen_before && published.version.is_none_or(|sent| sent >= version)
+    }
+
+    /// Waits until a publication for `uri` has arrived after the reading
+    /// `seen_before` that answers the open of `version` (see the type's
+    /// notes), for at most `cap`. `true` when one has. `false` when the cap
+    /// passed first; that is counted ([`Self::wait_timeouts`]) and logged at
+    /// debug, and every later wait waits again: one wait that ran out is not
+    /// proof that the server never publishes (pyright publishes after 3 s
+    /// when it starts cold).
+    pub async fn wait_after(
+        &self,
+        uri: &str,
+        seen_before: u64,
+        version: i64,
+        cap: Duration,
+    ) -> bool {
         let key = canonical_uri(uri);
         let published = async {
             loop {
@@ -302,29 +328,24 @@ impl Diagnostics {
                 let notified = self.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.count(&key) > seen_before {
+                if self.answers(&key, seen_before, version) {
                     return;
                 }
                 notified.await;
             }
         };
-        if self.count(&key) > seen_before {
+        if self.answers(&key, seen_before, version) {
             return true;
-        }
-        if self.gave_up.load(Ordering::Acquire) {
-            return false;
         }
         if tokio::time::timeout(cap, published).await.is_ok() {
             return true;
         }
         self.wait_timeouts.fetch_add(1, Ordering::Relaxed);
-        if !self.gave_up.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
-                uri,
-                cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
-                "no publishDiagnostics for an opened document within the wait; not waiting for diagnostics again in this session"
-            );
-        }
+        tracing::debug!(
+            uri,
+            cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
+            "no publishDiagnostics for an opened document within the wait"
+        );
         false
     }
 
@@ -544,13 +565,21 @@ impl JsonRpcClient {
     }
 
     /// Waits until the server has published diagnostics for `uri` after the
-    /// reading `seen_before` ([`Self::diagnostics_seen`]), for at most `cap`.
-    /// `false` when the cap passed first, or at once once an earlier wait of
-    /// this client passed its cap (a server that does not publish costs one
-    /// bounded wait per session, see [`Diagnostics::wait_after`]). It waits
-    /// on the server's own notifications, never on a timer.
-    pub async fn wait_diagnostics(&self, uri: &str, seen_before: u64, cap: Duration) -> bool {
-        self.diagnostics.wait_after(uri, seen_before, cap).await
+    /// reading `seen_before` ([`Self::diagnostics_seen`]) that answer the open
+    /// of `version` (a publication carrying an older `version` does not), for
+    /// at most `cap`. `false` when the cap passed first. A best-effort signal
+    /// (see [`Diagnostics`]). It waits on the server's own notifications,
+    /// never on a timer.
+    pub async fn wait_diagnostics(
+        &self,
+        uri: &str,
+        seen_before: u64,
+        version: i64,
+        cap: Duration,
+    ) -> bool {
+        self.diagnostics
+            .wait_after(uri, seen_before, version, cap)
+            .await
     }
 
     /// How many [`Self::wait_diagnostics`] calls ended at their cap.
@@ -562,6 +591,34 @@ impl JsonRpcClient {
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .await
+    }
+
+    /// [`Self::notify`] for a notification whose write must finish whether or
+    /// not the caller is still there: `hold` (a lock the notification is
+    /// ordered by) goes into the write task and lives until the write ends, so
+    /// a caller that is cancelled mid-write does not release it early; and
+    /// `written` runs in that task once the write succeeded (never after a
+    /// failure), so state that says "the server was sent this" is recorded
+    /// only for a notification that is on the pipe. Answers `hold` back when
+    /// the write succeeded.
+    pub async fn notify_holding<H: Send + 'static>(
+        &self,
+        method: &str,
+        params: Value,
+        hold: H,
+        written: impl FnOnce() + Send + 'static,
+    ) -> Result<H> {
+        let writer = Arc::clone(&self.writer);
+        let value = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        tokio::spawn(async move {
+            let outcome = writer.write_framed(&value).await;
+            if outcome.is_ok() {
+                written();
+            }
+            outcome.map(|()| hold)
+        })
+        .await
+        .context("language-server write task ended unexpectedly")?
     }
 
     /// Sends a JSON-RPC request and waits for the correlated response.
@@ -951,7 +1008,7 @@ async fn read_messages(
             && method == Some("textDocument/publishDiagnostics")
             && let Some(uri) = message["params"]["uri"].as_str()
         {
-            diagnostics.note(uri);
+            diagnostics.note(uri, message["params"]["version"].as_i64());
         }
         // Notifications (no id): evaluate readiness predicate.
         if request_id.is_none() && ready_predicate(&message) {
@@ -1350,7 +1407,7 @@ mod tests {
         let (a, b) = ("file:///work/a.py", "file:///work/b.py");
         let diagnostics = Arc::new(Diagnostics::default());
         // A publication for an earlier text of `a`: counted before the reading.
-        diagnostics.note(a);
+        diagnostics.note(a, None);
         let before = diagnostics.seen(a);
         assert_eq!(before, 1);
         assert_eq!(diagnostics.seen(b), 0);
@@ -1359,7 +1416,7 @@ mod tests {
             let diagnostics = Arc::clone(&diagnostics);
             async move {
                 diagnostics
-                    .wait_after(a, before, Duration::from_secs(3600))
+                    .wait_after(a, before, 1, Duration::from_secs(3600))
                     .await
             }
         });
@@ -1370,17 +1427,55 @@ mod tests {
             "nothing was published after the reading"
         );
 
-        diagnostics.note(b);
+        diagnostics.note(b, None);
         tokio::task::yield_now().await;
         assert!(
             !wait.is_finished(),
             "another document's publication ended the wait"
         );
 
-        diagnostics.note(a);
+        diagnostics.note(a, None);
         assert!(
             wait.await.unwrap(),
             "a publication for its own document ends it"
+        );
+        assert_eq!(diagnostics.wait_timeouts(), 0);
+    }
+
+    /// A publication that carries the version of an older text is not the
+    /// answer to a newer open; one without a version, or with a version at
+    /// least as new, is.
+    #[tokio::test(start_paused = true)]
+    async fn a_publication_for_an_older_version_does_not_end_the_wait() {
+        let uri = "file:///work/a.py";
+        let diagnostics = Arc::new(Diagnostics::default());
+        let before = diagnostics.seen(uri);
+        let wait = tokio::spawn({
+            let diagnostics = Arc::clone(&diagnostics);
+            async move {
+                diagnostics
+                    .wait_after(uri, before, 2, Duration::from_secs(3600))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // The late publication for version 1, the previous text.
+        diagnostics.note(uri, Some(1));
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "the older text's publication ended it");
+
+        diagnostics.note(uri, Some(2));
+        assert!(wait.await.unwrap(), "the open's own version ends it");
+
+        // Without a version it is counted as it always was.
+        let other = "file:///work/b.py";
+        let before = diagnostics.seen(other);
+        diagnostics.note(other, None);
+        assert!(
+            diagnostics
+                .wait_after(other, before, 5, Duration::from_secs(1))
+                .await
         );
         assert_eq!(diagnostics.wait_timeouts(), 0);
     }
@@ -1404,18 +1499,18 @@ mod tests {
             let diagnostics = Arc::clone(&diagnostics);
             async move {
                 diagnostics
-                    .wait_after(ours, 0, Duration::from_secs(3600))
+                    .wait_after(ours, 0, 1, Duration::from_secs(3600))
                     .await
             }
         });
         tokio::task::yield_now().await;
-        diagnostics.note(other);
+        diagnostics.note(other, None);
         tokio::task::yield_now().await;
         assert!(
             !wait.is_finished(),
             "another file's publication ended the wait"
         );
-        diagnostics.note(theirs);
+        diagnostics.note(theirs, None);
         assert!(
             wait.await.unwrap(),
             "the other spelling of its file ends it"
@@ -1425,33 +1520,25 @@ mod tests {
         assert_eq!(diagnostics.wait_timeouts(), 0);
     }
 
-    /// A server that does not publish ends the first wait at its cap and costs
-    /// nothing after that; a publication that did arrive still answers `true`.
+    /// A server that does not publish ends a wait at its cap, and the next
+    /// wait waits again: one run-out wait is not proof that none will come.
     #[tokio::test(start_paused = true)]
-    async fn a_wait_that_reaches_its_cap_is_counted_once_and_not_repeated() {
+    async fn every_wait_that_reaches_its_cap_is_counted_and_waits_in_full() {
         let diagnostics = Diagnostics::default();
         let cap = Duration::from_secs(10);
-        let started = tokio::time::Instant::now();
 
-        assert!(!diagnostics.wait_after("file:///work/a.py", 0, cap).await);
-        assert_eq!(diagnostics.wait_timeouts(), 1);
-        assert_eq!(started.elapsed(), cap, "the first wait ran to its cap");
+        for (index, uri) in ["file:///work/a.py", "file:///work/b.py"]
+            .into_iter()
+            .enumerate()
+        {
+            let started = tokio::time::Instant::now();
+            assert!(!diagnostics.wait_after(uri, 0, 1, cap).await);
+            assert_eq!(started.elapsed(), cap, "{uri}: the wait ran to its cap");
+            assert_eq!(diagnostics.wait_timeouts(), index as u64 + 1);
+        }
 
-        let second = tokio::time::Instant::now();
-        assert!(!diagnostics.wait_after("file:///work/b.py", 0, cap).await);
-        assert_eq!(
-            second.elapsed(),
-            Duration::ZERO,
-            "the latched wait is skipped"
-        );
-        assert_eq!(
-            diagnostics.wait_timeouts(),
-            1,
-            "a skipped wait is not a timeout"
-        );
-
-        diagnostics.note("file:///work/c.py");
-        assert!(diagnostics.wait_after("file:///work/c.py", 0, cap).await);
-        assert_eq!(diagnostics.wait_timeouts(), 1);
+        diagnostics.note("file:///work/c.py", None);
+        assert!(diagnostics.wait_after("file:///work/c.py", 0, 1, cap).await);
+        assert_eq!(diagnostics.wait_timeouts(), 2);
     }
 }

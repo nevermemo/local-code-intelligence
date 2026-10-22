@@ -196,3 +196,57 @@ async fn a_request_for_a_file_being_opened_waits_for_the_open_to_finish() {
     .await
     .expect("within the outer bound");
 }
+
+/// A caller cancelled while its `didOpen` is being written must not leave the
+/// text recorded as sent when that write then fails: the server never got it,
+/// so the next caller has to send it. The server stops reading after
+/// `initialized` (`--never-read-stdin`) and the text is far larger than a pipe
+/// holds, so the write is still going on when the first caller is cancelled
+/// and ends only at the transport's write bound. The uri's gate is held by the
+/// write itself, so the second caller waits for that end and then finds the
+/// text unsent; recorded before the write, it would be taken for sent at once.
+#[tokio::test]
+async fn a_cancelled_open_whose_write_fails_is_not_taken_for_sent() {
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        write(
+            &root,
+            "src/Big.py",
+            &format!("# {}\n", "x".repeat(4 * 1024 * 1024)),
+        );
+        let file = root.join("src/Big.py");
+        let transport = TransportConfig {
+            executable: env!("CARGO_BIN_EXE_fake-lsp-server").to_owned(),
+            args: vec![
+                "--mode".to_owned(),
+                "definition".to_owned(),
+                "--never-read-stdin".to_owned(),
+                "--state".to_owned(),
+                temp.path().join("state").to_string_lossy().into_owned(),
+            ],
+            working_dir: temp.path().to_owned(),
+            // The write bound: a write the server does not take ends here.
+            timeout: Duration::from_secs(2),
+            label: "fake".to_owned(),
+        };
+        let client = JsonRpcClient::spawn(&transport, &[], Box::new(|_| false))
+            .await
+            .unwrap();
+        // The server stops reading when it has this.
+        client.notify("initialized", json!({})).await.unwrap();
+        let sent = SentTexts::default();
+        let open = || open_if_changed(&client, &sent, &file, "src/Big.py", "fake", "python");
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), open()).await;
+        assert!(cancelled.is_err(), "the write was still going on");
+
+        let second = open().await;
+        assert!(
+            !matches!(second, Ok(None)),
+            "the text was taken for sent although its write never finished"
+        );
+    })
+    .await
+    .expect("within the outer bound");
+}

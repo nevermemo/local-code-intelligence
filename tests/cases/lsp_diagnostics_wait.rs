@@ -253,10 +253,12 @@ async fn a_publication_that_beats_the_hook_back_from_the_write_still_ends_its_wa
     .expect("within the outer bound");
 }
 
-/// A server that never publishes costs one bounded wait for the session, not
-/// one per file. The counter proves it; nothing here measures time.
+/// A server that never publishes costs each open at most the cap, and every
+/// run-out wait is counted: one wait that ran out is not proof that the next
+/// file will get no publication either. The counter proves it; nothing here
+/// measures time.
 #[tokio::test]
-async fn a_server_that_never_publishes_costs_one_wait_per_session() {
+async fn a_server_that_never_publishes_costs_each_open_at_most_the_cap() {
     tokio::time::timeout(LOADED_BUDGET, async {
         let temp = tempfile::tempdir().unwrap();
         let (client, adapter, root) =
@@ -281,8 +283,8 @@ async fn a_server_that_never_publishes_costs_one_wait_per_session() {
             assert_eq!(events(&state, "did_open_seen.txt"), index + 1, "{name}");
             assert_eq!(
                 client.diagnostics_wait_timeouts(),
-                1,
-                "{name}: the first file used the session's one wait"
+                index as u64 + 1,
+                "{name}: its open waited its cap and the wait was counted"
             );
         }
         assert_eq!(events(&state, "diagnostics_sent.txt"), 0);
