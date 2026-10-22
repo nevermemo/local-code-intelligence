@@ -5,7 +5,7 @@
 //! by omitting the adapter.
 
 use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{
@@ -504,19 +504,61 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .with_context(|| format!("timed out running {} --version", executable.display()))?
-            .with_context(|| format!("start {}", executable.display()))?;
-        ensure!(
-            output.status.success(),
-            "subprocess {} --version failed",
-            executable.display()
-        );
+        let output = match tokio::time::timeout(timeout, command.output()).await {
+            Err(_) => {
+                return Err(anyhow::Error::new(ProbeFailure::TimedOut).context(format!(
+                    "timed out running {} --version",
+                    executable.display()
+                )));
+            }
+            Ok(Err(error)) => {
+                let cause = if error.kind() == std::io::ErrorKind::NotFound {
+                    ProbeFailure::Missing
+                } else {
+                    ProbeFailure::Failed
+                };
+                return Err(anyhow::Error::new(cause)
+                    .context(format!("start {}: {error}", executable.display())));
+            }
+            Ok(Ok(output)) => output,
+        };
+        if !output.status.success() {
+            return Err(anyhow::Error::new(ProbeFailure::Failed).context(format!(
+                "subprocess {} --version failed",
+                executable.display()
+            )));
+        }
         Ok(())
     };
     probe_through(&resolved, run).await
 }
+
+/// Why [`probe_subprocess_version`] failed, as the root cause of its error (the
+/// readable text stays in the context above it). `[run_profile.lsp] breaker`
+/// opens a window on [`Self::Failed`] only: a window opens on evidence of a
+/// dead server, never on absence or silence (see `Manager::probe_once`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// The executable was not found (the spawn failed with `NotFound`).
+    Missing,
+    /// `--version` did not answer within the timeout.
+    TimedOut,
+    /// The binary was found but could not be started, or `--version` exited
+    /// non-zero.
+    Failed,
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "the binary was not found",
+            Self::TimedOut => "the version probe timed out",
+            Self::Failed => "the version probe failed",
+        })
+    }
+}
+
+impl std::error::Error for ProbeFailure {}
 
 #[cfg(test)]
 mod tests {
@@ -603,6 +645,79 @@ mod tests {
         // Outside the scope the memo answers again.
         probe().await.unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// The root cause of a probe error, `None` when the chain holds no
+    /// [`ProbeFailure`].
+    fn failure_of(error: &anyhow::Error) -> Option<ProbeFailure> {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProbeFailure>().copied())
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_is_a_typed_probe_failure() {
+        let error = fresh_probes(probe_subprocess_version(
+            Path::new("definitely-missing-lsp-binary-k11b"),
+            Duration::from_secs(1),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(failure_of(&error), Some(ProbeFailure::Missing), "{error:#}");
+        // The message text is the one callers and notes already carry.
+        assert!(
+            format!("{error:#}").contains("start definitely-missing-lsp-binary-k11b"),
+            "{error:#}"
+        );
+    }
+
+    /// Writes `<dir>/shim.cmd` with `body` and probes it by its full name.
+    #[cfg(windows)]
+    async fn probe_cmd_shim(body: &str, timeout: Duration) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim.cmd");
+        std::fs::write(&shim, body).unwrap();
+        fresh_probes(probe_subprocess_version(&shim, timeout)).await
+    }
+
+    /// A `.cmd` shim (how npm installs `pyright-langserver` and friends on
+    /// Windows) answers the version probe: the standard library starts it
+    /// through `cmd.exe`, as the transport does.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cmd_shim_answers_the_version_probe() {
+        probe_cmd_shim("@echo 1.0.0\r\n", Duration::from_secs(30))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cmd_shim_that_exits_non_zero_is_a_failed_probe() {
+        let error = probe_cmd_shim("@exit /b 3\r\n", Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(failure_of(&error), Some(ProbeFailure::Failed), "{error:#}");
+    }
+
+    /// A probe that does not answer in time is `TimedOut`, not `Missing` or
+    /// `Failed`: a loaded machine is not a dead server. The shim outlives the
+    /// 100 ms bound by seconds.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cmd_shim_that_does_not_answer_in_time_is_a_timed_out_probe() {
+        let error = probe_cmd_shim("@ping -n 4 127.0.0.1 >nul\r\n", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure_of(&error),
+            Some(ProbeFailure::TimedOut),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("timed out running"),
+            "{error:#}"
+        );
     }
 }
 

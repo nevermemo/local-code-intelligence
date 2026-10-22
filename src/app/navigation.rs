@@ -32,7 +32,11 @@ pub struct NavigationReport {
     /// `lsp: <provider> restarted: <reason>` for a kept server the barrier
     /// stopped (the answer is from a fresh one; the reason is `the tree changed
     /// since its last call`, `the index has no file list to stamp` or `the tree
-    /// stamp failed (<cause>)`), then
+    /// stamp failed (<cause>)`, `no tree stamp was recorded for it`), then
+    /// (the search report only)
+    /// `lsp: <provider> kept session; <reason> (kept: it watches its workspace)`
+    /// for a server that watches its workspace and was kept through a changed
+    /// tree, then
     /// `lsp: <provider> kept session; tree stamp unchanged since <n> s ago`
     /// (or `; no tree stamp was recorded for it`) for a server this call found
     /// running (exact for what the stamp covers). A server this call started
@@ -44,14 +48,18 @@ pub struct NavigationReport {
 /// The notes of a call that passed the tree barrier
 /// ([`lsp::Manager::tree_barrier`]) and made its requests inside a
 /// [`lsp::WalkSessions`] scope: one `restarted` entry per provider whose kept
-/// session the barrier stopped, then one `kept session` entry per provider
-/// whose answers came from a session the call found running. The wording is
-/// the traversal's `lsp.live` notes with `lsp:` as the prefix.
+/// session the barrier stopped, one `kept session ... (kept: it watches its
+/// workspace)` entry per watching server the search channel kept through a
+/// changed stamp (`kept`, always empty for navigation), then one `kept session`
+/// entry per provider whose answers came from a session the call found running.
+/// The wording is the traversal's `lsp.live` notes with `lsp:` as the prefix.
 pub(crate) fn barrier_notes(
     restarted: &[lsp::Restart],
+    kept: &[lsp::Kept],
     reused: &[(&'static str, Option<std::time::Duration>)],
 ) -> Vec<String> {
     let restarted = restarted.iter().map(|restart| restart.note("lsp"));
+    let kept = kept.iter().map(|kept| kept.note("lsp"));
     let reused = reused.iter().map(|(provider, unchanged)| match unchanged {
         Some(unchanged) => format!(
             "lsp: {provider} kept session; tree stamp unchanged since {} s ago",
@@ -59,7 +67,7 @@ pub(crate) fn barrier_notes(
         ),
         None => format!("lsp: {provider} kept session; no tree stamp was recorded for it"),
     });
-    restarted.chain(reused).collect()
+    restarted.chain(kept).chain(reused).collect()
 }
 
 /// What [`App::release_language_servers`] stopped.
@@ -162,7 +170,7 @@ impl App {
             }
         })
         .await;
-        let notes = barrier_notes(&restarted, &walk.reused());
+        let notes = barrier_notes(&restarted, &[], &walk.reused());
         // `applicable` is a map, so sort for a stable message and log order.
         failures.sort();
         order_symbols(&mut results);
@@ -282,7 +290,7 @@ impl App {
             workspace,
             results,
             warnings: Vec::new(),
-            notes: barrier_notes(&restarted, &walk.reused()),
+            notes: barrier_notes(&restarted, &[], &walk.reused()),
         })
     }
 
@@ -316,7 +324,7 @@ impl App {
             workspace,
             results,
             warnings: Vec::new(),
-            notes: barrier_notes(&restarted, &walk.reused()),
+            notes: barrier_notes(&restarted, &[], &walk.reused()),
         })
     }
 }
@@ -400,17 +408,22 @@ mod tests {
     #[test]
     fn the_barrier_notes_list_restarts_first_then_kept_sessions() {
         use std::time::Duration;
-        assert!(barrier_notes(&[], &[]).is_empty());
+        assert!(barrier_notes(&[], &[], &[]).is_empty());
         assert_eq!(
             barrier_notes(
                 &[lsp::Restart {
                     provider: "csharp-ls",
                     reason: lsp::RestartReason::TreeChanged,
                 }],
+                &[lsp::Kept {
+                    provider: "rust-analyzer",
+                    reason: lsp::RestartReason::TreeChanged,
+                }],
                 &[("pyright", Some(Duration::from_secs(7))), ("clangd", None)]
             ),
             [
                 "lsp: csharp-ls restarted: the tree changed since its last call",
+                "lsp: rust-analyzer kept session; the tree changed since its last call (kept: it watches its workspace)",
                 "lsp: pyright kept session; tree stamp unchanged since 7 s ago",
                 "lsp: clangd kept session; no tree stamp was recorded for it",
             ]
@@ -427,6 +440,7 @@ mod tests {
                     reason,
                 }],
                 &[],
+                &[],
             )
         };
         assert_eq!(
@@ -436,6 +450,10 @@ mod tests {
         assert_eq!(
             note(lsp::RestartReason::NoFileList),
             ["lsp: csharp-ls restarted: the index has no file list to stamp"]
+        );
+        assert_eq!(
+            note(lsp::RestartReason::Unrecorded),
+            ["lsp: csharp-ls restarted: no tree stamp was recorded for it"]
         );
         assert_eq!(
             note(lsp::RestartReason::StampFailed("src/x.cs: denied".into())),
