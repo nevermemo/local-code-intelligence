@@ -9112,3 +9112,132 @@ async fn an_unchanged_request_refreshes_a_files_place_in_the_open_set() {
     ]);
     assert_eq!(events, expected);
 }
+
+// ---------------------------------------------------------------------------
+// K12a-2: `[run_profile.lsp] roots`: where a server is started.
+// ---------------------------------------------------------------------------
+
+/// What one run of the documents fake as csharp-ls on a tree that lives under
+/// `<workspace>/sub/` (nothing at the top) shows under a `roots` value.
+struct RootRun {
+    /// The `rootUri` of every `initialize` the fake received.
+    started_at: Vec<String>,
+    /// `file:` URI of the workspace directory and of `sub/`, as the adapter
+    /// writes them.
+    workspace_uri: String,
+    sub_uri: String,
+    /// `relative_file_path` of the answer of a definition request.
+    definition: Vec<Option<String>>,
+    /// The `csharp-ls` entry of `index_status`'s `servers` before and after the
+    /// definition request.
+    before: Value,
+    after: Value,
+}
+
+async fn csharp_under_sub_with_roots(roots: local_code_intelligence::config::LspRoots) -> RootRun {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write(&workspace, "sub/Calculator.cs", CALCULATOR_CS);
+    write(&workspace, "sub/CallSite.cs", CALL_SITE_CS);
+    write(&workspace, "sub/app.sln", "\n");
+    let mut config = with_fake_documents_server(config, &state, &[], LOADED_BUDGET_SECONDS);
+    config.run_profile.lsp.roots = roots;
+    // Nothing but the call below starts a server.
+    config.run_profile.lsp.sessions = local_code_intelligence::config::LspSessions::PerCall;
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    let roster = |status: &local_code_intelligence::app::Status| -> Value {
+        serde_json::to_value(status).unwrap()["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["provider"] == "csharp-ls")
+            .expect("csharp-ls in the roster")
+            .clone()
+    };
+    let before = roster(&app.status(&workspace).await.unwrap());
+    let (line, character) = position_of(CALL_SITE_CS, "Add");
+    let answer = app
+        .definition(&workspace, "sub/CallSite.cs", line + 1, character)
+        .await
+        .unwrap();
+    let after = roster(&app.status(&workspace).await.unwrap());
+    let canonical = dunce::canonicalize(&workspace).unwrap();
+    let started_at = std::fs::read_to_string(state.join("root_uri.txt"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let uri = |path: &std::path::Path| reqwest::Url::from_directory_path(path).unwrap().to_string();
+    models_task.abort();
+    RootRun {
+        started_at,
+        workspace_uri: uri(&canonical),
+        sub_uri: uri(&canonical.join("sub")),
+        definition: answer
+            .results
+            .iter()
+            .map(|location| location.relative_file_path.clone())
+            .collect(),
+        before,
+        after,
+    }
+}
+
+/// Under the default key the server starts at the workspace (today's root);
+/// under `manifest` it starts at `sub/`, where `app.sln` is, and the answers
+/// still name workspace-relative paths. The roster shows the root before a
+/// session exists (what a start would choose) and after it (what it chose).
+/// Fails when the key does not reach the adapter's `initialize` (both runs
+/// would start at the workspace) and when the workspace stops being the
+/// default.
+#[tokio::test]
+async fn a_server_starts_at_its_manifest_root_under_roots_manifest() {
+    use local_code_intelligence::config::LspRoots;
+
+    let workspace_run = csharp_under_sub_with_roots(LspRoots::Workspace).await;
+    assert_eq!(
+        workspace_run.started_at,
+        std::slice::from_ref(&workspace_run.workspace_uri)
+    );
+    assert_eq!(
+        workspace_run.definition,
+        [Some("sub/Calculator.cs".to_owned())]
+    );
+    for roster in [&workspace_run.before, &workspace_run.after] {
+        assert_eq!(roster["root"], ".", "{roster}");
+        assert_eq!(roster["root_reason"], "roots_workspace", "{roster}");
+    }
+
+    let manifest_run = csharp_under_sub_with_roots(LspRoots::Manifest).await;
+    assert_eq!(
+        manifest_run.started_at,
+        std::slice::from_ref(&manifest_run.sub_uri)
+    );
+    assert!(
+        manifest_run.sub_uri.ends_with("/sub/"),
+        "{}",
+        manifest_run.sub_uri
+    );
+    assert_ne!(manifest_run.sub_uri, manifest_run.workspace_uri);
+    assert_eq!(
+        manifest_run.definition,
+        [Some("sub/Calculator.cs".to_owned())],
+        "the answer names the same workspace-relative path under both roots"
+    );
+    assert!(
+        manifest_run.before["session"].is_null(),
+        "{}",
+        manifest_run.before
+    );
+    for roster in [&manifest_run.before, &manifest_run.after] {
+        assert_eq!(roster["root"], "sub", "{roster}");
+        assert_eq!(roster["root_reason"], "manifest:app.sln", "{roster}");
+    }
+    assert!(
+        !manifest_run.after["session"].is_null(),
+        "{}",
+        manifest_run.after
+    );
+}

@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, LspSync},
+    config::{Config, LspRoots, LspSync},
     language,
     lsp::{
         adapter::{LspAdapter, SentTexts},
@@ -9,6 +9,7 @@ use crate::{
         java::JavaServer,
         markdown::MarkdownServer,
         python::PythonServer,
+        roots::Root,
         rust::RustServer,
         transport::{InactivityTimeout, JsonRpcClient, RpcError},
         typescript::TypeScriptServer,
@@ -39,6 +40,7 @@ pub mod java;
 mod job;
 pub mod markdown;
 pub mod python;
+pub mod roots;
 pub mod rust;
 pub mod stamp;
 pub mod sync;
@@ -183,16 +185,18 @@ struct GenericClient {
 }
 
 impl GenericClient {
-    /// Spawns and initializes the server. `start_timeout` bounds the
-    /// `initialize` request only (`lsp_start_timeout_seconds`); everything
-    /// after it keeps the transport's own timeout.
+    /// Spawns and initializes the server at `root` (the workspace path, or a
+    /// directory below it under `[run_profile.lsp] roots = "manifest"`, see
+    /// [`roots`]). `start_timeout` bounds the `initialize` request only
+    /// (`lsp_start_timeout_seconds`); everything after it keeps the
+    /// transport's own timeout.
     async fn spawn(
         adapter: &Arc<dyn LspAdapter>,
-        workspace: &Workspace,
+        root: &Path,
         start_timeout: Duration,
     ) -> Result<Arc<Self>> {
         let transport = adapter
-            .transport_config(&workspace.path)
+            .transport_config(root)
             .with_context(|| format!("{} is disabled or has no executable", adapter.provider()))?;
         let rpc = JsonRpcClient::spawn_with_busy(
             &transport,
@@ -202,7 +206,7 @@ impl GenericClient {
         )
         .await?;
         let params = adapter
-            .initialize_params(&workspace.path)
+            .initialize_params(root)
             .with_context(|| format!("cannot build {} initialization", adapter.provider()))?;
         let initialized = rpc
             .request_within("initialize", params, start_timeout)
@@ -428,6 +432,44 @@ struct Session {
     stuck: AtomicBool,
     /// When the session began, for [`ServerReadiness::age_ms`].
     began: Instant,
+    /// The directory the server was started at, set by the start task before
+    /// it spawns the server (see [`roots`]); empty until then.
+    root: Arc<std::sync::OnceLock<Root>>,
+}
+
+/// What a session's start needs to choose its root: `[run_profile.lsp]
+/// roots` and the index's file list.
+#[derive(Clone)]
+struct RootPlan {
+    roots: LspRoots,
+    files: Option<Arc<dyn stamp::IndexedFiles>>,
+}
+
+impl RootPlan {
+    /// The directory `adapter`'s server starts at in `workspace`. Under
+    /// `workspace` that is the workspace path and nothing is read. Under
+    /// `manifest` it is [`roots::for_server`] over the index's file list; with
+    /// no list the workspace.
+    async fn resolve(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Root {
+        if self.roots == LspRoots::Workspace {
+            return Root::workspace(&workspace.path, roots::RootReason::Workspace);
+        }
+        let listed = match &self.files {
+            Some(source) => source.indexed_files(workspace).await,
+            None => None,
+        };
+        let Some(listed) = listed else {
+            return Root::workspace(&workspace.path, roots::RootReason::NoFileList);
+        };
+        let (path, languages, manifests) = (
+            workspace.path.clone(),
+            adapter.languages(),
+            adapter.stamp_manifests(),
+        );
+        tokio::task::spawn_blocking(move || roots::for_server(&path, manifests, languages, &listed))
+            .await
+            .unwrap_or_else(|_| Root::workspace(&workspace.path, roots::RootReason::Unreadable))
+    }
 }
 
 impl Session {
@@ -437,24 +479,36 @@ impl Session {
         stuck_after: Option<Duration>,
         breakers: Option<Arc<LspBreakers>>,
         start_timeout: Duration,
+        plan: RootPlan,
     ) -> Arc<Self> {
         let (sender, start) = watch::channel(None);
         let (primed_sender, primed) = watch::channel(false);
         let provider = adapter.provider();
         let workspace_path = workspace.path.clone();
+        let recorded: Arc<std::sync::OnceLock<Root>> = Arc::default();
+        let recorder = Arc::clone(&recorded);
         tokio::spawn(async move {
             let provider = adapter.provider();
             let started = Instant::now();
             let outcome = tokio::select! {
-                outcome = GenericClient::spawn(&adapter, &workspace, start_timeout) => outcome,
+                outcome = async {
+                    let root = plan.resolve(&adapter, &workspace).await;
+                    let path = root.path.clone();
+                    let _ = recorder.set(root);
+                    GenericClient::spawn(&adapter, &path, start_timeout).await
+                } => outcome,
                 // Every receiver is gone: the manager was dropped.
                 () = sender.closed() => return,
             };
+            let root = recorder
+                .get()
+                .map_or_else(String::new, |root| root.relative.clone());
             let client = match &outcome {
                 Ok(client) => {
                     tracing::debug!(
                         provider,
                         workspace = %workspace.path.display(),
+                        root = %root,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "language server session ready"
                     );
@@ -464,6 +518,7 @@ impl Session {
                     tracing::warn!(
                         provider,
                         workspace = %workspace.path.display(),
+                        root = %root,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         error = %format!("{error:#}"),
                         "language server failed to start"
@@ -512,6 +567,7 @@ impl Session {
             stuck_after,
             stuck: AtomicBool::new(false),
             began: Instant::now(),
+            root: recorded,
         })
     }
 
@@ -1120,6 +1176,8 @@ pub struct Manager {
     /// `lsp_start_timeout_seconds`, or `lsp_timeout_seconds` when it is 0: the
     /// inactivity bound of a server's `initialize` request.
     start_timeout: Duration,
+    /// `[run_profile.lsp] roots`: where a server starts (see [`roots`]).
+    roots: LspRoots,
 }
 
 /// The running syncs of a [`Manager`], by workspace id.
@@ -1255,6 +1313,7 @@ impl Manager {
             } else {
                 timeout
             },
+            roots: config.run_profile.lsp.roots,
         }
     }
 
@@ -1419,6 +1478,35 @@ impl Manager {
         (adapter.provider().to_string(), workspace.id.clone())
     }
 
+    fn root_plan(&self) -> RootPlan {
+        RootPlan {
+            roots: self.roots,
+            files: self.indexed.lock().unwrap().clone(),
+        }
+    }
+
+    /// The directory `adapter`'s server starts at in `workspace`, by
+    /// `[run_profile.lsp] roots` and the index's file list as they are now
+    /// (see [`roots`]): the workspace under `workspace`, and under `manifest`
+    /// the directory of the topmost manifest the adapter names, or the
+    /// workspace with the reason. Reads the file list and the directories of
+    /// the adapter's files, starts nothing. A session fixes its root when it
+    /// starts and keeps it; [`Self::session_root`] reports that one.
+    pub async fn server_root(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Root {
+        self.root_plan().resolve(adapter, workspace).await
+    }
+
+    /// The directory the live session of this provider and workspace was
+    /// started at; `None` when there is no session, or it has not chosen its
+    /// root yet. Like [`Self::readiness`] it counts as no use of the session.
+    pub async fn session_root(&self, provider: &str, workspace_id: &str) -> Option<Root> {
+        self.sessions
+            .lock()
+            .await
+            .get(&(provider.to_string(), workspace_id.to_string()))
+            .and_then(|session| session.root.get().cloned())
+    }
+
     /// The session for this (provider, workspace), starting it if there is
     /// none. At most one start is ever in flight per key: concurrent callers
     /// get the same session. A session whose start already failed is replaced
@@ -1461,6 +1549,7 @@ impl Manager {
                     self.stuck_after,
                     self.breakers.clone(),
                     self.start_timeout,
+                    self.root_plan(),
                 );
                 if let Some(replaced) = sessions.insert(key.clone(), Arc::clone(&session))
                     && replaced.stuck()
@@ -3520,6 +3609,155 @@ mod tests {
             serde_json::to_value(ProbeState::NotProbed).unwrap(),
             json!("not_probed")
         );
+    }
+
+    /// An adapter that serves Go files, names `go.mod` as its manifest and
+    /// records every root its start hands to `transport_config` and
+    /// `initialize_params` (it has no executable, so the start stops there and
+    /// no process is spawned).
+    struct Rooted {
+        transport: std::sync::Mutex<Vec<PathBuf>>,
+        initialize: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl LspAdapter for Rooted {
+        fn provider(&self) -> &'static str {
+            "rooted-server"
+        }
+        fn languages(&self) -> &'static [&'static str] {
+            &["go"]
+        }
+        fn stamp_manifests(&self) -> &'static [&'static str] {
+            &["go.mod"]
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn configured_command(&self) -> Option<String> {
+            None
+        }
+        fn readiness_component_name(&self) -> &'static str {
+            "rooted_server_available"
+        }
+        fn transport_config(&self, root: &std::path::Path) -> Option<TransportConfig> {
+            self.transport.lock().unwrap().push(root.to_path_buf());
+            None
+        }
+        fn initialize_params(&self, root: &std::path::Path) -> Option<Value> {
+            self.initialize.lock().unwrap().push(root.to_path_buf());
+            None
+        }
+        fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+            Box::new(|_| false)
+        }
+    }
+
+    /// A file list that answers with a fixed list.
+    struct Listed(Vec<String>);
+
+    #[async_trait::async_trait]
+    impl stamp::IndexedFiles for Listed {
+        async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
+            Some(Arc::new(self.0.clone()))
+        }
+    }
+
+    fn manager_with(roots: LspRoots, files: Option<Vec<&str>>) -> Manager {
+        let mut config = Config::default();
+        config.run_profile.lsp.roots = roots;
+        let manager = Manager::new(&config);
+        match files {
+            Some(files) => manager.with_indexed_files(Arc::new(Listed(
+                files.into_iter().map(str::to_owned).collect(),
+            ))),
+            None => manager,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_server_root_follows_the_key_and_the_file_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = dunce::canonicalize(temp.path()).unwrap();
+        let ws = Workspace {
+            id: crate::workspace::hash(&path.to_string_lossy()),
+            path,
+        };
+        for relative in ["services/api/main.go", "services/api/go.mod"] {
+            let file = ws.path.join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x\n").unwrap();
+        }
+        let files = || Some(vec!["services/api/main.go"]);
+        let nested = ws.path.join("services").join("api");
+        let adapter = Arc::new(Rooted {
+            transport: std::sync::Mutex::new(Vec::new()),
+            initialize: std::sync::Mutex::new(Vec::new()),
+        });
+        let dyn_adapter: Arc<dyn LspAdapter> = Arc::clone(&adapter) as Arc<dyn LspAdapter>;
+
+        // The default key: the workspace, whatever the list holds, and a
+        // start hands that path to the adapter.
+        let workspace_mode = manager_with(LspRoots::Workspace, files());
+        let root = workspace_mode.server_root(&dyn_adapter, &ws).await;
+        assert_eq!(root.path, ws.path);
+        assert_eq!(root.relative, ".");
+        assert_eq!(root.reason, roots::RootReason::Workspace);
+        let session = workspace_mode.session(&dyn_adapter, &ws).await.unwrap();
+        assert!(
+            session.client().await.is_err(),
+            "the stub has no executable"
+        );
+        assert_eq!(
+            *adapter.transport.lock().unwrap(),
+            std::slice::from_ref(&ws.path)
+        );
+        assert_eq!(
+            workspace_mode
+                .session_root("rooted-server", &ws.id)
+                .await
+                .unwrap()
+                .relative,
+            "."
+        );
+
+        // `manifest`: the directory of the manifest, handed to the adapter's
+        // `transport_config`, and kept by the session for the roster.
+        adapter.transport.lock().unwrap().clear();
+        let manifest_mode = manager_with(LspRoots::Manifest, files());
+        let root = manifest_mode.server_root(&dyn_adapter, &ws).await;
+        assert_eq!(root.path, nested);
+        assert_eq!(root.relative, "services/api");
+        assert_eq!(root.reason, roots::RootReason::Manifest("go.mod".into()));
+        assert!(
+            manifest_mode
+                .session_root("rooted-server", &ws.id)
+                .await
+                .is_none(),
+            "no session yet"
+        );
+        let session = manifest_mode.session(&dyn_adapter, &ws).await.unwrap();
+        assert!(session.client().await.is_err());
+        assert_eq!(
+            *adapter.transport.lock().unwrap(),
+            std::slice::from_ref(&nested)
+        );
+        let kept = manifest_mode
+            .session_root("rooted-server", &ws.id)
+            .await
+            .unwrap();
+        assert_eq!(kept, root);
+
+        // `manifest` without a file list: the workspace, and it says why.
+        let listless = manager_with(LspRoots::Manifest, None);
+        let root = listless.server_root(&dyn_adapter, &ws).await;
+        assert_eq!(root.path, ws.path);
+        assert_eq!(root.reason, roots::RootReason::NoFileList);
+        // A list with no Go file of its own: no directory to look in below
+        // the workspace, so no manifest.
+        let unrelated = manager_with(LspRoots::Manifest, Some(vec!["docs/readme.md"]));
+        let root = unrelated.server_root(&dyn_adapter, &ws).await;
+        assert_eq!(root.path, ws.path);
+        assert_eq!(root.reason, roots::RootReason::NoManifest);
     }
 
     /// A window long enough that no test outlives it: a test that needs it to

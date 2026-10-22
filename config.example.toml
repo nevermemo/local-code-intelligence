@@ -714,7 +714,22 @@ mode = "cache"
 # timed out (lsp_timeout_seconds) opens no window because the server may only be
 # slow, and /ready still probes the binaries. The recipes never run lsp.live and
 # are the same under both values.
-# All seven keys are part of the run-profile hash.
+# roots = "workspace" (default): every language server starts at the workspace
+# path. "manifest": a server starts at the directory of the topmost project file
+# its adapter names (go.mod, go.sum, go.work for gopls; pyproject.toml,
+# pyrightconfig.json, setup.py and so on for pyright; tsconfig.json, package.json
+# and so on for typescript-language-server; *.sln, *.csproj for csharp-ls) found
+# in the directories of the index's files of its languages and their ancestors
+# (one directory read each, no recursive walk), so a module under services/api/
+# is served from services/api/. The workspace is kept when no such file is found,
+# when sibling directories at the same depth each hold one (one session per
+# module is not built), or when the chosen directory would leave an indexed file
+# of the server's languages outside it; `index_status` says which in
+# servers[].root and servers[].root_reason. A session fixes its root when it
+# starts. There is one session per server per workspace either way, and the tree
+# stamp and barrier read the whole workspace as before. The recipes never run
+# lsp.live and are the same under both values.
+# All eight keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "shared"
 outline_cache = false
@@ -723,6 +738,7 @@ call_hierarchy = false
 sync = "off"
 places = "scip"
 breaker = false
+roots = "workspace"
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against
