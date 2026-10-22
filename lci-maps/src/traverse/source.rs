@@ -250,14 +250,30 @@ impl ArbitrationCounts {
 /// subordinate map (`Some`, zero when it had nothing arbitrated). Edges that
 /// stay keep their order.
 pub fn arbitrate(raw: &mut Vec<Edge>, calls: &mut [ExpandCall], a: &Arbitration) {
+    debug_assert!(
+        !a.is_subordinate(a.authority),
+        "the authority must not be listed as a subordinate map"
+    );
     // What the authority named at this node, per family. A family it offered
-    // no edge of has no entry: it stands.
+    // no edge of has no entry: it stands. An answer cut at `EXPAND_LIMIT`
+    // (`n_edges` is what was kept after the cut) is incomplete, so a
+    // destination missing from it proves nothing: no family is answered. Only
+    // destinations the authority can place (`arbitrates`) count as named; a
+    // file fallback from the server is no answer.
+    let capped = calls
+        .iter()
+        .any(|call| call.map == a.authority && call.n_edges >= EXPAND_LIMIT);
     let mut answered: HashMap<ClaimFamily, HashSet<NodeId>> = HashMap::new();
-    for edge in raw.iter().filter(|edge| edge.map == a.authority) {
-        answered
-            .entry(ClaimFamily::of(edge.kind))
-            .or_default()
-            .insert(edge.dst.clone());
+    if !capped {
+        for edge in raw
+            .iter()
+            .filter(|edge| edge.map == a.authority && a.arbitrates(&edge.dst))
+        {
+            answered
+                .entry(ClaimFamily::of(edge.kind))
+                .or_default()
+                .insert(edge.dst.clone());
+        }
     }
     let mut counts: BTreeMap<MapId, ArbitrationCounts> = BTreeMap::new();
     raw.retain(|edge| {

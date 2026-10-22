@@ -255,6 +255,68 @@ async fn an_authority_that_did_not_answer_at_all_leaves_every_edge_standing() {
     assert_eq!(call(&expansion, "scip.impact").arbitration, counts(0, 0));
 }
 
+/// `count` distinct function destinations of `a`, as the server's answer.
+fn references(count: usize) -> Vec<(&'static str, &'static str, EdgeKind)> {
+    (0..count)
+        .map(|i| {
+            let dst: &'static str = Box::leak(format!("fn:R{i}").into_boxed_str());
+            ("a", dst, REFERS)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_authority_answer_cut_at_the_expand_limit_is_no_answer() {
+    // The server offered more than the limit: the walk keeps the first
+    // `EXPAND_LIMIT` and `n_edges` says so. A destination missing from a cut
+    // answer proves nothing, so `fn:C` (not among the kept) stands.
+    let reg = registry_of(vec![
+        Scripted::server(&references(crate::EXPAND_LIMIT + 5)),
+        Scripted::index(
+            "scip.impact",
+            &[("a", "fn:C", REFERS), ("a", "fn:R0", REFERS)],
+        ),
+    ]);
+    let expansion = expand_a(&reg, Some(arbitration())).await;
+    assert_eq!(call(&expansion, "lsp.live").n_edges, crate::EXPAND_LIMIT);
+    assert!(dsts(&expansion).contains(&n("fn:C")));
+    assert_eq!(call(&expansion, "scip.impact").arbitration, counts(0, 0));
+
+    // One edge short of the limit is a whole answer: `fn:C` is overruled.
+    let reg = registry_of(vec![
+        Scripted::server(&references(crate::EXPAND_LIMIT - 1)),
+        Scripted::index(
+            "scip.impact",
+            &[("a", "fn:C", REFERS), ("a", "fn:R0", REFERS)],
+        ),
+    ]);
+    let expansion = expand_a(&reg, Some(arbitration())).await;
+    assert!(!dsts(&expansion).contains(&n("fn:C")));
+    assert_eq!(call(&expansion, "scip.impact").arbitration, counts(1, 1));
+}
+
+#[tokio::test]
+async fn an_authority_answer_that_names_only_a_file_is_no_answer() {
+    // The server's file fallback (the holder of a position it cannot place) is
+    // not a symbol the SCIP edge could be confirmed against.
+    let reg = registry_of(vec![
+        Scripted::server(&[("a", "file:b", REFERS)]),
+        Scripted::index("scip.impact", &[("a", "fn:C", REFERS)]),
+    ]);
+    let expansion = expand_a(&reg, Some(arbitration())).await;
+    assert_eq!(dsts(&expansion), sorted(&["fn:C", "file:b"]));
+    assert_eq!(call(&expansion, "scip.impact").arbitration, counts(0, 0));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "authority must not be listed as a subordinate")]
+fn an_authority_listed_as_a_subordinate_panics_in_a_debug_build() {
+    let mut a = arbitration();
+    a.subordinate.push(("lsp.live", ClaimFamily::Refers));
+    arbitrate(&mut Vec::new(), &mut [], &a);
+}
+
 #[tokio::test]
 async fn only_symbol_destinations_of_the_listed_kinds_are_arbitrated() {
     let reg = registry_of(vec![

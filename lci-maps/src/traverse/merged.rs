@@ -564,8 +564,9 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> PreMerged<A> {
     /// Lets the authority of `arbitration` overrule the subordinate maps'
     /// edges, re-fusing from the row's raw edges as a map switched off does
     /// (the same [`arbitrate`] as [`OnTheFly::with_arbitration`], so both
-    /// sources answer alike). The rows must hold the unarbitrated edges (an
-    /// adjacency built from an on-the-fly source without one).
+    /// sources answer alike). The rows hold the unarbitrated edges by
+    /// construction: the adjacency only ever asks raw, through
+    /// `OnTheFly::new` and `Row::ask`, never with an arbitration attached.
     pub fn with_arbitration(mut self, arbitration: Arbitration) -> Self {
         self.arbitration = Some(arbitration);
         self
