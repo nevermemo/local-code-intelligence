@@ -831,9 +831,9 @@ struct LspChannel {
     failures: Vec<String>,
     /// Providers that did not answer within `lsp_search_budget_ms`.
     over_budget: Vec<&'static str>,
-    /// Providers whose kept session the tree barrier stopped because the tree
-    /// changed since its last check (see [`App::lsp_channel`]).
-    restarted: Vec<&'static str>,
+    /// Providers whose kept session the tree barrier stopped, each with the
+    /// reason (see [`App::lsp_channel`]).
+    restarted: Vec<crate::lsp::Restart>,
     /// Providers whose answers came from a session this search found running,
     /// each with how long its tree stamp had been unchanged (`None`: no stamp
     /// was recorded for it).

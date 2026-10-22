@@ -1265,10 +1265,8 @@ pub async fn run_with_trait_seeds(
                 for (provider, manager) in backend.routes() {
                     lsp_live_sessions.push((provider, manager, lsp_live_workspace.clone()));
                 }
-                for provider in backend.restarted() {
-                    notes.push(format!(
-                        "lsp.live: {provider} restarted: the tree changed since its last call"
-                    ));
+                for restart in backend.restarted() {
+                    notes.push(restart.note("lsp.live"));
                 }
                 // Which servers this walk found running is read when it ends
                 // (the barrier cannot say, see `WalkSessions`).

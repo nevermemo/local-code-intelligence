@@ -5649,6 +5649,18 @@ pub(super) fn restart_noted(answer: &Value, provider: &str) -> bool {
     })
 }
 
+/// Whether the walk noted that the tree barrier restarted `provider`'s kept
+/// session because the stamp could not be taken (not because the tree changed).
+pub(super) fn stamp_failure_noted(answer: &Value, provider: &str) -> bool {
+    let wanted = format!("lsp.live: {provider} restarted: the tree stamp failed (");
+    answer["notes"].as_array().is_some_and(|notes| {
+        notes.iter().any(|note| {
+            note.as_str()
+                .is_some_and(|note| note.starts_with(&wanted) && note.ends_with(')'))
+        })
+    })
+}
+
 /// Whether the walk labelled its answer as coming from a kept session of
 /// `provider`, whose tree stamp has not changed (the answer of a reused server
 /// is not a fresh server's).
@@ -7455,7 +7467,8 @@ async fn a_stamp_that_cannot_be_taken_restarts_the_shared_server_every_walk() {
     assert_eq!(state_count(&state, "spawn_count.txt"), 1);
 
     let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
-    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(stamp_failure_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
     assert!(!kept_noted(&answer, "csharp-ls"), "{answer}");
     assert_eq!(
         state_count(&state, "spawn_count.txt"),
@@ -7463,9 +7476,109 @@ async fn a_stamp_that_cannot_be_taken_restarts_the_shared_server_every_walk() {
         "nothing unchanged can be shown: a fresh server"
     );
     let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
-    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(stamp_failure_noted(&answer, "csharp-ls"), "{answer}");
     assert!(!kept_noted(&answer, "csharp-ls"), "{answer}");
     assert_eq!(state_count(&state, "spawn_count.txt"), 3);
+    manager.shutdown_all().await;
+}
+
+/// The barrier says why it stopped a kept session (N109): a failed stamp is
+/// not a changed tree. The cause is a short line, not the error chain.
+#[tokio::test]
+async fn the_barrier_names_a_failed_stamp_as_the_reason_of_a_restart() {
+    use local_code_intelligence::lsp::{Restart, RestartReason};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, _index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager_listing(&config, &workspace, &["src/bad\0name.cs"]);
+    let adapter = csharp_adapter(&manager);
+    assert!(
+        manager
+            .tree_barrier(&workspace, &[&adapter])
+            .await
+            .is_empty(),
+        "no session to stop yet"
+    );
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the shared server starts and answers");
+
+    let restarted = manager.tree_barrier(&workspace, &[&adapter]).await;
+    let [Restart { provider, reason }] = restarted.as_slice() else {
+        panic!("one restart expected: {restarted:?}");
+    };
+    assert_eq!(*provider, "csharp-ls");
+    let RestartReason::StampFailed(cause) = reason else {
+        panic!("the stamp failed, not the tree: {reason:?}");
+    };
+    assert!(
+        !cause.is_empty() && !cause.contains('\n') && cause.chars().count() <= 123,
+        "{cause:?}"
+    );
+    assert_eq!(
+        restarted[0].note("lsp"),
+        format!("lsp: csharp-ls restarted: the tree stamp failed ({cause})")
+    );
+    manager.shutdown_all().await;
+}
+
+/// With no index file list (a manager without a snapshot source) the barrier
+/// restarts the kept session and says that, not that the tree changed (N109);
+/// a walk notes it the same way.
+#[tokio::test]
+async fn a_missing_file_list_is_the_reason_of_the_restart_not_a_changed_tree() {
+    use local_code_intelligence::{
+        config::LspSessions,
+        lsp::{Restart, RestartReason},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = Arc::new(Manager::new(&config));
+    age_tree(&workspace.path);
+    let adapter = csharp_adapter(&manager);
+    assert!(
+        manager
+            .tree_barrier(&workspace, &[&adapter])
+            .await
+            .is_empty(),
+        "no session to stop yet"
+    );
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the shared server starts and answers");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    let restarted = manager.tree_barrier(&workspace, &[&adapter]).await;
+    assert_eq!(
+        restarted,
+        [Restart {
+            provider: "csharp-ls",
+            reason: RestartReason::NoFileList,
+        }]
+    );
+    assert_eq!(
+        restarted[0].note("lsp"),
+        "lsp: csharp-ls restarted: the index has no file list to stamp"
+    );
+
+    // A walk over a fresh session reads the same reason.
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the shared server starts again");
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    let notes: Vec<&str> = answer["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        notes.contains(&"lsp.live: csharp-ls restarted: the index has no file list to stamp"),
+        "{answer}"
+    );
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
     manager.shutdown_all().await;
 }
 
@@ -8551,7 +8664,10 @@ async fn a_walk_whose_server_the_barrier_stopped_answers_its_next_request_from_t
     let second = open().await.unwrap();
     assert_eq!(
         second.restarted(),
-        ["csharp-ls"],
+        [local_code_intelligence::lsp::Restart {
+            provider: "csharp-ls",
+            reason: local_code_intelligence::lsp::RestartReason::TreeChanged,
+        }],
         "the second walk's barrier saw the edit and stopped the server"
     );
 
