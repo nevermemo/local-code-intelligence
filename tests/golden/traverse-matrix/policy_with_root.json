@@ -1,0 +1,225 @@
+{
+  "checkpoint": {
+    "answer": [],
+    "budget_left_pct": 0,
+    "calls_left": 100,
+    "cleared": 0,
+    "disagreements": [],
+    "disagreements_total": 0,
+    "frontier": [
+      {
+        "depth": 1,
+        "est_cost": 0,
+        "fanout": 1,
+        "node": "file:src/Calculator.cs",
+        "potential": 0.5,
+        "score": 0.5,
+        "seen_before": false,
+        "site": {
+          "col": 1,
+          "line": 1,
+          "path": "src/Calculator.cs"
+        },
+        "via": "structure.contains",
+        "witness": "exact"
+      }
+    ],
+    "likely_complete": null,
+    "maps": [
+      {
+        "calls": 1,
+        "edges": 0,
+        "failures": 0,
+        "map": "graph.scip",
+        "tokens": 0
+      },
+      {
+        "calls": 1,
+        "edges": 1,
+        "failures": 0,
+        "map": "structure.contains",
+        "tokens": 0
+      }
+    ],
+    "pops": 1,
+    "pops_left": 0,
+    "question": "`Combine`",
+    "reason": "pops",
+    "regions": {
+      "cleared": 0,
+      "explored": 1,
+      "rows": [
+        {
+          "cleared": 0,
+          "explored": 1,
+          "path": ".",
+          "seen": 0
+        },
+        {
+          "cleared": 0,
+          "explored": 0,
+          "path": "src",
+          "seen": 1
+        }
+      ],
+      "seen": 1,
+      "unknown": null
+    },
+    "seeds": [
+      "sym:rust:Calculator.cs::Combine/fn"
+    ],
+    "stop": 0,
+    "tokens_left": 19988,
+    "visited": 1,
+    "visited_cards": [
+      {
+        "depth": 0,
+        "maps": [],
+        "n_maps": 0,
+        "node": "sym:rust:Calculator.cs::Combine/fn",
+        "potential": 1.0,
+        "ranked_potential": 1.0,
+        "site": {
+          "col": 16,
+          "line": 4,
+          "path": "src/Calculator.cs"
+        },
+        "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+        "via": null,
+        "witness": null
+      }
+    ]
+  },
+  "effective_policy": {
+    "hash": "cbcefe03ecdbd694",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": true,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "structure.contains",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "exact.closure",
+        "weight": 1.0
+      }
+    ],
+    "preset": "impact",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "exact": [
+    {
+      "answered": true,
+      "cards": 1,
+      "map": "exact.closure"
+    }
+  ],
+  "mode": "traverse",
+  "notes": [
+    "policy impact: the first stage alone answers (measured: the walk does not pay here at this many answers); the walk took one pop and its cards are not returned, continue the handle to walk on",
+    "exact.closure: names 1, anchored yes, closure 1, kept 1"
+  ],
+  "question": "`Combine`",
+  "results": [
+    {
+      "depth": 0,
+      "held": 1,
+      "maps": [
+        "exact.closure"
+      ],
+      "n_maps": 1,
+      "name": "Run",
+      "node": "sym:rust:CallSite.cs::Run/fn",
+      "origin": "exact",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "site": {
+        "col": 23,
+        "line": 4,
+        "path": "src/CallSite.cs"
+      },
+      "text": "sym:rust:CallSite.cs::Run/fn | exact.closure | p1.00 d0",
+      "via": "exact.closure",
+      "witness": null
+    },
+    {
+      "depth": 0,
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 16,
+        "line": 4,
+        "path": "src/Calculator.cs"
+      },
+      "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+      "via": null,
+      "witness": null
+    }
+  ],
+  "seed_hits": [],
+  "seed_sites": {
+    "sym:rust:Calculator.cs::Combine/fn": {
+      "col": 16,
+      "line": 4,
+      "path": "src/Calculator.cs"
+    }
+  },
+  "seed_source": "given",
+  "seeds": [
+    "sym:rust:Calculator.cs::Combine/fn"
+  ],
+  "status": "budget_exhausted",
+  "steering": [],
+  "stop_reason": "pops",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "first_stage": {
+      "exact": 1,
+      "seeds": 1,
+      "walk": 0
+    },
+    "hops": 1,
+    "per_map": {
+      "graph.scip": {
+        "expands": 1
+      },
+      "structure.contains": {
+        "expands": 1
+      }
+    },
+    "physical_external_calls": 0,
+    "physical_map_calls": 2,
+    "pops": 1,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "trace": {
+    "events": 5,
+    "hash": "19c71b0b8cd9b8b9"
+  }
+}

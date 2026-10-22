@@ -32,5 +32,7 @@ mod recipes;
 #[cfg(feature = "map-equivalence")]
 #[path = "cases/run_records.rs"]
 mod run_records;
+#[path = "cases/traverse_matrix.rs"]
+mod traverse_matrix;
 #[path = "cases/watching.rs"]
 mod watching;

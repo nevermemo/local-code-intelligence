@@ -285,9 +285,9 @@ fn walk(
                 continue;
             }
             walk(&path, depth + 1, best_solution, best_project);
-        } else if name.ends_with(".sln") {
+        } else if crate::path::has_extension_ignore_case(name, "sln") {
             consider(best_solution, depth, path);
-        } else if name.ends_with(".csproj") {
+        } else if crate::path::has_extension_ignore_case(name, "csproj") {
             consider(best_project, depth, path);
         }
     }

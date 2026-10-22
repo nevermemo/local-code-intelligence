@@ -668,7 +668,7 @@ pub(crate) fn is_test_path(path: &str) -> bool {
     name.contains(".test.")
         || name.contains(".spec.")
         || stem.ends_with("_test")
-        || (name.starts_with("test_") && name.ends_with(".py"))
+        || (name.starts_with("test_") && lci_core::path::has_extension_ignore_case(name, "py"))
         || name.ends_with("Test.java")
         || name.ends_with("Tests.java")
 }
