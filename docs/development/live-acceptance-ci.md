@@ -7,9 +7,10 @@ needs no GitHub account, runner or repository.
 ## What the workflow runs
 
 `.github/workflows/live-acceptance.yml` runs `cargo xtask acceptance <name>` and `evaluate ./evaluations/core.toml`
-against the real embedding and reranker services (ports 8766 and 8767) and real language-server executables. It starts
-with `cargo build --workspace` (the local orchestrator uses `build --workspace --exclude xtask`). The step list is
-`acceptance_steps` in `xtask/src/live_acceptance.rs`.
+against the real embedding and reranker services (ports 8766 and 8767) and real language-server executables. It is one
+step, `cargo xtask live-acceptance --require-all` (N87): the orchestrator builds (`build --workspace --exclude xtask`),
+runs the steps in `acceptance_steps` in `xtask/src/live_acceptance.rs` and the evaluation, and `--require-all` makes a
+step skipped for a missing tool fail the run. A unit test pins the command in the workflow file.
 
 `.github/workflows/ci.yml` is separate: its hosted matrix runs only `cargo xtask test --suite Full` against mocks on
 GitHub-hosted runners, which have no route to services on a developer machine.
@@ -26,12 +27,16 @@ Why a self-hosted runner is the only complete option: hosted runners cannot reac
 - `concurrency: { group: live-acceptance, cancel-in-progress: false }`: pushes queue on the one runner.
 - `timeout-minutes: 150`. The first real run took a little over an hour end to end, and the original 60-minute bound
   cut off a run that had passed every acceptance step; a single job bound cannot tell a slow healthy step from a dead
-  one, which is why the local orchestrator gives each step its own timeout.
-- A first step sets `LCI_ACCEPTANCE_FIXTURE_ROOT` to a run-unique directory (`lci-live-run-<run id>-<attempt>` under
-  `RUNNER_TEMP`), where `Fixture::create` puts every fixture. A final `if: always()` step removes only that directory
-  (fixtures left by a crashed run), never another run's fixtures or any other `lci-*` directory. It does not kill processes by name: the runner is a developer machine, and a blanket
+  one, which is why the orchestrator also gives each step its own timeout.
+- The orchestrator gives every fixture a run-unique root (`lci-live-run-<pid>-<stamp>` under the temp directory, passed
+  to each step as `LCI_ACCEPTANCE_FIXTURE_ROOT`, where `Fixture::create` puts every fixture) and removes only that
+  directory when the run ends, never another run's fixtures or any other `lci-*` directory. A run killed before that
+  point leaves its root behind. It does not kill processes by name: the runner is a developer machine, and a blanket
   `Stop-Process -Name rust-analyzer` would also kill editor language servers and a running `serve`. An orphaned
   process after a crash needs a human look at the process list.
+- Because the workflow never runs on `pull_request`, it cannot affect a merge: `test (windows-latest)` in `ci.yml` is
+  the only gating job. With `--require-all` a runner missing any tool in the table below turns the run red, which is
+  the intent: the runner is registered to host all of them.
 
 ## One-time setup (needs the repository owner's GitHub account)
 
@@ -55,9 +60,9 @@ An agent cannot do these steps:
 
 Checked on the development machine 2026-10-11 (`Get-Command` and `--version` per tool): every tool below was present.
 Every `*-lsp`, `*-missing` and `*-recovery` subcommand prints `PREREQUISITE_UNAVAILABLE` and skips rather than fails
-when its tool is not on `PATH`, so a missing tool degrades one step. The workflow runs steps one by one, so a skip ends
-a step successfully there; `cargo xtask live-acceptance` lists it as SKIPPED and ends with "Completed with skipped
-steps."; its `--require-all` flag turns a skip into a failure.
+when its tool is not on `PATH`, so a missing tool degrades one step. `cargo xtask live-acceptance` lists it as SKIPPED
+and, without `--require-all`, ends with "Completed with skipped steps." and exit code zero. The workflow passes
+`--require-all`, so there a skip fails the run.
 
 | Tool | Needed for | Notes |
 | --- | --- | --- |

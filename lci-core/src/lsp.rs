@@ -129,6 +129,16 @@ pub struct ServerReadiness {
     pub idle_ms: u64,
 }
 
+/// Whether a provider's binary has answered a version probe in this manager
+/// (see [`Manager::probe_state`]). Only a success is remembered, so a provider
+/// that was never asked and one whose probe failed are both `NotProbed`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeState {
+    Probed,
+    NotProbed,
+}
+
 /// How a server takes a changed document, from `textDocumentSync.change` in
 /// its `initialize` result (see [`change_sync_of`]). A session sends a file
 /// whose text changed as a `didChange` with the whole text under `Full` and
@@ -2284,6 +2294,27 @@ impl Manager {
             .map(|session| session.readiness())
     }
 
+    /// Whether `provider`'s binary has answered a version probe in this
+    /// manager, read from the memo of [`Self::probe_once`]. Runs no probe and
+    /// starts nothing, so a status report costs no subprocess.
+    pub fn probe_state(&self, provider: &str) -> ProbeState {
+        if self.probed.lock().unwrap().contains(provider) {
+            ProbeState::Probed
+        } else {
+            ProbeState::NotProbed
+        }
+    }
+
+    /// Time left in `provider`'s skip window under `[run_profile.lsp]
+    /// breaker = true`, `None` when there is no breaker or its window is
+    /// closed. A read: it runs no probe, starts nothing and opens or closes
+    /// no window.
+    pub fn breaker_remaining(&self, provider: &'static str) -> Option<Duration> {
+        self.breakers
+            .as_ref()
+            .and_then(|breakers| breakers.remaining(provider))
+    }
+
     /// Starts the server of every enabled adapter for `workspace` and waits
     /// until each has finished priming, so that a later `workspace/symbol`
     /// request does not pay the start. Returns, per provider, the time the
@@ -3466,6 +3497,31 @@ mod tests {
         assert_eq!(counts.asked.load(Ordering::SeqCst), 3);
     }
 
+    #[tokio::test]
+    async fn probe_state_reports_the_memo_and_runs_no_probe() {
+        let timeout = Duration::from_secs(1);
+        let adapter = Arc::new(Probing {
+            answers: vec![true],
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let dyn_adapter: Arc<dyn LspAdapter> = Arc::clone(&adapter) as Arc<dyn LspAdapter>;
+        let manager = Manager::new(&Config::default());
+        let asked = || adapter.asked.load(Ordering::SeqCst);
+        assert_eq!(manager.probe_state("probing-server"), ProbeState::NotProbed);
+        assert_eq!(asked(), 0);
+        manager.probe_once(&dyn_adapter, timeout).await.unwrap();
+        assert_eq!(asked(), 1);
+        assert_eq!(manager.probe_state("probing-server"), ProbeState::Probed);
+        assert_eq!(manager.probe_state("probing-server"), ProbeState::Probed);
+        assert_eq!(asked(), 1, "reading the state asks the binary nothing");
+        // Another provider is untouched, and the wire form is snake_case.
+        assert_eq!(manager.probe_state("other-server"), ProbeState::NotProbed);
+        assert_eq!(
+            serde_json::to_value(ProbeState::NotProbed).unwrap(),
+            json!("not_probed")
+        );
+    }
+
     /// A window long enough that no test outlives it: a test that needs it to
     /// have passed calls `expire` instead of waiting.
     fn long_window() -> Arc<LspBreakers> {
@@ -3652,6 +3708,35 @@ mod tests {
         breakers.expire("starting-server");
         assert!(manager.symbols(&adapter, &workspace, "x").await.is_err());
         assert_eq!(starts(), 2);
+    }
+
+    #[tokio::test]
+    async fn breaker_remaining_shows_an_open_window_and_starts_nothing() {
+        let stub = Arc::new(Starting {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let starts = || stub.starts.load(Ordering::SeqCst);
+        let adapter: Arc<dyn LspAdapter> = Arc::clone(&stub) as Arc<dyn LspAdapter>;
+        let workspace = prime_workspace();
+        let breakers = long_window();
+        let manager = Manager::new(&Config::default()).with_breakers(Some(Arc::clone(&breakers)));
+        // Before a failed start there is no window, and reading it starts
+        // nothing.
+        assert!(manager.breaker_remaining("starting-server").is_none());
+        assert_eq!(starts(), 0);
+        // The failed start opens the window; reading it still starts nothing.
+        assert!(manager.symbols(&adapter, &workspace, "x").await.is_err());
+        assert_eq!(starts(), 1);
+        assert!(manager.breaker_remaining("starting-server").is_some());
+        assert!(manager.breaker_remaining("other-server").is_none());
+        assert_eq!(starts(), 1);
+        // A manager without the breaker has no window to show.
+        let plain = Manager::new(&Config::default());
+        assert!(plain.breaker_remaining("starting-server").is_none());
+        // The window has passed.
+        breakers.expire("starting-server");
+        assert!(manager.breaker_remaining("starting-server").is_none());
+        assert_eq!(starts(), 1);
     }
 
     #[tokio::test]
