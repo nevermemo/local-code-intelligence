@@ -27,6 +27,14 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The documents-mode fake past its handshake and start-up walk, on a
 /// workspace that holds `src/Calculator.cs` only.
 async fn started_fake(temp: &tempfile::TempDir) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
+    started_fake_with(temp, &[]).await
+}
+
+/// [`started_fake`] with more fake-server flags.
+async fn started_fake_with(
+    temp: &tempfile::TempDir,
+    extra: &[&str],
+) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
     let root = temp.path().join("workspace");
     write(
         &root,
@@ -40,7 +48,10 @@ async fn started_fake(temp: &tempfile::TempDir) -> (Arc<JsonRpcClient>, std::pat
             "documents".to_owned(),
             "--state".to_owned(),
             temp.path().join("state").to_string_lossy().into_owned(),
-        ],
+        ]
+        .into_iter()
+        .chain(extra.iter().map(|arg| (*arg).to_owned()))
+        .collect(),
         working_dir: temp.path().to_owned(),
         timeout: LOADED_BUDGET,
         label: "fake".to_owned(),
@@ -93,9 +104,14 @@ async fn request(shared: &Shared, file: &std::path::Path, name: &'static str) ->
     )
     .await
     .unwrap();
-    if let Some(_opened) = opened {
+    if let Some(opened) = opened {
         shared.in_wait.notify_one();
         shared.hold.notified().await;
+        // Like a real hook, finish the wait for the publication (the fake's
+        // comes at once), so that the next caller is not handed it (N111).
+        opened
+            .wait_for_diagnostics(&shared.client, LOADED_BUDGET)
+            .await;
     }
     lock(&shared.log).push(name);
     let column = LATE_CS.lines().nth(1).unwrap().find("Add").unwrap();
@@ -246,6 +262,151 @@ async fn a_cancelled_open_whose_write_fails_is_not_taken_for_sent() {
             !matches!(second, Ok(None)),
             "the text was taken for sent although its write never finished"
         );
+    })
+    .await
+    .expect("within the outer bound");
+}
+
+/// A hook cancelled after its `didOpen` was written (here: the value dropped
+/// without waiting) leaves the wait for the server's diagnostics to the next
+/// caller of the file (N111). Caller 2 is handed the wait, finishes it, and its
+/// request goes out after the publication, with no second `didOpen`; caller 3
+/// finds the wait settled and gets nothing. Fails without the pending record
+/// (caller 2 gets `None` and its request is read during the pending
+/// publication) and without the settle (caller 3 gets the document again).
+#[tokio::test]
+async fn a_dropped_open_leaves_its_diagnostics_wait_to_the_next_caller() {
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, root) = started_fake_with(&temp, &["--diagnostics-delay-ms", "300"]).await;
+        let state = temp.path().join("state");
+        write(&root, "src/Late.cs", LATE_CS);
+        let file = root.join("src/Late.cs");
+        let sent = SentTexts::default();
+        let open = || open_if_changed(&client, &sent, &file, "src/Late.cs", "fake", "csharp");
+        let lines = |name: &str| {
+            std::fs::read_to_string(state.join(name)).map_or(0, |text| text.lines().count())
+        };
+
+        // Caller 1 sent the text and was cancelled before it waited.
+        let first = open().await.unwrap();
+        assert!(first.is_some(), "the first call sends the text");
+        drop(first);
+
+        // Caller 2 is handed the wait and ends it on the publication.
+        let resumed = open()
+            .await
+            .unwrap()
+            .expect("the unfinished wait is left to the next caller");
+        assert!(
+            resumed.wait_for_diagnostics(&client, LOADED_BUDGET).await,
+            "the publication came within the cap"
+        );
+        let column = LATE_CS.lines().nth(1).unwrap().find("Add").unwrap();
+        client
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": {"uri": reqwest::Url::from_file_path(&file).unwrap().to_string()},
+                    "position": {"line": 1, "character": column},
+                }),
+            )
+            .await
+            .unwrap();
+        drop(resumed);
+        assert_eq!(
+            lines("request_during_pending_diagnostics.txt"),
+            0,
+            "the request went out after the publication"
+        );
+        assert_eq!(lines("did_open_seen.txt"), 1, "the text was sent once");
+
+        // The wait is settled: nothing is left for caller 3.
+        assert!(open().await.unwrap().is_none(), "the wait was settled");
+        assert_eq!(client.diagnostics_wait_timeouts(), 0);
+    })
+    .await
+    .expect("within the outer bound");
+}
+
+/// A server that publishes empty diagnostics when it closes a document
+/// (pyright, clangd; the fake with `--close-diagnostics-delay-ms`, the
+/// publication carries no version) must not end the diagnostics wait of the
+/// open that follows the close. The 65th file closes the first; once the
+/// first file's own first publication is in (1000 ms), it is asked for again,
+/// while the close's publication (1500 ms after the close) is still on its
+/// way and the re-open's own (1000 ms after the re-open) comes after it. The
+/// wait must end on the latter: three publications counted for the file (open,
+/// close, re-open), not two. Fails when the re-open's wait accepts a
+/// publication that carries no version.
+#[tokio::test]
+async fn a_close_publication_does_not_end_a_reopens_diagnostics_wait() {
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, root) = started_fake_with(
+            &temp,
+            &[
+                "--diagnostics-delay-ms",
+                "1000",
+                "--close-diagnostics-delay-ms",
+                "1500",
+            ],
+        )
+        .await;
+        let relative = |number: u32| format!("src/F{number:03}.cs");
+        for number in 1..=65 {
+            write(
+                &root,
+                &relative(number),
+                &format!(
+                    "namespace Acceptance;\npublic sealed class F{number:03} {{ public int Run() => 1; }}\n"
+                ),
+            );
+        }
+        let sent = SentTexts::default();
+        let open = |number: u32| {
+            let (client, sent, root, relative) = (&client, &sent, root.clone(), relative(number));
+            async move {
+                open_if_changed(
+                    client,
+                    sent,
+                    &root.join(&relative),
+                    &relative,
+                    "fake",
+                    "csharp",
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first_uri = reqwest::Url::from_file_path(root.join(relative(1)))
+            .unwrap()
+            .to_string();
+
+        // 64 files fill the table; the 65th closes the first.
+        for number in 1..=65 {
+            let opened = open(number).await;
+            assert!(opened.is_some(), "F{number:03} is sent");
+        }
+        // The first file's first publication is in, the close's is not.
+        assert!(
+            client
+                .wait_diagnostics(&first_uri, 0, 1, LOADED_BUDGET)
+                .await
+        );
+        assert_eq!(client.diagnostics_seen(&first_uri), 1);
+
+        let reopened = open(1).await.expect("the closed file is opened again");
+        assert!(
+            reopened.wait_for_diagnostics(&client, LOADED_BUDGET).await,
+            "the re-open's own publication came within the cap"
+        );
+        assert_eq!(
+            client.diagnostics_seen(&first_uri),
+            3,
+            "open, close and re-open were each published: the wait did not end on the close's"
+        );
+        assert_eq!(client.diagnostics_wait_timeouts(), 0);
     })
     .await
     .expect("within the outer bound");

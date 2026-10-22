@@ -9033,3 +9033,284 @@ async fn interleaved_requests_of_two_walks_on_one_server_each_get_their_own_answ
     );
     manager.shutdown_all().await;
 }
+
+// ---------------------------------------------------------------------------
+// K7c-1: a changed text goes to a server in `textDocument/didChange` when it
+// advertised change sync (the documents fake as the python server: pyright's
+// hook opens documents, the fake answers from the text it was sent).
+// ---------------------------------------------------------------------------
+
+/// One document message the fake recorded: `(method, version, note)`.
+type DocumentEvent = (String, Option<i64>, Option<String>);
+
+/// The `didOpen`, `didChange`, `didClose` and `definition` lines of
+/// `events.jsonl`, in arrival order. A request round trip has to follow the
+/// notifications it is to include.
+fn document_events(state: &std::path::Path) -> Vec<DocumentEvent> {
+    std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|event| {
+            let method = event["method"].as_str()?.strip_prefix("textDocument/")?;
+            matches!(method, "didOpen" | "didChange" | "didClose" | "definition").then(|| {
+                (
+                    method.to_owned(),
+                    event["version"].as_i64(),
+                    event["note"].as_str().map(str::to_owned),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Asks twice for the definition of `Add` in `src/CallSite.cs`, appends a
+/// method that calls it, and asks for the definition at the new call. Answers
+/// the document events and the last answer's `(file, line, character)`.
+async fn edit_a_call_site_through_the_documents_fake(
+    sync_args: &[&str],
+) -> (Vec<DocumentEvent>, Vec<(String, u32, u32)>) {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_path = temp.path().join("workspace");
+    let data_path = temp.path().join("data");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&data_path).unwrap();
+    write_csharp_workspace(&workspace_path);
+    let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
+    let config = with_fake_documents_server_as(
+        Config {
+            data_dir: data_path,
+            ..Config::default()
+        },
+        "python",
+        &state,
+        sync_args,
+        LOADED_BUDGET_SECONDS,
+    );
+    let manager = Manager::new(&config);
+    let adapter = python_adapter(&manager);
+    let file = workspace.path.join("src/CallSite.cs");
+    let call = position_of(CALL_SITE_CS, "Add");
+    let definition = async |at: (u32, u32)| {
+        manager
+            .definition(&adapter, &workspace, &file, "src/CallSite.cs", at.0, at.1)
+            .await
+            .unwrap()
+    };
+
+    for _ in 0..2 {
+        assert_eq!(definition(call).await.len(), 1, "the unedited call site");
+    }
+    write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
+    let twice = position_of(CALL_SITE_WITH_TWICE_CS.lines().nth(2).unwrap(), "Add");
+    let new_call = (2, twice.1);
+    let answer = definition(new_call).await;
+    manager.shutdown_all().await;
+    let answered = answer
+        .iter()
+        .map(|location| {
+            (
+                location.relative_file_path.clone().unwrap(),
+                location.start_line,
+                location.start_character,
+            )
+        })
+        .collect();
+    (document_events(&state), answered)
+}
+
+fn at_add_in_calculator() -> Vec<(String, u32, u32)> {
+    let add = position_of(CALCULATOR_CS, "Add");
+    vec![("src/Calculator.cs".to_owned(), add.0 + 1, add.1)]
+}
+
+fn document_event(method: &str, version: Option<i64>, note: Option<&str>) -> DocumentEvent {
+    (method.to_owned(), version, note.map(str::to_owned))
+}
+
+/// A server that advertised full change sync is sent a changed text as
+/// `didChange` with the next version, once, and the answer follows the new
+/// text. Fails with a second `didOpen` (the fake notes `open-reopened`) and
+/// without the hash check (an extra `didChange` after the second request).
+#[tokio::test]
+async fn a_changed_file_is_sent_as_did_change_and_the_answer_follows_the_new_text() {
+    let (events, answer) = edit_a_call_site_through_the_documents_fake(&[]).await;
+    assert_eq!(
+        events,
+        [
+            document_event("didOpen", Some(1), None),
+            document_event("definition", None, None),
+            document_event("definition", None, None),
+            document_event("didChange", Some(2), None),
+            document_event("definition", None, None),
+        ]
+    );
+    assert_eq!(
+        answer,
+        at_add_in_calculator(),
+        "the call site that exists only in the new text"
+    );
+}
+
+/// A server that advertises no change sync (`change: 0`, `openClose` kept) is
+/// sent the edit as a second `didOpen`, as before; the fake notes the reopen,
+/// the one place a note is expected. Fails if `didChange` goes out whatever
+/// the capability says. The definition-mode control for the same rule is
+/// `a_second_request_on_an_unchanged_file_sends_no_second_did_open`
+/// (capabilities `{}`: `didOpen` 1, then 2).
+#[tokio::test]
+async fn a_server_that_advertises_no_change_sync_is_resent_the_text_as_did_open() {
+    let (events, answer) =
+        edit_a_call_site_through_the_documents_fake(&["--text-document-sync", "0"]).await;
+    assert_eq!(
+        events,
+        [
+            document_event("didOpen", Some(1), None),
+            document_event("definition", None, None),
+            document_event("definition", None, None),
+            document_event("didOpen", Some(2), Some("open-reopened")),
+            document_event("definition", None, None),
+        ]
+    );
+    assert_eq!(answer, at_add_in_calculator());
+}
+
+/// Incremental sync takes the whole text too: a change without a `range`
+/// replaces the document (LSP 3.17). Fails if the client sends ranges or does
+/// not send a change under `Incremental`.
+#[tokio::test]
+async fn an_incremental_sync_server_takes_the_whole_text_without_a_range() {
+    let (events, answer) =
+        edit_a_call_site_through_the_documents_fake(&["--text-document-sync", "2"]).await;
+    assert_eq!(
+        events,
+        [
+            document_event("didOpen", Some(1), None),
+            document_event("definition", None, None),
+            document_event("definition", None, None),
+            document_event("didChange", Some(2), None),
+            document_event("definition", None, None),
+        ]
+    );
+    assert_eq!(answer, at_add_in_calculator());
+}
+
+// ---------------------------------------------------------------------------
+// K7c-2: the open set is bounded; the least recently used file is closed first.
+// ---------------------------------------------------------------------------
+
+/// Navigates `src/F001.cs` .. `src/F065.cs` (one class each) by definition at
+/// the class name, in `order` (file numbers), through the documents fake as
+/// the python server. The events that name a file: `(method, file, version,
+/// note)` for each `didOpen` and `didClose`, in arrival order.
+async fn navigate_numbered_files(
+    order: &[u32],
+) -> Vec<(String, String, Option<i64>, Option<String>)> {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_path = temp.path().join("workspace");
+    let data_path = temp.path().join("data");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let class_line = |number: u32| {
+        format!(
+            "namespace Acceptance;\npublic sealed class F{number:03} {{ public int Run() => 1; }}\n"
+        )
+    };
+    for number in 1..=65 {
+        write(
+            &workspace_path,
+            &format!("src/F{number:03}.cs"),
+            &class_line(number),
+        );
+    }
+    let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
+    let config = with_fake_documents_server_as(
+        Config {
+            data_dir: data_path,
+            ..Config::default()
+        },
+        "python",
+        &state,
+        &[],
+        LOADED_BUDGET_SECONDS,
+    );
+    let manager = Manager::new(&config);
+    let adapter = python_adapter(&manager);
+    for &number in order {
+        let relative = format!("src/F{number:03}.cs");
+        let at = position_of(&class_line(number), &format!("F{number:03}"));
+        manager
+            .definition(
+                &adapter,
+                &workspace,
+                &workspace.path.join(&relative),
+                &relative,
+                at.0,
+                at.1,
+            )
+            .await
+            .unwrap();
+    }
+    manager.shutdown_all().await;
+    std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|event| {
+            let method = event["method"].as_str()?.strip_prefix("textDocument/")?;
+            matches!(method, "didOpen" | "didClose").then(|| {
+                let uri = event["uri"].as_str().unwrap();
+                (
+                    method.to_owned(),
+                    uri.rsplit('/').next().unwrap().to_owned(),
+                    event["version"].as_i64(),
+                    event["note"].as_str().map(str::to_owned),
+                )
+            })
+        })
+        .collect()
+}
+
+fn numbered(
+    method: &str,
+    number: u32,
+    version: Option<i64>,
+) -> (String, String, Option<i64>, Option<String>) {
+    (method.to_owned(), format!("F{number:03}.cs"), version, None)
+}
+
+/// 65 files in order: 64 `didOpen`, then the first file is closed before the
+/// 65th is opened; the first file asked for again re-opens at version 1
+/// (the fake notes `open-reopened` if it were still open) and closes the next
+/// least recently used. Fails without eviction (65 opens, no close) and with
+/// the close after the open.
+#[tokio::test]
+async fn the_open_set_is_bounded_and_the_least_recently_used_file_is_closed_first() {
+    let mut order: Vec<u32> = (1..=65).collect();
+    order.push(1);
+    let events = navigate_numbered_files(&order).await;
+    let mut expected: Vec<_> = (1..=64).map(|n| numbered("didOpen", n, Some(1))).collect();
+    expected.extend([
+        numbered("didClose", 1, None),
+        numbered("didOpen", 65, Some(1)),
+        numbered("didClose", 2, None),
+        numbered("didOpen", 1, Some(1)),
+    ]);
+    assert_eq!(events, expected);
+}
+
+/// A request on an unchanged file sends nothing but refreshes the file's place
+/// in the open set: after F001 is asked for again, the file closed for F065 is
+/// F002. Fails without `last_used` being touched on an unchanged request.
+#[tokio::test]
+async fn an_unchanged_request_refreshes_a_files_place_in_the_open_set() {
+    let mut order: Vec<u32> = (1..=64).collect();
+    order.extend([1, 65]);
+    let events = navigate_numbered_files(&order).await;
+    let mut expected: Vec<_> = (1..=64).map(|n| numbered("didOpen", n, Some(1))).collect();
+    expected.extend([
+        numbered("didClose", 2, None),
+        numbered("didOpen", 65, Some(1)),
+    ]);
+    assert_eq!(events, expected);
+}

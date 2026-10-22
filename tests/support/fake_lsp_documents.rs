@@ -54,9 +54,10 @@ pub enum Outcome {
 }
 
 /// The server capabilities of the mode: every provider the fake answers.
-pub fn capabilities() -> Value {
+/// `change` is the advertised `textDocumentSync.change` kind (0, 1 or 2).
+pub fn capabilities(change: u64) -> Value {
     json!({
-        "textDocumentSync": {"openClose": true, "change": 1},
+        "textDocumentSync": {"openClose": true, "change": change},
         "workspaceSymbolProvider": true,
         "definitionProvider": true,
         "referencesProvider": true,

@@ -129,6 +129,40 @@ pub struct ServerReadiness {
     pub idle_ms: u64,
 }
 
+/// How a server takes a changed document, from `textDocumentSync.change` in
+/// its `initialize` result (see [`change_sync_of`]). A session sends a file
+/// whose text changed as a `didChange` with the whole text under `Full` and
+/// `Incremental` (LSP 3.17: a change entry without a `range` replaces the
+/// whole text under either kind), and as a second `didOpen` under `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangeSync {
+    /// No change sync advertised (the capability is absent, `null`, 0 or not
+    /// understood): the server is never sent a `didChange`.
+    #[default]
+    None,
+    /// `TextDocumentSyncKind.Full` (1).
+    Full,
+    /// `TextDocumentSyncKind.Incremental` (2).
+    Incremental,
+}
+
+/// The change sync a server advertised: `capabilities.textDocumentSync` as a
+/// number (0, 1, 2) or an object with a `change` of those values. Anything
+/// else is [`ChangeSync::None`].
+pub fn change_sync_of(initialize_result: &Value) -> ChangeSync {
+    let sync = &initialize_result["capabilities"]["textDocumentSync"];
+    let kind = if sync.is_object() {
+        &sync["change"]
+    } else {
+        sync
+    };
+    match kind.as_u64() {
+        Some(1) => ChangeSync::Full,
+        Some(2) => ChangeSync::Incremental,
+        _ => ChangeSync::None,
+    }
+}
+
 /// A live JSON-RPC session with one spawned, initialized language server.
 struct GenericClient {
     rpc: Arc<JsonRpcClient>,
@@ -160,14 +194,15 @@ impl GenericClient {
         let params = adapter
             .initialize_params(&workspace.path)
             .with_context(|| format!("cannot build {} initialization", adapter.provider()))?;
-        rpc.request_within("initialize", params, start_timeout)
+        let initialized = rpc
+            .request_within("initialize", params, start_timeout)
             .await
             .with_context(|| format!("initialize {}", adapter.provider()))?;
         rpc.notify("initialized", json!({})).await?;
         adapter.after_initialized(&rpc).await?;
         Ok(Arc::new(Self {
             rpc,
-            sent: SentTexts::default(),
+            sent: SentTexts::with_sync(change_sync_of(&initialized)),
         }))
     }
 
@@ -4168,9 +4203,31 @@ mod tests {
                 ("marksman", true),
                 ("pyright", true),
                 ("rust-analyzer", false),
-                ("typescript-language-server", false),
+                ("typescript-language-server", true),
             ]
         );
+    }
+
+    #[test]
+    fn change_sync_is_read_from_both_capability_forms() {
+        let result = |sync: Value| json!({"capabilities": {"textDocumentSync": sync}});
+        assert_eq!(change_sync_of(&result(json!(0))), ChangeSync::None);
+        assert_eq!(change_sync_of(&result(json!(1))), ChangeSync::Full);
+        assert_eq!(change_sync_of(&result(json!(2))), ChangeSync::Incremental);
+        assert_eq!(
+            change_sync_of(&result(json!({"openClose": true, "change": 2}))),
+            ChangeSync::Incremental
+        );
+        assert_eq!(
+            change_sync_of(&result(json!({"openClose": true}))),
+            ChangeSync::None
+        );
+        assert_eq!(change_sync_of(&result(Value::Null)), ChangeSync::None);
+        assert_eq!(
+            change_sync_of(&json!({"capabilities": {}})),
+            ChangeSync::None
+        );
+        assert_eq!(change_sync_of(&json!({})), ChangeSync::None);
     }
 
     #[test]
