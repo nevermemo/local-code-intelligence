@@ -1,5 +1,7 @@
 include!("support/mod.rs");
 
+#[path = "cases/child_stdin.rs"]
+mod child_stdin;
 #[path = "cases/config.rs"]
 mod config;
 #[path = "cases/evaluation.rs"]
