@@ -61,9 +61,13 @@ impl LspAdapter for RustServer {
     /// `experimental.serverStatusNotification`, no
     /// `workspace.didChangeWatchedFiles`, so rust-analyzer cannot rely on the
     /// client for file changes and runs its own watcher (its documented
-    /// fallback). Correctness does not rely on that watcher: a kept session
-    /// passes the tree barrier of each walk (`Manager::tree_barrier`), so its
-    /// lag is not a staleness. Checked
+    /// fallback). Navigation and a traverse walk do not rely on that watcher:
+    /// a kept session passes the tree barrier (`Manager::tree_barrier`) and is
+    /// restarted when the stamp changed, so its lag is not a staleness there.
+    /// The search channel does rely on it (`Manager::search_barrier`, N108): it
+    /// keeps the session through a changed stamp and labels the answer, so a
+    /// search is as fresh as this watcher, which can lag an edit and misses a
+    /// `Cargo.toml` or `Cargo.lock` edit while the server reloads. Checked
     /// against the real server by the SHARED smoke (decision d454).
     fn watches_workspace(&self) -> bool {
         true

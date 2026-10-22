@@ -411,7 +411,11 @@ impl Map for LspMap<'_> {
         // The notes `search_once` reports, in its order: what the tree barrier
         // did, then the providers past the budget. A map carries one note, so
         // they are joined with "; " (N110).
-        let mut notes = crate::app::navigation::barrier_notes(&channel.restarted, &channel.reused);
+        let mut notes = crate::app::navigation::barrier_notes(
+            &channel.restarted,
+            &channel.kept,
+            &channel.reused,
+        );
         if !channel.over_budget.is_empty() {
             notes.push(
                 self.app

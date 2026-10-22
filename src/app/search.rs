@@ -834,6 +834,10 @@ struct LspChannel {
     /// Providers whose kept session the tree barrier stopped, each with the
     /// reason (see [`App::lsp_channel`]).
     restarted: Vec<crate::lsp::Restart>,
+    /// Providers that watch their workspace, whose session the barrier would
+    /// have stopped and the search kept, each with that reason (see
+    /// [`crate::lsp::Manager::search_barrier`]).
+    kept: Vec<crate::lsp::Kept>,
     /// Providers whose answers came from a session this search found running,
     /// each with how long its tree stamp had been unchanged (`None`: no stamp
     /// was recorded for it).
@@ -1308,6 +1312,7 @@ impl App {
         // Informational, like the over-budget note: nothing failed.
         report.notes.extend(super::navigation::barrier_notes(
             &lsp_result.restarted,
+            &lsp_result.kept,
             &lsp_result.reused,
         ));
         if !lsp_result.over_budget.is_empty() {
@@ -1819,10 +1824,12 @@ impl App {
     /// returned channel's `elapsed_ms` is left for the caller to set.
     ///
     /// Before the requests, the providers' kept sessions pass the tree barrier
-    /// (`Manager::tree_barrier`): one whose tree changed since its last check
+    /// (`Manager::search_barrier`): one whose tree changed since its last check
     /// is stopped and the search starts a fresh one (inside the budget, so a
-    /// slow start reads as an over-budget note). The channel lists those
-    /// restarts and the sessions the search found running whose requests
+    /// slow start reads as an over-budget note), except a server that watches
+    /// its workspace, which keeps its session and is listed as kept (N108: an
+    /// edit restarted rust-analyzer and the next searches lost the channel).
+    /// The channel lists those restarts, those kept watchers, and the sessions the search found running whose requests
     /// completed (one that missed the budget or failed is not an answer from
     /// a kept session).
     async fn lsp_channel(
@@ -1837,7 +1844,10 @@ impl App {
         // requests run in one scope that records which sessions the search
         // found running.
         let provider_refs: Vec<&Arc<dyn LspAdapter>> = providers.iter().collect();
-        let restarted = self.analyzer.tree_barrier(workspace, &provider_refs).await;
+        let barrier = self
+            .analyzer
+            .search_barrier(workspace, &provider_refs)
+            .await;
         let walk = Arc::new(crate::lsp::WalkSessions::default());
         let answers = walk
             .scope(futures::future::join_all(providers.iter().map(
@@ -1854,7 +1864,8 @@ impl App {
             )))
             .await;
         let mut channel = LspChannel {
-            restarted,
+            restarted: barrier.restarted,
+            kept: barrier.kept,
             ..LspChannel::default()
         };
         // The providers whose requests all completed: the session is recorded
@@ -1879,10 +1890,17 @@ impl App {
                 }
             }
         }
+        // A provider the barrier kept through a changed tree has its own note;
+        // its `WalkSessions` entry would read "tree stamp unchanged", which is
+        // false.
+        let kept_providers: Vec<&'static str> =
+            channel.kept.iter().map(|kept| kept.provider).collect();
         channel.reused = walk
             .reused()
             .into_iter()
-            .filter(|(provider, _)| completed.contains(provider))
+            .filter(|(provider, _)| {
+                completed.contains(provider) && !kept_providers.contains(provider)
+            })
             .collect();
         for index in 0..symbol_queries.len() {
             for locations in &mut per_provider {
