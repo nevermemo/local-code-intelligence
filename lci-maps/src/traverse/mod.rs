@@ -149,6 +149,18 @@
 //! has a `confirm` field. A handle keeps `top_k` and the confirmer's identity
 //! ([`handle::Snapshot::check_confirm`]); the caller passes the confirmer again.
 //!
+//! Arbitration ([`Traversal::arbitration`], off unless attached): a source
+//! given an [`source::Arbitration`] lets an authority map (a language server)
+//! overrule the edges of subordinate maps (a stale index) before fusion. The
+//! edge source applies it ([`source::OnTheFly::with_arbitration`],
+//! [`merged::PreMerged::with_arbitration`]); the traversal only reports it:
+//! the `expand` event's `calls[]` entry of a subordinate map has an
+//! `arbitration` object (`confirmed`, `overruled`), and the `end` event's
+//! `totals` has the sum over the call's expansions (none of this appears
+//! when nothing is attached). [`TraversalResult::arbitration`] and
+//! [`TraversalResult::arbitration_by_map`] carry the same counts, for this
+//! call only: a resume starts them again, and a retried pop counts again.
+//!
 //! Logical and physical work: the caps above charge a retried pop only what its
 //! earlier run did not pay (`tokens`, `external_calls`), the logical work. The
 //! maps ran again all the same, so [`Totals::physical_map_calls`] and
@@ -212,7 +224,7 @@ use lci_core::node::{NodeId, NodeKind};
 use priors::HopPriors;
 use rescore::{FrontierRescorer, RerankFailure};
 use serde_json::{Value, json};
-use source::{ClaimFamily, EdgeSource, Expansion, FusedEdge};
+use source::{ArbitrationCounts, ClaimFamily, EdgeSource, Expansion, FusedEdge};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -536,6 +548,14 @@ pub struct TraversalResult {
     /// Milliseconds each map spent answering expansions in this call. Wall
     /// clock: kept out of the events, the checkpoint and the handle.
     pub map_ms: BTreeMap<MapId, f64>,
+    /// What an arbitration did over this call, summed over its expansions:
+    /// `Some` exactly when one was attached ([`Traversal::arbitration`]).
+    /// Counted per call, not carried by a handle.
+    pub arbitration: Option<ArbitrationCounts>,
+    /// The same per subordinate map (every subordinate map of the attached
+    /// arbitration has an entry, zero when nothing of it was arbitrated);
+    /// empty when none was attached.
+    pub arbitration_by_map: BTreeMap<MapId, ArbitrationCounts>,
     /// The floor of the reranker frontier the run used (none: it was off).
     pub rerank_floor: Option<f64>,
     /// Milliseconds the rescorer calls took in this call. Wall clock: kept
@@ -642,6 +662,9 @@ pub struct Traversal<'s> {
     /// The confirm frontier: the confirmer and the most hops one expansion
     /// proposes.
     confirm: Option<(Arc<dyn FrontierConfirmer + 's>, usize)>,
+    /// The arbitration the edge source applies, as told to the traversal: it
+    /// decides what is reported and for which maps.
+    arbitration: Option<source::Arbitration>,
     score_bound: bool,
     priors: HopPriors,
     tie_break: Option<TieBreak>,
@@ -685,6 +708,7 @@ impl<'s> Traversal<'s> {
             trajectory: 0,
             rerank: None,
             confirm: None,
+            arbitration: None,
             score_bound: true,
             priors: HopPriors::default(),
             tie_break: None,
@@ -844,6 +868,17 @@ impl<'s> Traversal<'s> {
         self
     }
 
+    /// Reports an arbitration (default none; see the module docs): `a` must
+    /// be the one given to the edge source
+    /// ([`source::OnTheFly::with_arbitration`]), which does the arbitrating.
+    /// With it the `expand` events and the `end` totals carry the counts, and
+    /// [`TraversalResult::arbitration`] is `Some`; without it nothing is
+    /// printed and every output is as before.
+    pub fn arbitration(mut self, a: source::Arbitration) -> Self {
+        self.arbitration = Some(a);
+        self
+    }
+
     /// Whether the score bound may end the walk (default true; see
     /// [`Traversal::top_k`]). A resumed traversal keeps the setting its handle
     /// was made with.
@@ -968,6 +1003,9 @@ struct Run<'s> {
     rerank_ms: f64,
     /// Milliseconds the confirmer calls took in this call.
     confirm_ms: f64,
+    /// What the attached arbitration did in this call, in all and per map.
+    arbitration_total: ArbitrationCounts,
+    arbitration_maps: BTreeMap<MapId, ArbitrationCounts>,
     /// See [`TraversalResult::warnings`]; the ones the run itself finds.
     warnings: Vec<String>,
 }
@@ -1002,6 +1040,8 @@ impl<'s> Run<'s> {
             map_ms: BTreeMap::new(),
             rerank_ms: 0.0,
             confirm_ms: 0.0,
+            arbitration_total: ArbitrationCounts::default(),
+            arbitration_maps: BTreeMap::new(),
             warnings: Vec::new(),
         }
     }
@@ -1322,6 +1362,12 @@ impl<'s> Run<'s> {
                 object["totals"]["confirm_skipped"] = json!(self.totals.confirm_skipped);
                 object["totals"]["confirm_failures"] = json!(self.totals.confirm_failures);
             }
+            if self.t.arbitration.is_some() {
+                object["totals"]["arbitration"] = json!({
+                    "confirmed": self.arbitration_total.confirmed,
+                    "overruled": self.arbitration_total.overruled,
+                });
+            }
         }
         self.events.push(end);
         self.rerank_warnings();
@@ -1361,6 +1407,8 @@ impl<'s> Run<'s> {
             estimate: likely_complete(&self.tally.found),
             maps: self.tally.maps,
             map_ms: self.map_ms,
+            arbitration: self.t.arbitration.as_ref().map(|_| self.arbitration_total),
+            arbitration_by_map: self.arbitration_maps,
             rerank_floor: self.t.rerank.as_ref().map(|(_, floor)| *floor),
             rerank_ms: self.rerank_ms,
             confirm_top_k: self.t.confirm.as_ref().map(|(_, k)| *k),
@@ -1599,6 +1647,22 @@ impl<'s> Run<'s> {
             stat.calls += 1;
             stat.failures += u32::from(call.failure.is_some());
         }
+        // Arbitration counts, beside the tally: every subordinate map of the
+        // attached arbitration has an entry (zero when nothing was arbitrated).
+        if let Some(arbitration) = &self.t.arbitration {
+            for (map, _) in &arbitration.subordinate {
+                self.arbitration_maps.entry(*map).or_default();
+            }
+            for call in &calls {
+                if let Some(counts) = call.arbitration {
+                    self.arbitration_total.add(counts);
+                    self.arbitration_maps
+                        .entry(call.map)
+                        .or_default()
+                        .add(counts);
+                }
+            }
+        }
         let call_tokens: u64 = calls.iter().map(|c| c.cost.est_tokens).sum();
         let call_external: u32 = calls
             .iter()
@@ -1621,12 +1685,19 @@ impl<'s> Run<'s> {
         let call_report: Vec<Value> = calls
             .iter()
             .map(|c| {
-                json!({
+                let mut call = json!({
                     "map": c.map, "n_edges": c.n_edges,
                     "est_tokens": c.cost.est_tokens,
                     "external_calls": c.cost.external_calls,
                     "failure": c.failure,
-                })
+                });
+                if let Some(counts) = c.arbitration {
+                    call["arbitration"] = json!({
+                        "confirmed": counts.confirmed,
+                        "overruled": counts.overruled,
+                    });
+                }
+                call
             })
             .collect();
         if owed_tokens > self.tokens_left() || owed_calls > calls_before {

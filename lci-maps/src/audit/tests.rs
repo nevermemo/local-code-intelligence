@@ -394,6 +394,7 @@ impl EdgeSource for FixedCall {
                 cost: self.0,
                 failure: None,
                 ms: 0.0,
+                arbitration: None,
             }],
         }
     }

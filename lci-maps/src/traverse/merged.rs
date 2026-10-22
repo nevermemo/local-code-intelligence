@@ -62,7 +62,9 @@
 //! A map that breaks that declaration makes an incremental update differ from
 //! a full build; `update` then equals `build` only for maps that keep it.
 
-use super::source::{CostTable, EdgeSource, ExpandCall, Expansion, FusedEdge, OnTheFly, fuse};
+use super::source::{
+    Arbitration, CostTable, EdgeSource, ExpandCall, Expansion, FusedEdge, OnTheFly, arbitrate, fuse,
+};
 use crate::{
     Budget, Cost, FreshnessModel, MapId, Registry, SnapshotView,
     audit::canonical_fused,
@@ -545,6 +547,9 @@ impl MergedAdjacency {
 pub struct PreMerged<A: Borrow<MergedAdjacency> + Send + Sync> {
     adjacency: A,
     off: HashSet<String>,
+    /// Applied to a row's raw edges before fusing, as
+    /// [`OnTheFly::with_arbitration`] does.
+    arbitration: Option<Arbitration>,
 }
 
 impl<A: Borrow<MergedAdjacency> + Send + Sync> PreMerged<A> {
@@ -552,7 +557,19 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> PreMerged<A> {
         Self {
             adjacency,
             off: HashSet::new(),
+            arbitration: None,
         }
+    }
+
+    /// Lets the authority of `arbitration` overrule the subordinate maps'
+    /// edges, re-fusing from the row's raw edges as a map switched off does
+    /// (the same [`arbitrate`] as [`OnTheFly::with_arbitration`], so both
+    /// sources answer alike). The rows hold the unarbitrated edges by
+    /// construction: the adjacency only ever asks raw, through
+    /// `OnTheFly::new` and `Row::ask`, never with an arbitration attached.
+    pub fn with_arbitration(mut self, arbitration: Arbitration) -> Self {
+        self.arbitration = Some(arbitration);
+        self
     }
 }
 
@@ -570,24 +587,14 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> EdgeSource for PreMerged<A> {
                         cost: Cost::default(),
                         failure: Some("not in the pre-merged adjacency".into()),
                         ms: 0.0,
+                        arbitration: None,
                     }],
                 }
             } else {
                 Expansion::default()
             };
         };
-        let edges = if self.off.is_empty() {
-            row.fused.clone()
-        } else {
-            fuse(
-                row.raw
-                    .iter()
-                    .filter(|edge| !self.off.contains(edge.map))
-                    .cloned()
-                    .collect(),
-            )
-        };
-        let calls = row
+        let mut calls: Vec<ExpandCall> = row
             .calls
             .iter()
             .filter(|call| !self.off.contains(call.map))
@@ -597,8 +604,23 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> EdgeSource for PreMerged<A> {
                 cost: call.cost,
                 failure: call.failure.clone(),
                 ms: 0.0,
+                arbitration: None,
             })
             .collect();
+        let edges = if self.off.is_empty() && self.arbitration.is_none() {
+            row.fused.clone()
+        } else {
+            let mut raw: Vec<Edge> = row
+                .raw
+                .iter()
+                .filter(|edge| !self.off.contains(edge.map))
+                .cloned()
+                .collect();
+            if let Some(arbitration) = &self.arbitration {
+                arbitrate(&mut raw, &mut calls, arbitration);
+            }
+            fuse(raw)
+        };
         Expansion { edges, calls }
     }
 
