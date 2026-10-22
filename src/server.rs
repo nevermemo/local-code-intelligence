@@ -9,6 +9,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use std::{path::Path, sync::Arc};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct McpServer {
@@ -185,6 +186,26 @@ fn result<T: serde::Serialize>(profile_hash: &str, value: anyhow::Result<T>) -> 
     }
 }
 
+/// Runs `work` until it finishes or the client cancels the request (`ct`, the
+/// request context's token, which rmcp cancels on `notifications/cancelled`).
+/// On a cancel `work` is dropped at its current await point, exactly as axum
+/// drops a REST handler whose client went away, and the result is an error
+/// saying so; rmcp discards the response of a cancelled request, so the
+/// client never sees it. Work that was handed to a thread (`spawn_blocking`,
+/// the index-lock thread) is not stopped by the drop.
+async fn until_cancelled(
+    ct: &CancellationToken,
+    work: impl std::future::Future<Output = CallToolResult>,
+) -> CallToolResult {
+    tokio::select! {
+        biased;
+        () = ct.cancelled() => {
+            CallToolResult::error(vec![ContentBlock::text("the client cancelled the request")])
+        }
+        result = work => result,
+    }
+}
+
 /// A successful result whose text content is `text`, JSON with its keys in
 /// the order the writer chose (see `compact_view`), and whose structured
 /// content is the same JSON as a `Value`. The text is kept as written: a
@@ -270,11 +291,18 @@ impl McpServer {
     #[tool(
         description = "Index Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ source and Markdown documentation (opt-in, `[index].prose`) in a local workspace respecting gitignore. Reuses unchanged chunks and embeddings; returns when the persistent index is ready."
     )]
-    async fn index_workspace(&self, Parameters(args): Parameters<WorkspaceArgs>) -> CallToolResult {
-        result(
-            self.app.profile_hash(),
-            self.app.index(Path::new(&args.workspace_path)).await,
-        )
+    async fn index_workspace(
+        &self,
+        Parameters(args): Parameters<WorkspaceArgs>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        until_cancelled(&ct, async {
+            result(
+                self.app.profile_hash(),
+                self.app.index(Path::new(&args.workspace_path)).await,
+            )
+        })
+        .await
     }
     #[tool(
         description = "Read persistent index status for a canonical workspace, including chunk count and embedding compatibility."
@@ -365,7 +393,25 @@ impl McpServer {
     #[tool(
         description = "Search indexed Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ code and Markdown documentation (opt-in, `[index].prose`) using semantic, lexical, and optional language-server LSP retrieval with neural reranking. Optional language, repository-relative include/exclude glob, and source-role filters apply to every channel. Returns role/prior metadata, scores, timings, effective filters, and index lifecycle metadata. When `[index].prose = true` (default false: Markdown is not indexed), documentation chunks (Markdown) are returned in a separate `docs` list (default 2) unless `source_roles` names documentation. A missing index is auto-created on first search."
     )]
-    async fn search_code(&self, Parameters(args): Parameters<SearchCodeArgs>) -> CallToolResult {
+    async fn search_code(
+        &self,
+        Parameters(args): Parameters<SearchCodeArgs>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        until_cancelled(&ct, self.run_search_code(args)).await
+    }
+    #[tool(
+        description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, and marksman. Missing language servers do not make readiness fail."
+    )]
+    async fn service_status(&self, Parameters(_args): Parameters<NoArgs>) -> CallToolResult {
+        result(self.app.profile_hash(), Ok(self.app.service_status().await))
+    }
+}
+
+impl McpServer {
+    /// The body of `search_code`, which the tool runs under the request's
+    /// cancellation token.
+    async fn run_search_code(&self, args: SearchCodeArgs) -> CallToolResult {
         let (args, mode, budget, steer, handle) = args.into_parts();
         if mode.is_some() {
             return self.answer(
@@ -412,12 +458,6 @@ impl McpServer {
             },
             None => self.answer(report),
         }
-    }
-    #[tool(
-        description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, and marksman. Missing language servers do not make readiness fail."
-    )]
-    async fn service_status(&self, Parameters(_args): Parameters<NoArgs>) -> CallToolResult {
-        result(self.app.profile_hash(), Ok(self.app.service_status().await))
     }
 }
 
