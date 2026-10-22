@@ -9,8 +9,8 @@
 //! fallback (fail-open, same spirit as every other adapter here -- LCI never
 //! writes one on the caller's behalf). Like pyright, gopls's background
 //! analysis is asynchronous enough that a freshly opened file benefits from
-//! an explicit `textDocument/didOpen` and a bounded head start before a
-//! position request.
+//! an explicit `textDocument/didOpen` and a wait for the server's
+//! `publishDiagnostics` for it before a position request.
 
 use crate::config::GoLspConfig;
 use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
@@ -139,14 +139,14 @@ impl LspAdapter for GoServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if let Some(_opened) = open_if_changed(rpc, sent, file, relative, "gopls", "go").await? {
-            // Mirrors the Python/TypeScript adapters' bounded head start:
+        if let Some(opened) = open_if_changed(rpc, sent, file, relative, "gopls", "go").await? {
             // gopls processes a newly opened file and its package graph
             // asynchronously, so a request issued immediately after didOpen
-            // can race ahead and see no definition/references yet. Only a
-            // newly sent text needs it.
-            let head_start = self.timeout.min(Duration::from_secs(3));
-            tokio::time::sleep(head_start).await;
+            // can race ahead and see no definition/references yet. It
+            // publishes diagnostics for the file when it has taken it in:
+            // wait for that, bounded by the configured request timeout. Only
+            // a newly sent text needs it.
+            opened.wait_for_diagnostics(rpc, self.timeout).await;
         }
         Ok(())
     }

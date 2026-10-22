@@ -220,6 +220,7 @@ fn focused_invocations(suite: Suite) -> Option<Vec<Vec<&'static str>>> {
             lib("lsp::"),
             integration("navigation::"),
             integration("lsp_concurrent_open::"),
+            integration("lsp_diagnostics_wait::"),
         ],
         Suite::Full => return None,
     };

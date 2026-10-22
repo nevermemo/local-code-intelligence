@@ -126,7 +126,7 @@ impl LspAdapter for TypeScriptServer {
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
         // tsserver has no notification this client hooks as a reliable
         // "project loaded" signal over the typescript-language-server LSP
-        // wrapper; after_initialized gives it a bounded head start instead.
+        // wrapper; a file the hook opens is waited for by its diagnostics instead.
         Box::new(|_| false)
     }
 
@@ -147,7 +147,7 @@ impl LspAdapter for TypeScriptServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if let Some(_opened) = open_if_changed(
+        if let Some(opened) = open_if_changed(
             rpc,
             sent,
             file,
@@ -162,11 +162,11 @@ impl LspAdapter for TypeScriptServer {
             // a definition/references request issued immediately after
             // didOpen can race ahead of that and see an empty result,
             // especially for a freshly spawned, one-shot-CLI-invocation
-            // process with no warm project state to reuse. Give it a
-            // bounded, best-effort head start, the same kind of fallback
-            // rust-analyzer's adapter uses. Only a newly sent text needs it.
-            let head_start = self.timeout.min(Duration::from_secs(3));
-            tokio::time::sleep(head_start).await;
+            // process with no warm project state to reuse. It publishes
+            // diagnostics for the file once it has analysed it: wait for
+            // that, bounded by the configured request timeout. Only a newly
+            // sent text needs it.
+            opened.wait_for_diagnostics(rpc, self.timeout).await;
         }
         Ok(())
     }

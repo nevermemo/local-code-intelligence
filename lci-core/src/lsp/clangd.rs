@@ -144,7 +144,7 @@ impl LspAdapter for ClangdServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if let Some(_opened) = open_if_changed(
+        if let Some(opened) = open_if_changed(
             rpc,
             sent,
             file,
@@ -154,13 +154,13 @@ impl LspAdapter for ClangdServer {
         )
         .await?
         {
-            // Mirrors the Python/TypeScript/Go adapters' bounded head start:
             // clangd parses and indexes a newly opened file asynchronously,
             // so a request issued immediately after didOpen can race ahead
-            // and see no definition/references yet. Only a newly sent text
-            // needs it.
-            let head_start = self.timeout.min(Duration::from_secs(3));
-            tokio::time::sleep(head_start).await;
+            // and see no definition/references yet. It publishes diagnostics
+            // for the file when it has parsed it: wait for that, bounded by
+            // the configured request timeout. Only a newly sent text needs
+            // it.
+            opened.wait_for_diagnostics(rpc, self.timeout).await;
         }
         Ok(())
     }

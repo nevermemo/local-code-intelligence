@@ -194,6 +194,99 @@ impl TransportConfig {
     }
 }
 
+/// How many `textDocument/publishDiagnostics` notifications the server has
+/// sent for each document URI, and the wait on them. A server that publishes
+/// diagnostics for a document it was just sent has taken the text in and
+/// analysed it, so the next request for that document sees it: the event the
+/// adapters wait for after a `textDocument/didOpen`, in place of a fixed head
+/// start.
+///
+/// Only counts are kept, never the diagnostics. The count of a URI is read
+/// before the `didOpen` goes out ([`Self::seen`]) and the wait ends when the
+/// count passes that reading ([`Self::wait_after`]), so a publication for an
+/// earlier text of the document cannot end the wait for a later one.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    by_uri: std::sync::Mutex<HashMap<String, u64>>,
+    notify: tokio::sync::Notify,
+    /// How many waits ended at their cap.
+    wait_timeouts: AtomicU64,
+    /// Set by the first wait that ended at its cap: a server that did not
+    /// publish for a document it was sent is taken not to publish for opened
+    /// documents at all, and no later wait is made (it would cost the cap
+    /// again for nothing). Cleared by nothing: one bounded wait per session.
+    gave_up: AtomicBool,
+}
+
+impl Diagnostics {
+    /// Counts one publication for `uri` and wakes the waiters.
+    pub fn note(&self, uri: &str) {
+        *self
+            .by_uri
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(uri.to_owned())
+            .or_default() += 1;
+        self.notify.notify_waiters();
+    }
+
+    /// How many publications for `uri` have arrived so far; 0 for a URI never
+    /// published.
+    pub fn seen(&self, uri: &str) -> u64 {
+        self.by_uri
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(uri)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Waits until more than `seen_before` publications have arrived for
+    /// `uri`, for at most `cap`. `true` when they have. `false` when the cap
+    /// passed first, or at once when an earlier wait already ended at its cap
+    /// (see the `gave_up` latch): the server does not publish, and the wait
+    /// would only cost the cap again. A publication already counted past
+    /// `seen_before` answers `true` whatever the latch says.
+    pub async fn wait_after(&self, uri: &str, seen_before: u64, cap: Duration) -> bool {
+        let published = async {
+            loop {
+                // Registered before the count is read, so a publication in
+                // between wakes this wait instead of being missed.
+                let notified = self.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.seen(uri) > seen_before {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        if self.seen(uri) > seen_before {
+            return true;
+        }
+        if self.gave_up.load(Ordering::Acquire) {
+            return false;
+        }
+        if tokio::time::timeout(cap, published).await.is_ok() {
+            return true;
+        }
+        self.wait_timeouts.fetch_add(1, Ordering::Relaxed);
+        if !self.gave_up.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                uri,
+                cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
+                "no publishDiagnostics for an opened document within the wait; not waiting for diagnostics again in this session"
+            );
+        }
+        false
+    }
+
+    /// How many waits ended at their cap.
+    pub fn wait_timeouts(&self) -> u64 {
+        self.wait_timeouts.load(Ordering::Relaxed)
+    }
+}
+
 /// What the readiness and busy predicates have reported so far, see
 /// [`JsonRpcClient::state`]. It is a report: nothing in it changes how a
 /// request is sent, repeated or answered.
@@ -249,6 +342,8 @@ pub struct JsonRpcClient {
     /// `lsp.rs`). Only that one method counts: any other message would make a
     /// server that chats forever look busy.
     progress: Arc<AtomicU64>,
+    /// The `textDocument/publishDiagnostics` notifications seen, by document.
+    diagnostics: Arc<Diagnostics>,
     /// Why the reader task stopped (end of output, or a protocol failure such
     /// as a frame over [`MAX_FRAME_BYTES`]); `None` while it runs. It is set
     /// before the pending requests are failed, so a request that arrives later
@@ -316,12 +411,14 @@ impl JsonRpcClient {
         let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_activity: LastActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
         let progress = Arc::new(AtomicU64::new(0));
+        let diagnostics = Arc::new(Diagnostics::default());
         let reader_writer = Arc::clone(&writer);
         let reader_pending = Arc::clone(&pending);
         let reader_ready = Arc::clone(&ready);
         let reader_is_ready = Arc::clone(&is_ready);
         let reader_last_activity = Arc::clone(&last_activity);
         let reader_progress = Arc::clone(&progress);
+        let reader_diagnostics = Arc::clone(&diagnostics);
         let (state_sender, state) = watch::channel(ServerState {
             busy: false,
             changes: 0,
@@ -339,6 +436,7 @@ impl JsonRpcClient {
                 reader_is_ready,
                 reader_last_activity,
                 reader_progress,
+                reader_diagnostics,
                 ready_predicate,
                 busy_predicate,
                 state_sender,
@@ -377,6 +475,7 @@ impl JsonRpcClient {
             state,
             last_activity,
             progress,
+            diagnostics,
             reader_stopped,
             #[cfg(windows)]
             job,
@@ -387,6 +486,29 @@ impl JsonRpcClient {
     /// the change between two readings means anything.
     pub fn progress_count(&self) -> u64 {
         self.progress.load(Ordering::Relaxed)
+    }
+
+    /// How many `textDocument/publishDiagnostics` notifications the server
+    /// has sent for `uri` so far. Read it BEFORE sending the `didOpen` the
+    /// publication is awaited for, and pass it to
+    /// [`Self::wait_diagnostics`].
+    pub fn diagnostics_seen(&self, uri: &str) -> u64 {
+        self.diagnostics.seen(uri)
+    }
+
+    /// Waits until the server has published diagnostics for `uri` after the
+    /// reading `seen_before` ([`Self::diagnostics_seen`]), for at most `cap`.
+    /// `false` when the cap passed first, or at once once an earlier wait of
+    /// this client passed its cap (a server that does not publish costs one
+    /// bounded wait per session, see [`Diagnostics::wait_after`]). It waits
+    /// on the server's own notifications, never on a timer.
+    pub async fn wait_diagnostics(&self, uri: &str, seen_before: u64, cap: Duration) -> bool {
+        self.diagnostics.wait_after(uri, seen_before, cap).await
+    }
+
+    /// How many [`Self::wait_diagnostics`] calls ended at their cap.
+    pub fn diagnostics_wait_timeouts(&self) -> u64 {
+        self.diagnostics.wait_timeouts()
     }
 
     /// Sends a JSON-RPC notification (no response expected).
@@ -729,6 +851,7 @@ async fn read_messages(
     is_ready: Arc<std::sync::atomic::AtomicBool>,
     last_activity: LastActivity,
     progress: Arc<AtomicU64>,
+    diagnostics: Arc<Diagnostics>,
     ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     busy_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     state: watch::Sender<ServerState>,
@@ -776,6 +899,12 @@ async fn read_messages(
         }
         if request_id.is_none() && method == Some("$/progress") {
             progress.fetch_add(1, Ordering::Relaxed);
+        }
+        if request_id.is_none()
+            && method == Some("textDocument/publishDiagnostics")
+            && let Some(uri) = message["params"]["uri"].as_str()
+        {
+            diagnostics.note(uri);
         }
         // Notifications (no id): evaluate readiness predicate.
         if request_id.is_none() && ready_predicate(&message) {
@@ -1164,5 +1293,78 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("shim-ran arg"),
             "{output:?}"
         );
+    }
+
+    /// The wait is on the document it was made for, and only on publications
+    /// after the reading it was given. The clock is paused: a wait that only
+    /// ends at its cap would be seen as such.
+    #[tokio::test(start_paused = true)]
+    async fn a_diagnostics_wait_ends_on_its_uri_not_another() {
+        let (a, b) = ("file:///work/a.py", "file:///work/b.py");
+        let diagnostics = Arc::new(Diagnostics::default());
+        // A publication for an earlier text of `a`: counted before the reading.
+        diagnostics.note(a);
+        let before = diagnostics.seen(a);
+        assert_eq!(before, 1);
+        assert_eq!(diagnostics.seen(b), 0);
+
+        let wait = tokio::spawn({
+            let diagnostics = Arc::clone(&diagnostics);
+            async move {
+                diagnostics
+                    .wait_after(a, before, Duration::from_secs(3600))
+                    .await
+            }
+        });
+        // Lets the wait park on the notification.
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "nothing was published after the reading"
+        );
+
+        diagnostics.note(b);
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "another document's publication ended the wait"
+        );
+
+        diagnostics.note(a);
+        assert!(
+            wait.await.unwrap(),
+            "a publication for its own document ends it"
+        );
+        assert_eq!(diagnostics.wait_timeouts(), 0);
+    }
+
+    /// A server that does not publish ends the first wait at its cap and costs
+    /// nothing after that; a publication that did arrive still answers `true`.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_reaches_its_cap_is_counted_once_and_not_repeated() {
+        let diagnostics = Diagnostics::default();
+        let cap = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+
+        assert!(!diagnostics.wait_after("file:///work/a.py", 0, cap).await);
+        assert_eq!(diagnostics.wait_timeouts(), 1);
+        assert_eq!(started.elapsed(), cap, "the first wait ran to its cap");
+
+        let second = tokio::time::Instant::now();
+        assert!(!diagnostics.wait_after("file:///work/b.py", 0, cap).await);
+        assert_eq!(
+            second.elapsed(),
+            Duration::ZERO,
+            "the latched wait is skipped"
+        );
+        assert_eq!(
+            diagnostics.wait_timeouts(),
+            1,
+            "a skipped wait is not a timeout"
+        );
+
+        diagnostics.note("file:///work/c.py");
+        assert!(diagnostics.wait_after("file:///work/c.py", 0, cap).await);
+        assert_eq!(diagnostics.wait_timeouts(), 1);
     }
 }

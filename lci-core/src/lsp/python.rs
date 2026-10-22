@@ -141,17 +141,17 @@ impl LspAdapter for PythonServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if let Some(_opened) =
+        if let Some(opened) =
             open_if_changed(rpc, sent, file, relative, "pyright", "python").await?
         {
-            // Mirrors the TypeScript adapter's bounded head start: pyright
-            // processes a newly opened file and its workspace scan
+            // pyright processes a newly opened file and its workspace scan
             // asynchronously, so a request issued immediately after didOpen
-            // can race ahead and see no definition/references yet. Only a
-            // newly sent text needs it; a repeat request on an unchanged
+            // can race ahead and see no definition/references yet. It
+            // publishes diagnostics for the file when it has taken it in:
+            // wait for that, bounded by the configured request timeout. Only
+            // a newly sent text needs it; a repeat request on an unchanged
             // file pays nothing.
-            let head_start = self.timeout.min(Duration::from_secs(3));
-            tokio::time::sleep(head_start).await;
+            opened.wait_for_diagnostics(rpc, self.timeout).await;
         }
         Ok(())
     }

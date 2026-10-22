@@ -217,9 +217,9 @@ pub async fn read_for_did_open(
 ///
 /// It also holds one gate per URI. [`open_if_changed`] takes it before the
 /// comparison and an [`OpenedDocument`] keeps it until the hook that sent the
-/// text is done (its head start included), so a concurrent request for the
+/// text is done (its diagnostics wait included), so a concurrent request for the
 /// same file waits for an open in flight instead of skipping it and reaching
-/// the server before the text or before the head start has passed. Both maps
+/// the server before the text or before the server has taken it in. Both maps
 /// keep one entry per navigated file for the session's life.
 #[derive(Debug, Default)]
 pub struct SentTexts {
@@ -228,13 +228,31 @@ pub struct SentTexts {
 }
 
 /// A document this hook just sent in `textDocument/didOpen`. Holding it keeps
-/// the URI's gate, so a hook that waits after the open (a head start) keeps
-/// the waiting inside the value, and drops it when the wait is over.
+/// the URI's gate, so a hook that waits after the open (for the server's
+/// diagnostics, see [`Self::wait_for_diagnostics`]) keeps the waiting inside
+/// the value, and drops it when the wait is over.
 #[derive(Debug)]
 pub struct OpenedDocument {
     /// The document URI.
     pub uri: String,
+    /// How many `publishDiagnostics` the server had sent for the URI when the
+    /// `didOpen` was written, read just before the write: a publication
+    /// counted past it answers this open.
+    diagnostics_before: u64,
     _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl OpenedDocument {
+    /// Waits for the server's `publishDiagnostics` for this document after the
+    /// `didOpen`, the event that says the server has taken the text in, for at
+    /// most `cap` ([`JsonRpcClient::wait_diagnostics`]). `false` when the cap
+    /// passed first, or at once when this client already waited a whole `cap`
+    /// for a server that did not publish. The caller's own deadline cancels
+    /// the future.
+    pub async fn wait_for_diagnostics(&self, rpc: &JsonRpcClient, cap: Duration) -> bool {
+        rpc.wait_diagnostics(&self.uri, self.diagnostics_before, cap)
+            .await
+    }
 }
 
 impl SentTexts {
@@ -295,9 +313,12 @@ impl SentTexts {
 /// The call first waits for any open of the same URI in flight on this
 /// session, so a request that finds the text already sent returns only after
 /// the `didOpen` has been written (the write is awaited to the end) and after
-/// the sending hook let go of its [`OpenedDocument`], head start included.
+/// the sending hook let go of its [`OpenedDocument`], diagnostics wait included.
 /// Hold the returned value across a wait that must also hold other requests
-/// for the file back; drop it when the wait is over.
+/// for the file back; drop it when the wait is over. The diagnostics count the
+/// wait needs is read here, after the gate is taken and just before the
+/// `didOpen` is written, so a publication cannot slip in between the reading
+/// and the write.
 pub async fn open_if_changed(
     rpc: &JsonRpcClient,
     sent: &SentTexts,
@@ -316,6 +337,7 @@ pub async fn open_if_changed(
     if !sent.changed(&uri, &crate::workspace::hash(&content)) {
         return Ok(None);
     }
+    let diagnostics_before = rpc.diagnostics_seen(&uri);
     let notified = rpc
         .notify(
             "textDocument/didOpen",
@@ -333,7 +355,11 @@ pub async fn open_if_changed(
         sent.forget(&uri);
         return Err(error);
     }
-    Ok(Some(OpenedDocument { uri, _gate: gate }))
+    Ok(Some(OpenedDocument {
+        uri,
+        diagnostics_before,
+        _gate: gate,
+    }))
 }
 
 /// What identifies a binary for the process-wide probe memo. The invocation is

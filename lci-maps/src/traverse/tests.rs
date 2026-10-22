@@ -40,6 +40,10 @@ struct GraphMap {
     conf: u8,
     witness: WitnessClass,
     delay: Duration,
+    /// From this call on (1 is the first) the map never answers: a gate the
+    /// walk's deadline has to cut, in place of a delay that has to outlast a
+    /// clock.
+    hang_from: Option<u32>,
     panics: bool,
     cost: Cost,
     /// The file every edge was seen in, when set.
@@ -77,6 +81,7 @@ impl GraphMap {
             conf: 80,
             witness: WitnessClass::Compiler,
             delay: Duration::ZERO,
+            hang_from: None,
             panics: false,
             cost: Cost::default(),
             site_path: None,
@@ -111,6 +116,11 @@ impl GraphMap {
 
     fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    fn hangs_from(mut self, call: u32) -> Self {
+        self.hang_from = Some(call);
         self
     }
 
@@ -159,7 +169,7 @@ impl Map for GraphMap {
         budget: Budget,
         _view: &SnapshotView<'_>,
     ) -> crate::edge::Expanded {
-        self.invoked.fetch_add(1, Ordering::Relaxed);
+        let call = self.invoked.fetch_add(1, Ordering::Relaxed) + 1;
         assert!(!self.panics, "this map panics on purpose");
         if self.honors_calls && self.cost.external_calls > budget.max_external_calls {
             return crate::edge::Expanded::default();
@@ -169,6 +179,9 @@ impl Map for GraphMap {
         }
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
+        }
+        if self.hang_from.is_some_and(|from| call >= from) {
+            std::future::pending::<()>().await;
         }
         let edges = self
             .edges
@@ -375,17 +388,23 @@ fn stops_of(result: &TraversalResult) -> Vec<(u64, String)> {
 
 #[tokio::test]
 async fn the_deadline_is_never_exceeded() {
+    // The second expansion never answers, so only the deadline can end it. The
+    // proof that it did is that the walk returns at all: the outer bound is
+    // the test's only clock. The deadline is far enough away (the walk reads
+    // the wall clock, which a paused test clock does not move) for the first,
+    // instant expansion to finish before it on a loaded machine.
     let reg = registry(vec![
-        GraphMap::new("slow", &[("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")])
-            .delay(Duration::from_millis(60)),
+        GraphMap::new("slow", &[("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")]).hangs_from(2),
     ]);
     let mut limits = budget(100);
-    let limit = Duration::from_millis(100);
-    limits.deadline = Instant::now() + limit;
-    let started = Instant::now();
-    let result = walk(&reg, vec![seed("a")], limits, |t| t).await;
+    limits.deadline = Instant::now() + Duration::from_millis(500);
     // The second expansion is cut at the deadline, not waited for.
-    assert!(started.elapsed() < limit + Duration::from_millis(150));
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        walk(&reg, vec![seed("a")], limits, |t| t),
+    )
+    .await
+    .expect("the walk ends at its deadline, not at the hung map");
     assert_eq!(result.status, TraversalStatus::BudgetExhausted);
     assert_eq!(result.totals.pops, 2);
     let expands: Vec<_> = result

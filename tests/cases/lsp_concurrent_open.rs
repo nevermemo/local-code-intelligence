@@ -1,7 +1,9 @@
 //! Position requests that reach one shared language-server client at the same
 //! time for the same file (ASYNC-2 commit A, review fix): a request that finds
 //! the file's text already sent must not go out before that send has finished,
-//! its head start included. The fake is the documents-mode one, which answers
+//! its wait for the server's diagnostics included (here a wait the test ends;
+//! the real one is pinned in `lsp_diagnostics_wait`). The fake is the
+//! documents-mode one, which answers
 //! from the text it was sent, so a request that overtakes the `didOpen` is
 //! answered empty.
 
@@ -69,17 +71,17 @@ async fn started_fake(temp: &tempfile::TempDir) -> (Arc<JsonRpcClient>, std::pat
 struct Shared {
     client: Arc<JsonRpcClient>,
     sent: SentTexts,
-    /// Ends the sender's head start.
-    head_start: Notify,
-    /// Fired by the hook that sent the text, once it holds its head start.
-    in_head_start: Notify,
+    /// Ends the sender's diagnostics wait.
+    hold: Notify,
+    /// Fired by the hook that sent the text, once it is in its wait.
+    in_wait: Notify,
     /// What happened, in order.
     log: Mutex<Vec<&'static str>>,
 }
 
 /// A position request the way the manager makes one: the adapter's hook, then
-/// the request. The hook is a language adapter's, with its fixed head start
-/// replaced by a wait the test ends.
+/// the request. The hook is a language adapter's, with its wait for the
+/// server's diagnostics replaced by a wait the test ends.
 async fn request(shared: &Shared, file: &std::path::Path, name: &'static str) -> Value {
     let opened = open_if_changed(
         &shared.client,
@@ -92,8 +94,8 @@ async fn request(shared: &Shared, file: &std::path::Path, name: &'static str) ->
     .await
     .unwrap();
     if let Some(_opened) = opened {
-        shared.in_head_start.notify_one();
-        shared.head_start.notified().await;
+        shared.in_wait.notify_one();
+        shared.hold.notified().await;
     }
     lock(&shared.log).push(name);
     let column = LATE_CS.lines().nth(1).unwrap().find("Add").unwrap();
@@ -122,17 +124,17 @@ async fn a_request_for_a_file_being_opened_waits_for_the_open_to_finish() {
         let shared = Arc::new(Shared {
             client,
             sent: SentTexts::default(),
-            head_start: Notify::new(),
-            in_head_start: Notify::new(),
+            hold: Notify::new(),
+            in_wait: Notify::new(),
             log: Mutex::new(Vec::new()),
         });
 
-        // The first request sends the text and then holds its head start.
+        // The first request sends the text and then holds its wait.
         let first = tokio::spawn({
             let (shared, file) = (Arc::clone(&shared), file.clone());
             async move { request(&shared, &file, "first").await }
         });
-        shared.in_head_start.notified().await;
+        shared.in_wait.notified().await;
 
         // The second finds the text sent. It must park behind the open, not
         // go on to its request.
@@ -150,10 +152,10 @@ async fn a_request_for_a_file_being_opened_waits_for_the_open_to_finish() {
         assert_eq!(
             *lock(&shared.log),
             Vec::<&str>::new(),
-            "no request went out during the head start"
+            "no request went out during the diagnostics wait"
         );
 
-        shared.head_start.notify_one();
+        shared.hold.notify_one();
         let (first, second) = (first.await.unwrap(), second.await.unwrap());
         for (name, answer) in [("first", &first), ("second", &second)] {
             let places = answer.as_array().unwrap();
