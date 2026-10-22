@@ -141,6 +141,7 @@ use crate::{
     edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
     live_grep::{CostLog, ScipSpans, SymbolLocator},
     scip_graph::ScipMap,
+    traverse::confirm::{Confirmation, FrontierConfirmer, Proposal, Verdict},
 };
 use lci_core::{
     config::LspSync,
@@ -1009,6 +1010,93 @@ impl Map for LspLive {
             dependent: false,
             good_for: vec![QuestionType::WhereTo, QuestionType::Impact],
         }
+    }
+}
+
+impl LspLive {
+    /// The confirmer of the confirm frontier (`[run_profile.walk] confirm`;
+    /// see [`crate::traverse::confirm`]): it asks the server where the name
+    /// at each text proposal's site is defined, one `textDocument/definition`
+    /// request per proposal, through this map's backend and places.
+    pub fn confirmer(self: &Arc<Self>) -> Arc<dyn FrontierConfirmer> {
+        Arc::new(LspConfirmer {
+            map: Arc::clone(self),
+        })
+    }
+
+    /// What the answered `places` of a definition request say about `src`:
+    /// confirmed when one of them is held by `src` (the symbol defined there,
+    /// else the one whose definition holds its line; the file, when `src` is
+    /// a file); refuted when one is held by another symbol; otherwise (every
+    /// place is held only by its file: the node table cannot name a symbol
+    /// there) unknown, since an import or re-export line, a symbol the index
+    /// lacks or another id scheme would otherwise refute a true reference.
+    fn verdict(&self, src: &NodeId, places: &[Place]) -> Verdict {
+        let mut other_symbol = false;
+        for place in places {
+            let symbol = self
+                .places
+                .defined_at(place)
+                .or_else(|| self.places.enclosing(&place.path, place.line));
+            match symbol {
+                Some(symbol) if symbol == *src => return Verdict::Confirmed,
+                Some(_) => other_symbol = true,
+                None => {
+                    if NodeId::file(&place.path).is_ok_and(|file| file == *src) {
+                        return Verdict::Confirmed;
+                    }
+                }
+            }
+        }
+        if other_symbol {
+            Verdict::Refuted
+        } else {
+            Verdict::Unknown
+        }
+    }
+}
+
+/// The confirmer of [`LspLive::confirmer`]: an answered place held by the
+/// proposal's `src` confirms it, one held by another symbol refutes it, and
+/// no answer, an error or an answer only a file holds is unknown.
+struct LspConfirmer {
+    map: Arc<LspLive>,
+}
+
+#[crate::async_trait]
+impl FrontierConfirmer for LspConfirmer {
+    async fn confirm(
+        &self,
+        proposals: &[Proposal],
+        max_calls: u32,
+    ) -> Result<Confirmation, String> {
+        let mut verdicts = Vec::with_capacity(proposals.len());
+        let mut calls = 0u32;
+        for proposal in proposals {
+            // The call stops at the allowance: the rest are not asked.
+            if calls >= max_calls {
+                verdicts.push(Verdict::Unknown);
+                continue;
+            }
+            calls += 1;
+            let at = Place {
+                path: proposal.site.path.clone(),
+                line: proposal.site.line,
+                col: proposal.site.col,
+            };
+            verdicts.push(match self.map.backend.definition(&at).await {
+                Ok(places) if places.is_empty() => Verdict::Unknown,
+                Ok(places) => self.map.verdict(&proposal.src, &places),
+                // The map's own `last_error` is left alone: it reports the
+                // expansions, and a hop that stays as it was needs no note.
+                Err(_) => Verdict::Unknown,
+            });
+        }
+        Ok(Confirmation { verdicts, calls })
+    }
+
+    fn identity(&self) -> String {
+        format!("{LSP_LIVE_ID} definition")
     }
 }
 

@@ -138,6 +138,17 @@
 //! keeps the floor and the rescorer's identity
 //! ([`handle::Snapshot::check_rerank`]); the caller passes the rescorer again.
 //!
+//! Confirm frontier (`[run_profile.walk] confirm`, off by default): see
+//! [`confirm`]. After the gate and the beam, the kept hops whose only witness
+//! is a `grep.live` text proposal are sent, best first and cut at `top_k`, in
+//! one [`confirm::FrontierConfirmer`] call: a confirmed hop keeps its value and
+//! becomes a server answer (witness `lsp`), a refuted one is dropped (it still
+//! corroborates at 0), an unknown one is unchanged. The calls are external
+//! calls of the pop, under `max_external_calls`; nothing here ends the walk.
+//! Counted in [`Totals::confirm_calls`] and its neighbours; the `expand` event
+//! has a `confirm` field. A handle keeps `top_k` and the confirmer's identity
+//! ([`handle::Snapshot::check_confirm`]); the caller passes the confirmer again.
+//!
 //! Logical and physical work: the caps above charge a retried pop only what its
 //! earlier run did not pay (`tokens`, `external_calls`), the logical work. The
 //! maps ran again all the same, so [`Totals::physical_map_calls`] and
@@ -167,6 +178,7 @@
 //! trace at the 200-pop cap grows by at most about 240 KB. Only the trace
 //! changes (and so its hash): answers, checkpoints and handles do not.
 
+pub mod confirm;
 pub mod frontier;
 pub mod fusion;
 pub mod handle;
@@ -187,6 +199,7 @@ pub mod trace;
 mod tests;
 
 use crate::{Budget, EdgeKind, MapId, edge::MapCard, edge::WitnessClass};
+use confirm::{Confirmation, FrontierConfirmer, Proposal, Verdict};
 use frontier::{
     Candidate, Frontier, HopPrice, HopScorer, Pricing, RulesScorer, ScoreCtx, hop_from,
 };
@@ -202,6 +215,7 @@ use serde_json::{Value, json};
 use source::{ClaimFamily, EdgeSource, Expansion, FusedEdge};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
     time::Instant,
 };
 use steer::Steer;
@@ -448,6 +462,21 @@ pub struct Totals {
     /// Expansions whose rerank was skipped because the `model_calls` cap was
     /// reached (no call was made, the hops kept factor 1; not a failure).
     pub rerank_skipped: u32,
+    /// Confirm frontier only (see [`confirm`]): confirmer calls made, the
+    /// proposals they carried and how each was decided, and the external calls
+    /// they used (also in `external_calls`). `confirm_confirmed +
+    /// confirm_refuted + confirm_unknown == confirm_proposals`.
+    pub confirm_calls: u32,
+    pub confirm_proposals: u32,
+    pub confirm_confirmed: u32,
+    pub confirm_refuted: u32,
+    pub confirm_unknown: u32,
+    /// Expansions that had proposals but no external call left (no call was
+    /// made; not a failure).
+    pub confirm_skipped: u32,
+    /// Calls that failed (an error, or a wrong number of verdicts): their
+    /// hops stayed as they were.
+    pub confirm_failures: u32,
     /// Map calls that ran, retries of a cut pop included. `external_calls`
     /// and `tokens` charge a retry only what the earlier run did not pay (the
     /// logical work); these count every call and the external calls it made
@@ -512,6 +541,11 @@ pub struct TraversalResult {
     /// Milliseconds the rescorer calls took in this call. Wall clock: kept
     /// out of the events, the checkpoint and the handle.
     pub rerank_ms: f64,
+    /// Whether the confirm frontier was on, and its `top_k`.
+    pub confirm_top_k: Option<usize>,
+    /// Milliseconds the confirmer calls took in this call. Wall clock: kept
+    /// out of the events, the checkpoint and the handle.
+    pub confirm_ms: f64,
     /// The tie-break the run ordered tied results with (see [`tiebreak`]).
     pub tie_break: Option<TieBreak>,
     /// The question's tokens, which a tie-break's `overlap` is measured on.
@@ -605,6 +639,9 @@ pub struct Traversal<'s> {
     trajectory: usize,
     /// The reranker frontier: the rescorer and the floor of the hop factor.
     rerank: Option<(Box<dyn FrontierRescorer + 's>, f64)>,
+    /// The confirm frontier: the confirmer and the most hops one expansion
+    /// proposes.
+    confirm: Option<(Arc<dyn FrontierConfirmer + 's>, usize)>,
     score_bound: bool,
     priors: HopPriors,
     tie_break: Option<TieBreak>,
@@ -647,6 +684,7 @@ impl<'s> Traversal<'s> {
             card_paths: false,
             trajectory: 0,
             rerank: None,
+            confirm: None,
             score_bound: true,
             priors: HopPriors::default(),
             tie_break: None,
@@ -791,6 +829,21 @@ impl<'s> Traversal<'s> {
         self
     }
 
+    /// The confirm frontier (default off; see [`confirm`]): in each expansion
+    /// the `confirmer` is asked, in one call, about the first `top_k` kept hops
+    /// that are only `grep.live` text proposals (`top_k` 0 proposes none). Its
+    /// `top_k` and [`FrontierConfirmer::identity`] are kept in a handle: a
+    /// resumed traversal passes the same ones again and the caller checks them
+    /// with [`handle::Snapshot::check_confirm`].
+    pub fn confirm_frontier(
+        mut self,
+        confirmer: Arc<dyn FrontierConfirmer + 's>,
+        top_k: usize,
+    ) -> Self {
+        self.confirm = Some((confirmer, top_k));
+        self
+    }
+
     /// Whether the score bound may end the walk (default true; see
     /// [`Traversal::top_k`]). A resumed traversal keeps the setting its handle
     /// was made with.
@@ -913,6 +966,8 @@ struct Run<'s> {
     map_ms: BTreeMap<MapId, f64>,
     /// Milliseconds the rescorer calls took in this call.
     rerank_ms: f64,
+    /// Milliseconds the confirmer calls took in this call.
+    confirm_ms: f64,
     /// See [`TraversalResult::warnings`]; the ones the run itself finds.
     warnings: Vec<String>,
 }
@@ -946,6 +1001,7 @@ impl<'s> Run<'s> {
             paid: BTreeMap::new(),
             map_ms: BTreeMap::new(),
             rerank_ms: 0.0,
+            confirm_ms: 0.0,
             warnings: Vec::new(),
         }
     }
@@ -1085,6 +1141,9 @@ impl<'s> Run<'s> {
             }
             if let (Some(floor), Some(object)) = (self.rerank_floor(), start.as_object_mut()) {
                 object.insert("rerank_floor".into(), json!(floor));
+            }
+            if let (Some((_, top_k)), Some(object)) = (&self.t.confirm, start.as_object_mut()) {
+                object.insert("confirm".into(), json!({"top_k": top_k}));
             }
             if let (false, Some(object)) = (self.t.score_bound, start.as_object_mut()) {
                 object.insert("score_bound".into(), json!(false));
@@ -1254,9 +1313,19 @@ impl<'s> Run<'s> {
                     failure_reasons_json(&self.totals.rerank_failure_reasons);
                 object["totals"]["rerank_skipped"] = json!(self.totals.rerank_skipped);
             }
+            if self.t.confirm.is_some() {
+                object["totals"]["confirm_calls"] = json!(self.totals.confirm_calls);
+                object["totals"]["confirm_proposals"] = json!(self.totals.confirm_proposals);
+                object["totals"]["confirm_confirmed"] = json!(self.totals.confirm_confirmed);
+                object["totals"]["confirm_refuted"] = json!(self.totals.confirm_refuted);
+                object["totals"]["confirm_unknown"] = json!(self.totals.confirm_unknown);
+                object["totals"]["confirm_skipped"] = json!(self.totals.confirm_skipped);
+                object["totals"]["confirm_failures"] = json!(self.totals.confirm_failures);
+            }
         }
         self.events.push(end);
         self.rerank_warnings();
+        self.confirm_warnings();
         let snapshot = resumable.then(|| self.snapshot());
         if let (Some(cp), Some(snapshot)) = (checkpoint.as_mut(), &snapshot) {
             cp.handle = Some(snapshot.handle());
@@ -1294,6 +1363,8 @@ impl<'s> Run<'s> {
             map_ms: self.map_ms,
             rerank_floor: self.t.rerank.as_ref().map(|(_, floor)| *floor),
             rerank_ms: self.rerank_ms,
+            confirm_top_k: self.t.confirm.as_ref().map(|(_, k)| *k),
+            confirm_ms: self.confirm_ms,
             tie_break: self.t.tie_break,
             query: self.query,
             warnings: self.warnings,
@@ -1322,6 +1393,17 @@ impl<'s> Run<'s> {
             self.warnings.push(format!(
                 "rerank_frontier: the model_calls cap of {cap} was reached; {} expansions were not rated and their hops kept factor 1",
                 self.totals.rerank_skipped
+            ));
+        }
+    }
+
+    /// Warns of confirmer calls that failed, over the whole traversal (the
+    /// totals persist in a handle).
+    fn confirm_warnings(&mut self) {
+        if self.totals.confirm_failures > 0 {
+            self.warnings.push(format!(
+                "confirm_frontier: {} of {} confirmer calls failed over this traversal; their hops stayed as the text search found them",
+                self.totals.confirm_failures, self.totals.confirm_calls
             ));
         }
     }
@@ -1621,6 +1703,9 @@ impl<'s> Run<'s> {
             self.t.price,
             trait_seed,
         );
+        // The confirm frontier acts before the reranker: a refuted hop is not
+        // rated, and a confirmed one is rated as the server answer it is.
+        let (steps, confirm) = self.confirm(steps, &mut kept).await;
         let (steps, rerank) = self.rescore(steps, &kept).await;
 
         // Then adopt what the tokens afford, best first.
@@ -1745,6 +1830,9 @@ impl<'s> Run<'s> {
             if (paid_tokens, paid_calls) != (0, 0) {
                 object.insert("paid_before".into(), json!([paid_tokens, paid_calls]));
             }
+            if let Some(confirm) = confirm {
+                object.insert("confirm".into(), confirm);
+            }
             if let Some(rerank) = rerank {
                 object.insert("rerank".into(), rerank);
             }
@@ -1755,6 +1843,120 @@ impl<'s> Run<'s> {
         }
         self.events.insert(at, event);
         cut.then_some(adopted > 0 || timed_out)
+    }
+
+    /// The confirm frontier (see [`confirm`]): the first `top_k` of the kept
+    /// hops that are only `grep.live` text proposals, best first, go to the
+    /// confirmer in one call. A confirmed hop is relabelled in `kept` (a server
+    /// answer) and keeps its value, a refuted one leaves `steps`, an unknown
+    /// one is unchanged. The external calls the confirmer made are charged to
+    /// this pop. Returns the hops and the `confirm` field of the `expand`
+    /// event (none when the frontier is off or nothing was proposed).
+    ///
+    /// A call is never made with no external call left (no failure; counted in
+    /// [`Totals::confirm_skipped`]). A call that errs or answers the wrong
+    /// number of verdicts counts in [`Totals::confirm_failures`]; one the
+    /// walk's deadline cuts is not a failure (the walk's own end is the
+    /// deadline) and is charged all the calls it could have made, since what
+    /// it made is unknown. In each case every hop stays as it was.
+    async fn confirm(
+        &mut self,
+        steps: Vec<(usize, f64)>,
+        kept: &mut [FusedEdge],
+    ) -> (Vec<(usize, f64)>, Option<Value>) {
+        let Some((confirmer, top_k)) = &self.t.confirm else {
+            return (steps, None);
+        };
+        let (confirmer, top_k) = (Arc::clone(confirmer), *top_k);
+        // Best value first; a tie keeps the order the beam gave.
+        let mut order: Vec<usize> = (0..steps.len()).collect();
+        order.sort_by(|&a, &b| steps[b].1.total_cmp(&steps[a].1).then(a.cmp(&b)));
+        let (picked, proposals): (Vec<usize>, Vec<Proposal>) = order
+            .into_iter()
+            .filter(|&p| confirm::proposes(&kept[steps[p].0]))
+            .filter_map(|p| {
+                let edge = &kept[steps[p].0].best;
+                let site = edge.site.clone()?;
+                Some((
+                    p,
+                    Proposal {
+                        src: edge.src.clone(),
+                        dst: edge.dst.clone(),
+                        site,
+                    },
+                ))
+            })
+            .take(top_k)
+            .unzip();
+        if proposals.is_empty() {
+            return (steps, None);
+        }
+        let n = u32::try_from(proposals.len()).unwrap_or(u32::MAX);
+        let max_calls = self.calls_left();
+        if max_calls == 0 {
+            self.totals.confirm_skipped = self.totals.confirm_skipped.saturating_add(1);
+            return (
+                steps,
+                Some(json!({"skipped": "external_calls", "proposals": n})),
+            );
+        }
+        let started = Instant::now();
+        let left = self.t.budget.deadline.saturating_duration_since(started);
+        let answer = tokio::time::timeout(left, confirmer.confirm(&proposals, max_calls)).await;
+        self.confirm_ms += started.elapsed().as_secs_f64() * 1000.0;
+        let unknown = || vec![Verdict::Unknown; proposals.len()];
+        // The verdicts, the calls to charge, and why the call gave none.
+        let (verdicts, used, failed): (Vec<Verdict>, u32, Option<&str>) = match answer {
+            Err(_elapsed) => (unknown(), max_calls.min(n), Some("deadline")),
+            Ok(Err(_)) => (unknown(), 0, Some("error")),
+            Ok(Ok(Confirmation { verdicts, calls })) if verdicts.len() != proposals.len() => {
+                (unknown(), calls.min(max_calls), Some("count_mismatch"))
+            }
+            Ok(Ok(Confirmation { verdicts, calls })) => (verdicts, calls.min(max_calls), None),
+        };
+        // The calls ran: they are charged to this pop, whatever becomes of
+        // its hops.
+        self.totals.external_calls = self.totals.external_calls.saturating_add(used);
+        self.totals.physical_external_calls =
+            self.totals.physical_external_calls.saturating_add(used);
+        self.totals.confirm_calls = self.totals.confirm_calls.saturating_add(1);
+        self.totals.confirm_proposals = self.totals.confirm_proposals.saturating_add(n);
+        // The deadline ends the walk by itself; only the others are failures.
+        if matches!(failed, Some("error" | "count_mismatch")) {
+            self.totals.confirm_failures = self.totals.confirm_failures.saturating_add(1);
+        }
+        let (mut confirmed, mut refuted, mut unsure) = (0u32, 0u32, 0u32);
+        let mut dropped: HashSet<usize> = HashSet::new();
+        for (&p, verdict) in picked.iter().zip(&verdicts) {
+            match verdict {
+                Verdict::Confirmed => {
+                    confirmed += 1;
+                    confirm::relabel(&mut kept[steps[p].0]);
+                }
+                Verdict::Refuted => {
+                    refuted += 1;
+                    dropped.insert(p);
+                }
+                Verdict::Unknown => unsure += 1,
+            }
+        }
+        self.totals.confirm_confirmed = self.totals.confirm_confirmed.saturating_add(confirmed);
+        self.totals.confirm_refuted = self.totals.confirm_refuted.saturating_add(refuted);
+        self.totals.confirm_unknown = self.totals.confirm_unknown.saturating_add(unsure);
+        let mut event = json!({
+            "proposals": n, "confirmed": confirmed, "refuted": refuted,
+            "unknown": unsure, "calls": used,
+        });
+        if let Some(reason) = failed {
+            event["failed"] = json!(reason);
+        }
+        let steps = steps
+            .into_iter()
+            .enumerate()
+            .filter(|(p, _)| !dropped.contains(p))
+            .map(|(_, step)| step)
+            .collect();
+        (steps, Some(event))
     }
 
     /// The reranker frontier (see [`rescore`]): one rescorer call rates the
