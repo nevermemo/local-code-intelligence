@@ -173,9 +173,10 @@ pub fn save(data_dir: &Path, manifest: &Manifest) -> Result<()> {
     let temporary = directory.join(format!("{}.json.tmp", manifest.workspace_id));
     std::fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)
         .context("write workspace manifest")?;
-    if destination.exists() {
-        std::fs::remove_file(&destination).context("replace workspace manifest")?;
-    }
+    // `rename` replaces an existing destination on every supported platform
+    // (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows), so the old
+    // manifest stays in place until the new one is complete. Removing it first
+    // would lose the manifest if the process died in between.
     std::fs::rename(&temporary, &destination).context("commit workspace manifest")?;
     Ok(())
 }
@@ -196,6 +197,23 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let workspace = Workspace::resolve(&root, &data).unwrap();
         (temp, root, data, workspace)
+    }
+
+    #[test]
+    fn save_over_an_existing_manifest_replaces_it_and_leaves_no_temporary_file() {
+        let (_temp, _root, data, workspace) = fixture();
+        let mut manifest = Manifest::empty(&workspace);
+        save(&data, &manifest).unwrap();
+        manifest.fingerprint = "second-save".into();
+        save(&data, &manifest).unwrap();
+
+        let loaded = try_load(&data, &workspace).unwrap();
+        assert_eq!(loaded.fingerprint, "second-save");
+        let names: Vec<_> = std::fs::read_dir(data.join("manifests"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("{}.json", workspace.id)]);
     }
 
     #[test]
