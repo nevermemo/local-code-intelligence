@@ -4056,3 +4056,150 @@ async fn a_default_server_answers_without_or_over_a_corrupt_scip_index() {
     );
     server.stop();
 }
+
+/// `index_status` lists one entry per language server (`servers`) and the
+/// languages the index holds that no enabled, configured server lists
+/// (`languages_without_server`). It is a report: no probe runs and no server
+/// starts for it. Over REST, which returns the JSON `index_status` and
+/// `lci status` print.
+#[tokio::test]
+async fn index_status_lists_a_server_per_language_and_the_languages_without_one() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("lsp-state");
+    let workspace = temp.path().join("roster-repository");
+    write_csharp_workspace(&workspace);
+    write(
+        &workspace,
+        "tools/helper.py",
+        "def helper():\n    return 1\n",
+    );
+    write(
+        &workspace,
+        "crates/lib.rs",
+        "pub fn lib_entry() -> u32 { 1 }\n",
+    );
+    // `[csharp] path` is the fake; `[python]` is unset; rust-analyzer's path
+    // is the fixture's missing binary, which a probe would turn into a failure.
+    let app = Arc::new(
+        App::open(with_fake_csharp_server(
+            config,
+            &state,
+            &[],
+            LOADED_BUDGET_SECONDS,
+        ))
+        .await
+        .unwrap()
+        .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let status = || async {
+        client
+            .post(format!("{base}/v1/index_status"))
+            .json(&json!({"workspace_path": workspace}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+    let roster = |status: &Value, provider: &str| -> Value {
+        status["servers"]
+            .as_array()
+            .expect("servers")
+            .iter()
+            .find(|server| server["provider"] == provider)
+            .unwrap_or_else(|| panic!("no {provider} in {status}"))
+            .clone()
+    };
+
+    let before = status().await;
+    let providers: Vec<&str> = before["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|server| server["provider"].as_str().unwrap())
+        .collect();
+    let mut sorted = providers.clone();
+    sorted.sort_unstable();
+    assert_eq!(providers, sorted, "sorted by provider: {before}");
+    assert_eq!(
+        providers.len(),
+        before["analyzers"].as_object().unwrap().len(),
+        "one entry per adapter, like analyzers: {before}"
+    );
+    let csharp = roster(&before, "csharp-ls");
+    assert_eq!(csharp["languages_in_index"], json!(["csharp"]), "{csharp}");
+    assert_eq!(csharp["configured"], true, "{csharp}");
+    assert_eq!(csharp["enabled"], true, "{csharp}");
+    assert_eq!(csharp["root"], ".", "{csharp}");
+    assert!(csharp["session"].is_null(), "{csharp}");
+    let pyright = roster(&before, "pyright");
+    assert_eq!(
+        pyright["languages_in_index"],
+        json!(["python"]),
+        "{pyright}"
+    );
+    assert_eq!(pyright["configured"], false, "{pyright}");
+    assert_eq!(pyright["enabled"], false, "{pyright}");
+    assert!(pyright["command"].is_null(), "{pyright}");
+    // A server of several languages lists only those the index holds: this
+    // index holds none of the TypeScript family.
+    let typescript = roster(&before, "typescript-language-server");
+    assert!(
+        typescript["languages"].as_array().unwrap().len() > 1,
+        "{typescript}"
+    );
+    assert_eq!(typescript["languages_in_index"], json!([]), "{typescript}");
+    let rust = roster(&before, "rust-analyzer");
+    assert_eq!(rust["languages_in_index"], json!(["rust"]), "{rust}");
+    assert_eq!(rust["configured"], true, "{rust}");
+    assert_eq!(rust["probe"], "not_probed", "no probe ran: {rust}");
+    assert_eq!(
+        before["languages_without_server"],
+        json!(["python"]),
+        "{before}"
+    );
+    // Nothing was probed or started by the report.
+    assert_eq!(lsp_spawn_count(&state), 0);
+    assert!(
+        before["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|server| server["probe"] == "not_probed" && server["session"].is_null()),
+        "{before}"
+    );
+
+    // A navigation call starts the C# server; its session is the same object
+    // as in `analyzers`, and the unrelated entries are as they were.
+    let symbols = client
+        .post(format!("{base}/v1/search_symbols"))
+        .json(&json!({"workspace_path": workspace, "query": "Calculator"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(symbols.status(), StatusCode::OK);
+    let after = status().await;
+    let csharp = roster(&after, "csharp-ls");
+    assert!(csharp["session"].is_object(), "{csharp}");
+    assert_eq!(
+        csharp["session"], after["analyzers"]["csharp-ls"],
+        "{after}"
+    );
+    // A navigation call starts the server without a version probe (only
+    // `/ready` and `lsp.live` run one), so the roster still says `not_probed`.
+    assert_eq!(csharp["probe"], "not_probed", "{csharp}");
+    assert!(roster(&after, "pyright")["session"].is_null(), "{after}");
+    assert_eq!(
+        after["languages_without_server"],
+        json!(["python"]),
+        "{after}"
+    );
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}

@@ -129,6 +129,16 @@ pub struct ServerReadiness {
     pub idle_ms: u64,
 }
 
+/// Whether a provider's binary has answered a version probe in this manager
+/// (see [`Manager::probe_state`]). Only a success is remembered, so a provider
+/// that was never asked and one whose probe failed are both `NotProbed`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeState {
+    Probed,
+    NotProbed,
+}
+
 /// A live JSON-RPC session with one spawned, initialized language server.
 struct GenericClient {
     rpc: Arc<JsonRpcClient>,
@@ -2249,6 +2259,17 @@ impl Manager {
             .map(|session| session.readiness())
     }
 
+    /// Whether `provider`'s binary has answered a version probe in this
+    /// manager, read from the memo of [`Self::probe_once`]. Runs no probe and
+    /// starts nothing, so a status report costs no subprocess.
+    pub fn probe_state(&self, provider: &str) -> ProbeState {
+        if self.probed.lock().unwrap().contains(provider) {
+            ProbeState::Probed
+        } else {
+            ProbeState::NotProbed
+        }
+    }
+
     /// Starts the server of every enabled adapter for `workspace` and waits
     /// until each has finished priming, so that a later `workspace/symbol`
     /// request does not pay the start. Returns, per provider, the time the
@@ -3429,6 +3450,31 @@ mod tests {
         let other = Manager::new(&Config::default());
         other.probe_once(&adapter, timeout).await.unwrap();
         assert_eq!(counts.asked.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn probe_state_reports_the_memo_and_runs_no_probe() {
+        let timeout = Duration::from_secs(1);
+        let adapter = Arc::new(Probing {
+            answers: vec![true],
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let dyn_adapter: Arc<dyn LspAdapter> = Arc::clone(&adapter) as Arc<dyn LspAdapter>;
+        let manager = Manager::new(&Config::default());
+        let asked = || adapter.asked.load(Ordering::SeqCst);
+        assert_eq!(manager.probe_state("probing-server"), ProbeState::NotProbed);
+        assert_eq!(asked(), 0);
+        manager.probe_once(&dyn_adapter, timeout).await.unwrap();
+        assert_eq!(asked(), 1);
+        assert_eq!(manager.probe_state("probing-server"), ProbeState::Probed);
+        assert_eq!(manager.probe_state("probing-server"), ProbeState::Probed);
+        assert_eq!(asked(), 1, "reading the state asks the binary nothing");
+        // Another provider is untouched, and the wire form is snake_case.
+        assert_eq!(manager.probe_state("other-server"), ProbeState::NotProbed);
+        assert_eq!(
+            serde_json::to_value(ProbeState::NotProbed).unwrap(),
+            json!("not_probed")
+        );
     }
 
     /// A window long enough that no test outlives it: a test that needs it to
