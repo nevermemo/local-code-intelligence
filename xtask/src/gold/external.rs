@@ -153,7 +153,7 @@ pub fn run(command: ExternalCommand) -> Result<()> {
             subset,
             force,
         } => {
-            let summary = fetch(&HttpFetcher::new()?, source, &out, &subset, force)?;
+            let summary = fetch(&HttpFetcher, source, &out, &subset, force)?;
             println!("{summary}");
             Ok(())
         }
@@ -184,22 +184,13 @@ pub(crate) trait Fetcher {
     fn get(&self, url: &str) -> Result<Vec<u8>>;
 }
 
-struct HttpFetcher {
-    client: reqwest::Client,
-}
+struct HttpFetcher;
 
 impl HttpFetcher {
-    fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .user_agent("lci-xtask-gold-external")
-            .build()
-            .context("failed to build the HTTP client")?;
-        Ok(Self { client })
-    }
-
     /// One GET on a fresh runtime on its own thread: `run` is called from
-    /// inside the xtask runtime, where `block_on` would panic.
+    /// inside the xtask runtime, where `block_on` would panic. The client is
+    /// built inside that runtime, so no connection outlives the runtime that
+    /// drove it.
     fn download(&self, url: &str) -> Result<Vec<u8>> {
         std::thread::scope(|scope| {
             scope
@@ -208,8 +199,12 @@ impl HttpFetcher {
                         .enable_all()
                         .build()?;
                     runtime.block_on(async {
-                        let response = self
-                            .client
+                        let client = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(600))
+                            .user_agent("lci-xtask-gold-external")
+                            .build()
+                            .context("failed to build the HTTP client")?;
+                        let response = client
                             .get(url)
                             .send()
                             .await
@@ -703,17 +698,14 @@ fn split_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// Whether the question holds the member's stem under any spelling of its
-/// tokens. A one-token stem is the strata rule (`holds_stem`: generic and short
-/// stems never). A stem of several tokens (`user_service`, `UserService`) is
-/// held when a question word has the same letters and digits once separators
-/// are dropped (`UserService`, `user_service`) or the question holds its tokens
-/// next to each other (`user service`); a stem whose tokens are all generic
-/// never counts.
-fn holds_stem_tokens(words: &[String], question_tokens: &[String], path: &str) -> bool {
-    if holds_stem(words, path) {
-        return true;
-    }
+/// Whether the question holds the member's stem under another spelling of its
+/// tokens (the one-word case is the strata rule, `holds_stem`: generic and
+/// short stems never). A stem of several tokens (`user_service`,
+/// `UserService`) is held when a question word has the same letters and digits
+/// once separators are dropped (`UserService`, `user_service`) or the question
+/// holds its tokens next to each other (`user service`); a stem whose tokens
+/// are all generic never counts.
+fn holds_stem_spelling(words: &[String], question_tokens: &[String], path: &str) -> bool {
     let tokens = split_tokens(file_stem(path));
     if tokens.len() < 2 || tokens.iter().all(|t| is_generic_token(t)) {
         return false;
@@ -732,15 +724,69 @@ fn is_generic_token(token: &str) -> bool {
     GENERIC_STEMS.contains(&token) || GENERIC_DIR_TOKENS.contains(&token)
 }
 
+/// Which rule made a question a leak. Checked in this order over all the
+/// members, so an item reports the first rule that fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeakRule {
+    /// The question holds a member's path verbatim.
+    Path,
+    /// The question holds a member's stem as one whole word (`holds_stem`).
+    StemWord,
+    /// The question holds a member's stem under another spelling of its tokens.
+    StemTokens,
+    /// The question holds a token of 4 or more characters of a member's
+    /// directories.
+    DirToken,
+}
+
+impl LeakRule {
+    pub(crate) const ALL: [LeakRule; 4] = [
+        LeakRule::Path,
+        LeakRule::StemWord,
+        LeakRule::StemTokens,
+        LeakRule::DirToken,
+    ];
+
+    /// The key in the report's `leak_rules`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            LeakRule::Path => "path",
+            LeakRule::StemWord => "stem_word",
+            LeakRule::StemTokens => "stem_tokens",
+            LeakRule::DirToken => "dir_token",
+        }
+    }
+
+    /// The item's stratum: `external/leak-path`, `external/leak-stem` (word or
+    /// tokens) or `external/leak-dir`. The where-to scorer's `leak` dimension
+    /// is the part after `external/`, and strata.rs counts every value but
+    /// `clean`, `n/a` and `none` as a leak.
+    pub(crate) fn stratum(self) -> &'static str {
+        match self {
+            LeakRule::Path => "external/leak-path",
+            LeakRule::StemWord | LeakRule::StemTokens => "external/leak-stem",
+            LeakRule::DirToken => "external/leak-dir",
+        }
+    }
+}
+
 /// Whether the question gives a member away: it holds the member's stem (as a
-/// whole word, or under another spelling of its tokens: `holds_stem_tokens`),
+/// whole word, or under another spelling of its tokens: `holds_stem_spelling`),
 /// holds the member's path verbatim, or holds a lower-cased token of 4 or more
 /// characters from the member's directories (split on `/`, `_`, `-`, `.` and
 /// camelCase; the generic directory tokens, the repository name and the
 /// repository owner never). Question words split on every non-alphanumeric
 /// character for the directory tokens (so `file_utils` gives `file` and
 /// `utils`).
+#[cfg_attr(not(test), expect(dead_code, reason = "convert uses leak_rule_of"))]
 pub(crate) fn leak_of(question: &str, members: &[String], repo: &str) -> bool {
+    leak_rule_of(question, members, repo).is_some()
+}
+
+/// The first rule, in the order of [`LeakRule`], that makes the question a
+/// leak for some member; `None` when it is clean. Measurement only: the set of
+/// leaks is the union of the rules and does not depend on the order.
+pub(crate) fn leak_rule_of(question: &str, members: &[String], repo: &str) -> Option<LeakRule> {
     let question_tokens = split_tokens(question);
     let words: Vec<String> = question
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -762,10 +808,7 @@ pub(crate) fn leak_of(question: &str, members: &[String], repo: &str) -> bool {
         ignored.extend(split_tokens(name));
         ignored.insert(name.to_ascii_lowercase());
     }
-    members.iter().any(|path| {
-        if holds_stem_tokens(&words, &question_tokens, path) || question.contains(path.as_str()) {
-            return true;
-        }
+    let holds_dir_token = |path: &String| {
         let dirs = path.rsplit_once('/').map_or("", |(dirs, _)| dirs);
         split_tokens(dirs).into_iter().any(|token| {
             token.len() >= MIN_DIR_TOKEN
@@ -774,7 +817,21 @@ pub(crate) fn leak_of(question: &str, members: &[String], repo: &str) -> bool {
                 && !ignored.contains(&token)
                 && parts.contains(&token)
         })
-    })
+    };
+    if members.iter().any(|path| question.contains(path.as_str())) {
+        Some(LeakRule::Path)
+    } else if members.iter().any(|path| holds_stem(&words, path)) {
+        Some(LeakRule::StemWord)
+    } else if members
+        .iter()
+        .any(|path| holds_stem_spelling(&words, &question_tokens, path))
+    {
+        Some(LeakRule::StemTokens)
+    } else if members.iter().any(holds_dir_token) {
+        Some(LeakRule::DirToken)
+    } else {
+        None
+    }
 }
 
 // --------------------------------------------------------------- converter
@@ -811,7 +868,7 @@ impl Excluded {
 }
 
 enum Outcome {
-    Kept(Box<Value>, usize, bool),
+    Kept(Box<Value>, usize, Option<LeakRule>),
     NoQuestion,
     Portability,
     NoMember,
@@ -897,7 +954,7 @@ fn convert_row(
     if members.is_empty() {
         return Outcome::NoMember;
     }
-    let leak = leak_of(&question, &members, &row.repo);
+    let leak = leak_rule_of(&question, &members, &row.repo);
     let symbols = row.nodes.as_deref().map(symbols_of).unwrap_or_default();
     let item = json!({
         "id": row.id,
@@ -910,7 +967,7 @@ fn convert_row(
             "symbols": symbols,
         },
         "accept": {},
-        "stratum": if leak { "external/leak" } else { "external/clean" },
+        "stratum": leak.map_or("external/clean", LeakRule::stratum),
         "external": {
             "dataset": source.dataset(),
             "licence": source.licence(),
@@ -947,6 +1004,8 @@ pub(crate) fn convert(
     let mut excluded = Excluded::default();
     let (mut no_member, mut portability, mut no_question) = (0usize, 0usize, 0usize);
     let (mut leak, mut overlap_items, mut truncated) = (0usize, 0usize, 0usize);
+    let mut leak_rules: BTreeMap<&str, usize> =
+        LeakRule::ALL.iter().map(|r| (r.name(), 0usize)).collect();
     let mut per_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut per_repo: BTreeMap<String, usize> = BTreeMap::new();
     let mut overlap_repos: BTreeMap<String, usize> = BTreeMap::new();
@@ -955,11 +1014,14 @@ pub(crate) fn convert(
         let overlap = known.contains(&row.repo.to_ascii_lowercase());
         let mut row_excluded = Excluded::default();
         match convert_row(source, row, provenance, overlap, &mut row_excluded) {
-            Outcome::Kept(item, members, is_leak) => {
+            Outcome::Kept(item, members, rule) => {
                 excluded.test += row_excluded.test;
                 excluded.created += row_excluded.created;
                 excluded.unsupported_extension += row_excluded.unsupported_extension;
-                leak += usize::from(is_leak);
+                if let Some(rule) = rule {
+                    leak += 1;
+                    *leak_rules.entry(rule.name()).or_default() += 1;
+                }
                 if overlap {
                     overlap_items += 1;
                     *overlap_repos.entry(row.repo.clone()).or_default() += 1;
@@ -1007,6 +1069,7 @@ pub(crate) fn convert(
         "per_language": per_language,
         "per_repo": per_repo,
         "leak": leak,
+        "leak_rules": leak_rules,
         "clean": items.len() - leak,
         "overlap": overlap_items,
         "overlap_repos": overlap_repos,

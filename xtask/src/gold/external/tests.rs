@@ -260,7 +260,7 @@ fn a_member_named_in_the_question_gets_the_leak_stratum() {
         &diff("src/parser.py", false),
     );
     let out = convert_one(Source::SwePolybenchVerified, row);
-    assert_eq!(out.items[0]["stratum"], "external/leak");
+    assert_eq!(out.items[0]["stratum"], "external/leak-stem");
     assert_eq!(out.report["leak"], 1);
     assert_eq!(out.report["clean"], 0);
 }
@@ -414,9 +414,9 @@ fn converted_items_score_through_where_to_and_convert_to_evaluate() {
         report["strata"]["leak"]["clean"]["metrics"]["set_recall"],
         1.0
     );
-    assert_eq!(report["strata"]["leak"]["leak"]["n"], 1);
+    assert_eq!(report["strata"]["leak"]["leak-stem"]["n"], 1);
     assert_eq!(
-        report["strata"]["leak"]["leak"]["metrics"]["set_recall"],
+        report["strata"]["leak"]["leak-stem"]["metrics"]["set_recall"],
         0.0
     );
 
@@ -761,10 +761,16 @@ fn fetch_refuses_to_overwrite_a_file_with_another_hash() {
 
     // The same content again is fine; other content is refused and changes nothing.
     fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], false).unwrap();
+    let record_path = dir.join("swe-polybench-verified").join("fetch.json");
+    let record_before = std::fs::read_to_string(&record_path).unwrap();
     *fetcher.body.borrow_mut() = "second".to_string();
     let error = fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], false).unwrap_err();
     assert!(error.to_string().contains("--force"), "{error}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_before
+    );
     // --force overwrites.
     fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], true).unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
@@ -804,4 +810,136 @@ fn fetch_of_lca_takes_the_test_split_of_each_subset_and_rejects_unknown_ones() {
     .unwrap_err();
     assert!(error.to_string().contains("rb"), "{error}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn rule_of(question: &str, member: &str) -> Option<LeakRule> {
+    leak_rule_of(question, &[member.to_string()], "acme/widgets")
+}
+
+#[test]
+fn a_member_path_in_the_question_reports_the_path_rule() {
+    // The path verbatim comes first, even when the stem and a directory also match.
+    assert_eq!(
+        rule_of(
+            "see lib/scheduler/queue.py, the queue in scheduler",
+            "lib/scheduler/queue.py"
+        ),
+        Some(LeakRule::Path)
+    );
+    // The rules are checked over all members: a path in the second member wins
+    // over a stem word in the first.
+    let members = ["src/alpha.py".to_string(), "src/beta/gamma.py".to_string()];
+    assert_eq!(
+        leak_rule_of("alpha and src/beta/gamma.py", &members, "a/b"),
+        Some(LeakRule::Path)
+    );
+}
+
+#[test]
+fn a_stem_word_in_the_question_reports_the_stem_word_rule() {
+    // Before the directory token, which also matches here.
+    assert_eq!(
+        rule_of("the queue in the scheduler", "lib/scheduler/queue.py"),
+        Some(LeakRule::StemWord)
+    );
+}
+
+#[test]
+fn another_spelling_of_the_stem_reports_the_stem_tokens_rule() {
+    // Before the directory token, which also matches here.
+    assert_eq!(
+        rule_of(
+            "UserService in the scheduler stalls",
+            "lib/scheduler/user_service.py"
+        ),
+        Some(LeakRule::StemTokens)
+    );
+    assert_eq!(
+        rule_of("the user service stalls", "lib/zzz/user_service.py"),
+        Some(LeakRule::StemTokens)
+    );
+}
+
+#[test]
+fn a_directory_token_alone_reports_the_dir_token_rule_and_nothing_is_clean() {
+    assert_eq!(
+        rule_of("the scheduler stalls", "lib/scheduler/queue.py"),
+        Some(LeakRule::DirToken)
+    );
+    assert_eq!(rule_of("it crashes", "lib/scheduler/queue.py"), None);
+    // `leak_of` is the same decision without the rule.
+    let members = ["lib/scheduler/queue.py".to_string()];
+    assert!(leak_of("the scheduler stalls", &members, "a/b"));
+    assert!(!leak_of("it crashes", &members, "a/b"));
+}
+
+#[test]
+fn items_carry_a_stratum_per_leak_rule_and_the_report_counts_the_rules() {
+    let rows = vec![
+        polybench_row(
+            "p-1",
+            "acme/widgets",
+            "see src/pkg/zzz.py now",
+            &diff("src/pkg/zzz.py", false),
+        ),
+        polybench_row(
+            "p-2",
+            "acme/widgets",
+            "the zzz module fails",
+            &diff("src/pkg/zzz.py", false),
+        ),
+        polybench_row(
+            "p-3",
+            "acme/widgets",
+            "UserService fails",
+            &diff("src/pkg/user_service.py", false),
+        ),
+        polybench_row(
+            "p-4",
+            "acme/widgets",
+            "the scheduler fails",
+            &diff("src/scheduler/qqq.py", false),
+        ),
+        polybench_row(
+            "p-5",
+            "acme/widgets",
+            "it fails",
+            &diff("src/scheduler/qqq.py", false),
+        ),
+    ];
+    let out = convert(Source::SwePolybenchVerified, &rows, &provenance(), &[]);
+    let strata: Vec<&str> = out
+        .items
+        .iter()
+        .map(|i| i["stratum"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        strata,
+        [
+            "external/leak-path",
+            "external/leak-stem",
+            "external/leak-stem",
+            "external/leak-dir",
+            "external/clean"
+        ]
+    );
+    assert_eq!(out.report["leak"], 4);
+    assert_eq!(out.report["clean"], 1);
+    assert_eq!(
+        out.report["leak_rules"],
+        json!({"path": 1, "stem_word": 1, "stem_tokens": 1, "dir_token": 1})
+    );
+    // The where-to scorer's leak dimension takes the sub-stratum, and the
+    // strata report still counts every sub-stratum as a leak.
+    let run = parse_run(
+        r#"{"polybench:p-1": ["src/pkg/zzz.py"], "polybench:p-2": [], "polybench:p-3": [], "polybench:p-4": ["src/scheduler/qqq.py"], "polybench:p-5": []}"#,
+    )
+    .unwrap();
+    let scored = score_set(Set::WhereTo, &out.items, &run, true, false).unwrap();
+    assert_eq!(scored["strata"]["leak"]["leak-path"]["n"], 1);
+    assert_eq!(scored["strata"]["leak"]["leak-dir"]["n"], 1);
+    assert_eq!(scored["strata"]["leak"]["clean"]["n"], 1);
+    let strata_report = super::super::strata::report(Set::WhereTo, &out.items).unwrap();
+    assert_eq!(strata_report["counts"]["grep_easy"], 4);
+    assert_eq!(strata_report["counts"]["core"], 1);
 }
