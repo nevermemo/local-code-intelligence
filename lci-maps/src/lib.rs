@@ -30,6 +30,7 @@ pub mod live_grep;
 pub mod lsp_live;
 pub mod probe;
 pub mod probe_map;
+pub mod process;
 pub mod reads_key;
 pub mod run_record;
 pub mod scip_graph;
