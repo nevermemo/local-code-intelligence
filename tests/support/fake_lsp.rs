@@ -95,6 +95,11 @@ pub struct FakeLspConfig {
     /// `--no-diagnostics`: the server never publishes diagnostics, as one
     /// that does not for opened documents.
     pub no_diagnostics: bool,
+    /// `--text-document-sync <0|1|2>` (`--mode documents`): the `change` kind
+    /// the server advertises in `textDocumentSync`. Default 1 (full); 0 keeps
+    /// `openClose` and advertises no change sync; with 2 the fake still applies
+    /// a change without a `range` and notes a ranged one.
+    pub text_document_sync: u64,
     /// The first process exits on its first definition request
     /// (`--exit-on-definition-request`), leaving the replacement healthy.
     pub exit_on_definition_request: bool,
@@ -331,6 +336,9 @@ pub fn run_from_env() -> io::Result<()> {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
         no_diagnostics: cli.iter().any(|arg| arg == "--no-diagnostics"),
+        text_document_sync: cli_arg(&cli, "--text-document-sync")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1),
         exit_on_definition_request: cli.iter().any(|arg| arg == "--exit-on-definition-request"),
         answer_unhandled: cli.iter().any(|arg| arg == "--answer-unhandled"),
         ignore_shutdown,
@@ -657,7 +665,22 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         {
             match store.handle(method, &request["params"], id.is_some()) {
                 documents::Outcome::Pass => {}
-                documents::Outcome::Handled => continue,
+                documents::Outcome::Handled => {
+                    // A change is published for like an open: the version of
+                    // the publication is the notification's.
+                    if method == "textDocument/didChange"
+                        && !config.no_diagnostics
+                        && let Some(uri) = request["params"]["textDocument"]["uri"].as_str()
+                    {
+                        pending_diagnostics.push_back((
+                            Instant::now() + Duration::from_millis(config.diagnostics_delay_ms),
+                            uri.to_owned(),
+                            request["params"]["textDocument"]["version"].as_i64(),
+                        ));
+                        send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
+                    }
+                    continue;
+                }
                 documents::Outcome::Response(result) => {
                     if let Some(id) = id {
                         write_message(&mut stdout, &json_response(id, result))?;
@@ -690,7 +713,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             }
             if let Some(id) = id {
                 let capabilities = if document_store.is_some() {
-                    documents::capabilities()
+                    documents::capabilities(config.text_document_sync)
                 } else {
                     json!({})
                 };

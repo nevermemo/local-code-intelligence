@@ -4,7 +4,10 @@
 //! `false` and `transport_config`/`initialize_params` returning `None`, not
 //! by omitting the adapter.
 
-use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
+use crate::lsp::{
+    ChangeSync,
+    transport::{JsonRpcClient, RpcError, TransportConfig},
+};
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -12,7 +15,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[async_trait]
@@ -116,10 +119,11 @@ pub trait LspAdapter: Send + Sync {
 
     /// Whether the server holds the file's current disk text at every
     /// position request: [`Self::before_position_request`] sends it in a
-    /// `textDocument/didOpen` when it differs from the text this session sent
-    /// last (read just before the request, up to [`MAX_DID_OPEN_BYTES`]), so an
-    /// unchanged file is not sent again, and the server takes that text even
-    /// when the document is already open. Only then may the manager's outline cache
+    /// `textDocument/didOpen` (or `textDocument/didChange` for a text that
+    /// changed, see [`open_if_changed`]) when it differs from the text this
+    /// session sent last (read just before the request, up to
+    /// [`MAX_DID_OPEN_BYTES`]), so an unchanged file is not sent again, and the
+    /// server takes that text even when the document is already open. Only then may the manager's outline cache
     /// (`[run_profile.lsp] outline_cache`) keep an answer under the hash of
     /// the bytes on disk. Default `false`: a server that is told nothing
     /// (csharp-ls), or that watches the disk itself and can lag an edit
@@ -192,6 +196,14 @@ pub trait LspAdapter: Send + Sync {
 /// a per-file size cap to share (roadmap N18 part f).
 pub const MAX_DID_OPEN_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The most documents one server session holds open at a time. Opening a
+/// new file past it first closes the least recently used one that has no
+/// open in flight (`textDocument/didClose`), so a long-lived session over a
+/// large tree does not keep every file it ever navigated in the server's
+/// memory. A size, not a behaviour: a closed file is sent again (as a new
+/// `didOpen`, version 1) when it is next navigated, and no answer changes.
+pub const MAX_OPEN_DOCUMENTS: usize = 64;
+
 /// The longest a hook waits for the server's `publishDiagnostics` after a
 /// `didOpen` (the wait is also bounded by the configured request timeout, and
 /// is the smaller of the two): the worst case of the fixed head start it
@@ -230,34 +242,59 @@ pub async fn read_for_did_open(
     String::from_utf8(bytes).map(Some).with_context(context)
 }
 
-/// The texts one session has sent in `textDocument/didOpen`, by document URI,
-/// as the content hash and the `version` of each. A text is recorded only once
-/// its `didOpen` is on the pipe, so a failed or abandoned send is sent again.
-/// A new session starts empty, so a restarted server is sent its files again.
+/// The texts one session has sent in `textDocument/didOpen` or
+/// `textDocument/didChange`, by document URI, as the content hash and the
+/// `version` of each. A text is recorded only once its send is on the pipe, so
+/// a failed or abandoned send is sent again. A new session starts empty, so a
+/// restarted server is sent its files again.
 ///
 /// It also holds one gate per URI. [`open_if_changed`] takes it before the
 /// comparison and an [`OpenedDocument`] keeps it until the hook that sent the
 /// text is done (its diagnostics wait included), so a concurrent request for the
 /// same file waits for an open in flight instead of skipping it and reaching
-/// the server before the text or before the server has taken it in. Both maps
-/// keep one entry per navigated file for the session's life.
+/// the server before the text or before the server has taken it in. The table
+/// holds at most [`MAX_OPEN_DOCUMENTS`] files: a new file past that evicts the
+/// least recently used one that has no open in flight with a `didClose`, and
+/// the evicted file's gate goes with its entry.
 #[derive(Debug, Default)]
 pub struct SentTexts {
     texts: Arc<Mutex<HashMap<String, SentText>>>,
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while a file new to the table is given its place (the eviction
+    /// that makes room, then its `didOpen`), so concurrent new files cannot
+    /// each see room and together overfill the table.
+    open_set: tokio::sync::Mutex<()>,
+    /// What the server advertised for a changed document: `didChange` with the
+    /// whole text under `Full` and `Incremental`, a second `didOpen` under
+    /// `None` (the default, and what a server without the capability is sent).
+    sync: ChangeSync,
 }
 
-/// What one `didOpen` of a document carried, as the session recorded it.
+/// What one send of a document carried, as the session recorded it.
 #[derive(Debug, Clone)]
 struct SentText {
     hash: String,
     version: i64,
+    /// The `diagnostics_before` reading of the send, until a hook has
+    /// finished waiting for the server's publication for it
+    /// ([`OpenedDocument::wait_for_diagnostics`] clears it). While it is set, the
+    /// next caller of [`open_if_changed`] for the uri gets the wait handed to
+    /// it, so a hook cancelled after its write (or one that never waits, like
+    /// jdtls: it stays set, each later call of that hook for the file gets an
+    /// [`OpenedDocument`] it ignores, which costs nothing) does not leave the
+    /// text unwaited for.
+    pending: Option<u64>,
+    /// When a caller of [`open_if_changed`] last asked for the uri, whether it
+    /// sent or found the text current: the order of eviction.
+    last_used: Instant,
 }
 
-/// A document this hook just sent in `textDocument/didOpen`. Holding it keeps
-/// the URI's gate, so a hook that waits after the open (for the server's
-/// diagnostics, see [`Self::wait_for_diagnostics`]) keeps the waiting inside
-/// the value, and drops it when the wait is over.
+/// A document this hook just sent in `textDocument/didOpen` or
+/// `textDocument/didChange`, or one whose send an earlier hook did not finish
+/// waiting for. Holding it keeps the URI's gate, so a hook that waits after
+/// the send (for the server's diagnostics, see
+/// [`Self::wait_for_diagnostics`]) keeps the waiting inside the value, and
+/// drops it when the wait is over.
 #[derive(Debug)]
 pub struct OpenedDocument {
     /// The document URI.
@@ -270,23 +307,46 @@ pub struct OpenedDocument {
     /// document in the session, then one more for each text sent after it, so
     /// a publication that names an older version is not for this text.
     version: i64,
+    texts: Arc<Mutex<HashMap<String, SentText>>>,
     _gate: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl OpenedDocument {
     /// Waits for the server's `publishDiagnostics` for this document after the
-    /// `didOpen`, the event that says the server has taken the text in, for at
+    /// send, the event that says the server has taken the text in, for at
     /// most `cap` ([`JsonRpcClient::wait_diagnostics`]). `false` when the cap
     /// passed first. A best-effort signal, not proof that the server holds the
     /// current text (see [`crate::lsp::transport::Diagnostics`]). The caller's
-    /// own deadline cancels the future.
+    /// own deadline cancels the future, and then the wait is left pending for
+    /// the next caller of the uri; a wait that ended, either way, is settled
+    /// and not repeated for the same text.
     pub async fn wait_for_diagnostics(&self, rpc: &JsonRpcClient, cap: Duration) -> bool {
-        rpc.wait_diagnostics(&self.uri, self.diagnostics_before, self.version, cap)
-            .await
+        let answered = rpc
+            .wait_diagnostics(&self.uri, self.diagnostics_before, self.version, cap)
+            .await;
+        if let Some(sent) = self
+            .texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&self.uri)
+            .filter(|sent| sent.version == self.version)
+        {
+            sent.pending = None;
+        }
+        answered
     }
 }
 
 impl SentTexts {
+    /// An empty table for a server that advertised `sync` for a changed
+    /// document (the default table is [`ChangeSync::None`]).
+    pub fn with_sync(sync: ChangeSync) -> Self {
+        Self {
+            sync,
+            ..Self::default()
+        }
+    }
+
     /// Waits for any open of `uri` in flight, then holds the URI's gate. It
     /// costs nothing while no hook is between its `didOpen` and its release.
     async fn gate(&self, uri: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -323,7 +383,7 @@ impl SentTexts {
             .is_some_and(|sent| sent.hash == hash)
     }
 
-    /// The `version` the next `didOpen` of `uri` carries.
+    /// The `version` the next send of `uri` carries.
     fn next_version(&self, uri: &str) -> i64 {
         self.texts
             .lock()
@@ -332,27 +392,162 @@ impl SentTexts {
             .map_or(1, |sent| sent.version + 1)
     }
 
-    /// What records `hash` and `version` as sent for `uri`, to run once the
-    /// `didOpen` is written (it outlives the caller, see
-    /// [`JsonRpcClient::notify_holding`]).
-    fn recorder(&self, uri: &str, hash: String, version: i64) -> impl FnOnce() + Send + 'static {
+    /// The `diagnostics_before` reading and the `version` of the last send of
+    /// `uri` when no hook has finished waiting for the server's publication
+    /// for it.
+    fn pending_wait(&self, uri: &str) -> Option<(u64, i64)> {
+        let texts = self.texts.lock().unwrap_or_else(PoisonError::into_inner);
+        let sent = texts.get(uri)?;
+        sent.pending.map(|before| (before, sent.version))
+    }
+
+    /// Marks `uri` as just asked for, if the session has sent it.
+    fn touch(&self, uri: &str) {
+        if let Some(sent) = self
+            .texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(uri)
+        {
+            sent.last_used = Instant::now();
+        }
+    }
+
+    /// How many files the table holds.
+    fn len(&self) -> usize {
+        self.texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// The least recently used file in the table whose gate is free, with the
+    /// gate taken, so no open of it can start while it is closed. `None` when
+    /// every gate is held (opens in flight on all of them).
+    fn eviction_candidate(&self) -> Option<(String, tokio::sync::OwnedMutexGuard<()>)> {
+        let mut by_age: Vec<(Instant, String)> = self
+            .texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(uri, sent)| (sent.last_used, uri.clone()))
+            .collect();
+        by_age.sort();
+        by_age.into_iter().find_map(|(_, uri)| {
+            let gate = Arc::clone(
+                self.gates
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(uri.clone())
+                    .or_default(),
+            );
+            gate.try_lock_owned().ok().map(|guard| (uri, guard))
+        })
+    }
+
+    /// Drops the gate of an evicted `uri` from the map, unless a caller has
+    /// since started waiting on it (then that caller needs the very same gate
+    /// to stay exclusive with whoever opens the file next). `guard` is the
+    /// gate's own guard, held across the check: the map's handle and the
+    /// guard's are the two when nobody else has a handle.
+    fn forget_gate(&self, uri: &str, guard: tokio::sync::OwnedMutexGuard<()>) {
+        let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
+        if gates
+            .get(uri)
+            .is_some_and(|gate| Arc::strong_count(gate) == 2)
+        {
+            gates.remove(uri);
+        }
+        drop(gates);
+        drop(guard);
+    }
+
+    /// Makes room for a file new to the table: while it holds
+    /// [`MAX_OPEN_DOCUMENTS`] files, closes the least recently used one that
+    /// has no open in flight (`textDocument/didClose`, written before this
+    /// returns, so it precedes the caller's `didOpen` on the pipe) and forgets
+    /// it. Stops, leaving the table over the bound until the next new file,
+    /// when every file has an open in flight or a close could not be written.
+    /// The returned guard keeps other new files out until the caller's own
+    /// send has been recorded.
+    async fn make_room(&self, rpc: &JsonRpcClient) -> tokio::sync::MutexGuard<'_, ()> {
+        let room = self.open_set.lock().await;
+        while self.len() >= MAX_OPEN_DOCUMENTS {
+            let Some((uri, gate)) = self.eviction_candidate() else {
+                tracing::debug!(
+                    open = self.len(),
+                    "every open document has an open in flight; none is closed"
+                );
+                break;
+            };
+            let texts = Arc::clone(&self.texts);
+            let evicted = uri.clone();
+            let closed = rpc
+                .notify_holding(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": uri}}),
+                    gate,
+                    move || {
+                        texts
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&evicted);
+                    },
+                )
+                .await;
+            match closed {
+                Ok(gate) => self.forget_gate(&uri, gate),
+                Err(error) => {
+                    // The entry stays, so the next new file closes it again.
+                    tracing::debug!(%error, uri, "could not close an open document");
+                    break;
+                }
+            }
+        }
+        room
+    }
+
+    /// What records `hash` and `version` as sent for `uri` (with the wait for
+    /// its publication still pending), to run once the send is written (it
+    /// outlives the caller, see [`JsonRpcClient::notify_holding`]).
+    fn recorder(
+        &self,
+        uri: &str,
+        hash: String,
+        version: i64,
+        diagnostics_before: u64,
+    ) -> impl FnOnce() + Send + 'static {
         let (texts, uri) = (Arc::clone(&self.texts), uri.to_owned());
         move || {
-            texts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(uri, SentText { hash, version });
+            texts.lock().unwrap_or_else(PoisonError::into_inner).insert(
+                uri,
+                SentText {
+                    hash,
+                    version,
+                    pending: Some(diagnostics_before),
+                    last_used: Instant::now(),
+                },
+            );
         }
     }
 }
 
-/// Sends `file`'s current disk text in `textDocument/didOpen` unless this
-/// session already sent that exact text, and answers the document when it
-/// sent. The text is recorded as sent when the write has finished, not before,
+/// Sends `file`'s current disk text unless this session already sent that
+/// exact text, and answers the document when it sent (or when an earlier
+/// send's wait for the server's diagnostics was never finished, see
+/// [`SentText::pending`]). The first text of a file goes in
+/// `textDocument/didOpen`; a changed one goes in `textDocument/didChange`
+/// with the whole text when the server advertised change sync (`Full` or
+/// `Incremental`: LSP 3.17 reads a change entry without a `range` as the whole
+/// text under either kind), and in a second `didOpen` with the next `version`
+/// when it did not (pyright replaces the text on a repeated open;
+/// typescript-language-server refuses it, which is why it needs the change).
+/// The text is recorded as sent when the write has finished, not before,
 /// and the URI's gate is held until then even when the caller is cancelled
 /// mid-write (the write runs on a task that owns the gate), so a later caller
-/// never sees the text as sent while its `didOpen` is still to be written. `None`: the text is unchanged since the last send, or the file
-/// is above [`MAX_DID_OPEN_BYTES`] and is not sent (see
+/// never sees the text as sent while its send is still to be written. `None`:
+/// the text is unchanged since the last send and its wait is settled, or the
+/// file is above [`MAX_DID_OPEN_BYTES`] and is not sent (see
 /// [`read_for_did_open`]).
 ///
 /// The call first waits for any open of the same URI in flight on this
@@ -376,17 +571,44 @@ pub async fn open_if_changed(
         .map_err(|_| anyhow!("cannot convert file path to URI"))?
         .to_string();
     let gate = sent.gate(&uri).await;
+    sent.touch(&uri);
     let Some(content) = read_for_did_open(file, relative, server).await? else {
         return Ok(None);
     };
     let hash = crate::workspace::hash(&content);
     if sent.is_current(&uri, &hash) {
-        return Ok(None);
+        // Nothing to send; a wait an earlier caller left unfinished (it was
+        // cancelled after its write, or its hook never waits) is this one's.
+        return Ok(sent
+            .pending_wait(&uri)
+            .map(|(diagnostics_before, version)| OpenedDocument {
+                uri,
+                diagnostics_before,
+                version,
+                texts: Arc::clone(&sent.texts),
+                _gate: gate,
+            }));
     }
     let version = sent.next_version(&uri);
+    // A file new to the table takes its place in the open set first: when the
+    // table is full, the least recently used file is closed (its `didClose` is
+    // written before this file's `didOpen`).
+    let _place = if version == 1 {
+        Some(sent.make_room(rpc).await)
+    } else {
+        None
+    };
     let diagnostics_before = rpc.diagnostics_seen(&uri);
-    let gate = rpc
-        .notify_holding(
+    let (method, params) = if version > 1 && sent.sync != ChangeSync::None {
+        (
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": content}]
+            }),
+        )
+    } else {
+        (
             "textDocument/didOpen",
             json!({
                 "textDocument": {
@@ -396,14 +618,21 @@ pub async fn open_if_changed(
                     "text": content
                 }
             }),
+        )
+    };
+    let gate = rpc
+        .notify_holding(
+            method,
+            params,
             gate,
-            sent.recorder(&uri, hash, version),
+            sent.recorder(&uri, hash, version, diagnostics_before),
         )
         .await?;
     Ok(Some(OpenedDocument {
         uri,
         diagnostics_before,
         version,
+        texts: Arc::clone(&sent.texts),
         _gate: gate,
     }))
 }
@@ -528,7 +757,7 @@ mod tests {
         let sent = SentTexts::default();
         assert!(!sent.is_current("file:///a", "h1"), "nothing recorded yet");
         assert_eq!(sent.next_version("file:///a"), 1);
-        sent.recorder("file:///a", "h1".into(), 1)();
+        sent.recorder("file:///a", "h1".into(), 1, 0)();
         assert!(sent.is_current("file:///a", "h1"), "same text again");
         assert!(
             !sent.is_current("file:///b", "h1"),
@@ -536,13 +765,66 @@ mod tests {
         );
         assert_eq!(sent.next_version("file:///a"), 2);
         assert!(!sent.is_current("file:///a", "h2"), "a new text");
-        sent.recorder("file:///a", "h2".into(), 2)();
+        sent.recorder("file:///a", "h2".into(), 2, 0)();
         assert!(sent.is_current("file:///a", "h2"));
         assert!(
             !sent.is_current("file:///a", "h1"),
             "back to the old text is a change"
         );
         assert_eq!(sent.next_version("file:///a"), 3);
+    }
+
+    #[tokio::test]
+    async fn the_least_recently_used_entry_with_a_free_gate_is_the_eviction_candidate() {
+        let sent = SentTexts::default();
+        // Back-dated, so that a touch (now) is newer than every staged entry.
+        let base = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the clock has run for a minute");
+        for (index, uri) in ["file:///a", "file:///b", "file:///c"]
+            .into_iter()
+            .enumerate()
+        {
+            // Staged ages: `a` is the oldest, then `b`, then `c`.
+            sent.texts.lock().unwrap().insert(
+                uri.to_owned(),
+                SentText {
+                    hash: "h".into(),
+                    version: 1,
+                    pending: None,
+                    last_used: base + Duration::from_secs(index as u64),
+                },
+            );
+        }
+        assert_eq!(sent.len(), 3);
+
+        // The oldest has an open in flight: its gate is held, so the next
+        // oldest is the candidate.
+        let held = sent.gate("file:///a").await;
+        let (uri, _guard) = sent.eviction_candidate().expect("a free gate exists");
+        assert_eq!(uri, "file:///b");
+        drop(_guard);
+        drop(held);
+
+        // None held: the oldest.
+        let (uri, _guard) = sent.eviction_candidate().expect("a free gate exists");
+        assert_eq!(uri, "file:///a");
+        drop(_guard);
+
+        // A touch moves a file to the back of the order.
+        sent.touch("file:///a");
+        let (uri, _guard) = sent.eviction_candidate().expect("a free gate exists");
+        assert_eq!(uri, "file:///b");
+        drop(_guard);
+
+        // Every gate held: no candidate.
+        let all = [
+            sent.gate("file:///a").await,
+            sent.gate("file:///b").await,
+            sent.gate("file:///c").await,
+        ];
+        assert!(sent.eviction_candidate().is_none());
+        drop(all);
     }
 
     #[tokio::test]
