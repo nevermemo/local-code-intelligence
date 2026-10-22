@@ -1,0 +1,57 @@
+{
+  "effective_policy": {
+    "hash": "8a8847f5c923d85b",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "structure.contains",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "scip.implements",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "scip.implements: 1 impl headers read (1 with a trait, 0 external; 0 macro and 0 other unresolved, 0 documents without source), 1 type-trait and 1 method pairs, 0 facts dropped for lack of a node id, cap 64 edges per node",
+    "no start node: the hybrid search and the symbol names in the question found nothing in the SCIP graph, and no seeds were given; name a function or method the code defines"
+  ],
+  "question": "`Speak`",
+  "results": [],
+  "seed_source": "none",
+  "seeds": [],
+  "status": "no_seeds",
+  "stop_reason": "no_seeds",
+  "totals": {
+    "first_stage": {
+      "exact": 0,
+      "seeds": 0,
+      "walk": 0
+    },
+    "physical_external_calls": 0
+  },
+  "trait_seeds": 0
+}

@@ -108,7 +108,7 @@ fn shapes(generation: u32) -> String {
 
 const CONFIG_RS: &str = "pub struct Config {\n    pub rate: u32,\n}\n";
 
-fn write_tree(root: &Path, generation: u32, shifted: bool) {
+pub(super) fn write_tree(root: &Path, generation: u32, shifted: bool) {
     write(root, "src/Calculator.cs", &calculator(generation, shifted));
     write(root, "src/CallSite.cs", &call_site(generation));
     write(root, "src/shapes.rs", &shapes(generation));
@@ -138,8 +138,8 @@ fn tree_hashes(root: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-const COMBINE: &str = "sym:rust:Calculator.cs::Combine/fn";
-const RUN: &str = "sym:rust:CallSite.cs::Run/fn";
+pub(super) const COMBINE: &str = "sym:rust:Calculator.cs::Combine/fn";
+pub(super) const RUN: &str = "sym:rust:CallSite.cs::Run/fn";
 const SPEAK: &str = "sym:rust:shapes::Speak/trait";
 const RATE_KEY: &str = "cfg:toml:rate";
 
@@ -297,7 +297,7 @@ fn scan_rust(text: &str, module: &str) -> ScipSymbols {
 /// function with its exact range, its body and its kind. Returns the byte
 /// length of the file (the stamp changes with it).
 #[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
-fn write_scip(root: &Path, index: &Path) -> u64 {
+pub(super) fn write_scip(root: &Path, index: &Path) -> u64 {
     use scip::types::{Document, symbol_information::Kind};
     let mut message = scip::types::Index::default();
     for file in ["src/Calculator.cs", "src/CallSite.cs"] {

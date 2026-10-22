@@ -1,0 +1,1 @@
+unknown map "nope"; the maps are seeds.hybrid, seeds.scip_names, graph.scip, structure.contains, and, only when named, grep.live, docs.mentions, grep.structural, config.key, git.history, probe.compile, search.lexical, search.vector, scip.impact, scip.implements, tests.tested_by, lsp.live, exact.closure, exact.pickaxe, seeds.bm25, seeds.literal, seeds.repo_map
