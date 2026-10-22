@@ -161,7 +161,65 @@ pub struct Status {
     /// `primed`, and counters and ages in milliseconds. A report only: it
     /// does not keep a session alive and changes no answer.
     pub analyzers: BTreeMap<String, Option<crate::lsp::ServerReadiness>>,
+    /// One entry per registered language server, sorted by provider: what it
+    /// can serve, which of those languages this index holds, whether it is
+    /// configured and enabled, whether its binary has answered a version
+    /// probe, and its session. A report built from the manager's memory:
+    /// reading it runs no probe and starts no server.
+    pub servers: Vec<ServerRoster>,
+    /// The languages this index holds that no enabled, configured language
+    /// server lists (sorted). Empty without a snapshot.
+    pub languages_without_server: Vec<String>,
     pub indexed_at_unix_seconds: Option<String>,
+}
+
+/// One language server in [`Status::servers`].
+#[derive(Debug, Serialize)]
+pub struct ServerRoster {
+    pub provider: String,
+    /// Every Tree-sitter language the server can navigate.
+    pub languages: Vec<&'static str>,
+    /// The subset of `languages` the index holds (sorted).
+    pub languages_in_index: Vec<String>,
+    /// A command or installation path is configured.
+    pub configured: bool,
+    /// Configured and not explicitly disabled.
+    pub enabled: bool,
+    /// The configured command or installation path.
+    pub command: Option<String>,
+    /// `probed` once the manager's own version probe has passed (run by
+    /// priming and the `lsp.live` warm start; `/ready` probes separately and
+    /// does not count), else `not_probed`.
+    pub probe: crate::lsp::ProbeState,
+    /// Milliseconds left in the server's skip window under
+    /// `[run_profile.lsp] breaker = true` (a failed probe or start opened it);
+    /// `null` without the breaker or when the window is closed.
+    pub breaker_open_ms: Option<u64>,
+    /// The directory the server is started at, relative to the workspace.
+    pub root: String,
+    /// The session's report, as in `analyzers`; `null` without a session.
+    pub session: Option<crate::lsp::ServerReadiness>,
+}
+
+/// The languages of `in_index` that no enabled, configured adapter lists,
+/// sorted.
+fn languages_without_server(
+    adapters: &[Arc<dyn crate::lsp::adapter::LspAdapter>],
+    in_index: &HashSet<String>,
+) -> Vec<String> {
+    let mut languages: Vec<String> = in_index
+        .iter()
+        .filter(|language| {
+            !adapters.iter().any(|adapter| {
+                adapter.enabled()
+                    && adapter.configured_command().is_some()
+                    && adapter.languages().contains(&language.as_str())
+            })
+        })
+        .cloned()
+        .collect();
+    languages.sort_unstable();
+    languages
 }
 
 #[derive(Debug, Serialize)]
@@ -625,13 +683,17 @@ impl App {
         // decision is made under a read guard of the workspace, held until the
         // task is spawned (spawning awaits nothing), so a build cannot start
         // between the check and the warm start.
-        if let Some(snapshot) = &snapshot
+        // The languages the index holds, read once for the warm start and the
+        // roster below.
+        let in_index = match &snapshot {
+            Some(snapshot) => Store::languages(snapshot).await.unwrap_or_default(),
+            None => HashSet::new(),
+        };
+        if snapshot.is_some()
             && self.warm_start_due(&workspace.id)
+            && let Ok(_building_excluded) = coordination.lock.try_read()
         {
-            let languages = Store::languages(snapshot).await.unwrap_or_default();
-            if let Ok(_building_excluded) = coordination.lock.try_read() {
-                self.warm_language_servers(&workspace, languages);
-            }
+            self.warm_language_servers(&workspace, in_index.clone());
         }
         let chunks = match &snapshot {
             Some(s) => s.table.count_rows(None).await?,
@@ -671,17 +733,42 @@ impl App {
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let mut analyzers_running = BTreeMap::new();
         let mut analyzers = BTreeMap::new();
+        let mut servers = Vec::new();
         for adapter in self.analyzer.adapters() {
             let provider = adapter.provider();
             analyzers_running.insert(
                 provider.to_owned(),
                 self.analyzer.running(provider, &workspace.id).await,
             );
-            analyzers.insert(
-                provider.to_owned(),
-                self.analyzer.readiness(provider, &workspace.id).await,
-            );
+            let session = self.analyzer.readiness(provider, &workspace.id).await;
+            analyzers.insert(provider.to_owned(), session.clone());
+            let mut languages_in_index: Vec<String> = adapter
+                .languages()
+                .iter()
+                .filter(|language| in_index.contains(**language))
+                .map(|language| (*language).to_owned())
+                .collect();
+            languages_in_index.sort_unstable();
+            let command = adapter.configured_command();
+            servers.push(ServerRoster {
+                provider: provider.to_owned(),
+                languages: adapter.languages().to_vec(),
+                languages_in_index,
+                configured: command.is_some(),
+                enabled: adapter.enabled(),
+                command,
+                probe: self.analyzer.probe_state(provider),
+                breaker_open_ms: self
+                    .analyzer
+                    .breaker_remaining(provider)
+                    .map(|left| u64::try_from(left.as_millis()).unwrap_or(u64::MAX)),
+                root: ".".to_owned(),
+                session,
+            });
         }
+        servers.sort_by(|a, b| a.provider.cmp(&b.provider));
+        let languages_without_server =
+            languages_without_server(self.analyzer.adapters(), &in_index);
         // The deprecated per-server booleans read the same map, so they can
         // never disagree with it.
         let running = |provider: &str| analyzers_running.get(provider).copied().unwrap_or(false);
@@ -717,6 +804,8 @@ impl App {
             clangd_analyzer_running,
             analyzers_running,
             analyzers,
+            servers,
+            languages_without_server,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }
@@ -871,6 +960,42 @@ mod tests {
             code: code.to_owned(),
             content_hash: "hash".to_owned(),
         }
+    }
+
+    #[test]
+    fn languages_without_server_ignores_disabled_and_unconfigured_adapters() {
+        let in_index: HashSet<String> = ["csharp", "python", "rust"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let without = |csharp: crate::config::CSharpLspConfig| {
+            let config = crate::config::Config {
+                csharp,
+                ..crate::config::Config::default()
+            };
+            let manager = crate::lsp::Manager::new(&config);
+            languages_without_server(manager.adapters(), &in_index)
+        };
+        // Enabled and configured: only python (never configured) has none.
+        let configured = crate::config::CSharpLspConfig {
+            path: Some("csharp-ls".into()),
+            ..Default::default()
+        };
+        assert_eq!(without(configured.clone()), ["python"]);
+        // A path with `disabled = true`: the adapter exists but serves nothing.
+        let disabled = crate::config::CSharpLspConfig {
+            disabled: true,
+            ..configured
+        };
+        assert_eq!(without(disabled), ["csharp", "python"]);
+        // No path at all: the adapter is disabled too, so this case does not
+        // pin the `configured_command` guard in `languages_without_server`; the
+        // guard is redundant today (every adapter's `enabled()` implies a
+        // configured command) and stays as a defence.
+        assert_eq!(
+            without(crate::config::CSharpLspConfig::default()),
+            ["csharp", "python"]
+        );
     }
 
     #[test]
