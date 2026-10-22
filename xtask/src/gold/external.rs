@@ -9,19 +9,21 @@
 //! * Held out. The items say so (`external.heldout: true`) and nothing here is
 //!   called from a tuning, preset or default-choosing path. Cycle 2 reads the
 //!   set once, at the end, as a held-out check.
-//! * No data in the repository. The converter reads one dataset file given on
+//! * No data in the repository. The converter reads the dataset files given on
 //!   the command line and writes the gold under a directory given on the
 //!   command line; the owner's local paths live only in local configs and
 //!   scripts. The report holds counts and hashes, never question or patch
 //!   text.
-//! * The converter reads only the row: no tree, no network, no clone.
+//! * The converter reads only the rows: no tree, no network, no clone.
 //!
-//! K4a (this file) holds the row type, the SWE-PolyBench CSV reader, the
-//! LongCodeArena column adapter (the parquet reader that feeds it is K4b), the
-//! patch parser, the test-file rule, the leak check and the converter. Fetching
-//! the files is K4b.
+//! `fetch` downloads the official files pinned at one dataset revision and
+//! records their hashes in `fetch.json`. `convert` reads a SWE-PolyBench CSV
+//! directly. LongCodeArena ships parquet, and the repository has no parquet
+//! reader (d499): a one-off conversion outside the repository turns each
+//! `<subset>/test-00000-of-00001.parquet` into `<subset>.jsonl`, one JSON object
+//! per row with the parquet column names, and `convert` reads those.
 
-use super::strata::{GENERIC_STEMS, holds_stem};
+use super::strata::{GENERIC_STEMS, file_stem, holds_stem};
 use super::write_file;
 use anyhow::{Context, Result, bail};
 use clap::{Subcommand, ValueEnum};
@@ -29,16 +31,23 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The question goes on a command line in the bench; Windows caps a command
 /// line near 32k characters.
 pub(crate) const QUESTION_MAX_CHARS: usize = 8000;
 
 /// Directory tokens that say nothing when a question holds them.
-const GENERIC_DIR_TOKENS: [&str; 6] = ["src", "lib", "main", "app", "core", "test"];
+const GENERIC_DIR_TOKENS: [&str; 11] = [
+    "src", "lib", "main", "app", "core", "test", "java", "python", "node", "packages", "common",
+];
 
 /// Shortest directory token that counts for the leak check.
 const MIN_DIR_TOKEN: usize = 4;
+
+/// The LongCodeArena subsets and the one split of each that is used.
+const LCA_SUBSETS: [&str; 3] = ["py", "java", "kt"];
+const LCA_TEST_FILE: &str = "test-00000-of-00001.parquet";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Source {
@@ -72,26 +81,50 @@ impl Source {
         format!("https://huggingface.co/datasets/{}", self.dataset())
     }
 
-    /// The file of the source that `convert` reads, inside `--in`.
-    pub(crate) fn data_file(self) -> &'static str {
+    /// The dataset files `fetch` downloads, relative to the dataset root.
+    pub(crate) fn fetch_files(self, subsets: &[String]) -> Vec<String> {
         match self {
-            Source::SwePolybenchVerified => "test.csv",
-            Source::LcaBugloc => "test-00000-of-00001.parquet",
+            Source::SwePolybenchVerified => vec!["test.csv".to_string()],
+            Source::LcaBugloc => {
+                let mut files: Vec<String> = subsets
+                    .iter()
+                    .map(|s| format!("{s}/{LCA_TEST_FILE}"))
+                    .collect();
+                files.push("repos.json".to_string());
+                files
+            }
         }
     }
 }
 
 #[derive(Subcommand)]
 pub enum ExternalCommand {
-    /// Convert one downloaded dataset file to a where-to gold file
+    /// Download the official files of one source from its Hugging Face dataset
+    /// page into `<out>/<source>/`, pinned at the revision `main` has now, and
+    /// record revision, size and sha256 of each in `fetch.json`. Refuses to
+    /// overwrite a file with different content unless `--force`.
+    Fetch {
+        #[arg(long, value_enum)]
+        source: Source,
+        /// Directory that receives `<source>/` (outside the repository).
+        #[arg(long)]
+        out: PathBuf,
+        /// lca-bugloc subsets to fetch.
+        #[arg(long, value_delimiter = ',', default_value = "py,java,kt")]
+        subset: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Convert one downloaded dataset to a where-to gold file
     /// (`external-<source>.json`, a JSON array in id order) and a counts
-    /// report. Reads the file and nothing else. Held out: never use the
+    /// report. Reads the files and nothing else. Held out: never use the
     /// output to tune or to choose a default.
     Convert {
         #[arg(long, value_enum)]
         source: Source,
-        /// Directory holding the source's data file (`test.csv` for
-        /// swe-polybench-verified).
+        /// Directory holding the source's files (`test.csv` for
+        /// swe-polybench-verified; `<subset>.jsonl` per subset, converted from
+        /// the parquet files outside the repository, for lca-bugloc).
         #[arg(long = "in")]
         input: PathBuf,
         /// Gold directory (outside the repository) that receives the files.
@@ -101,8 +134,9 @@ pub enum ExternalCommand {
         /// matching items get `external.overlap: true`. Repeatable.
         #[arg(long = "known-repo", value_name = "OWNER/NAME")]
         known_repo: Vec<String>,
-        /// Revision of the dataset the file came from, recorded in every
-        /// item and in the report.
+        /// Revision of the dataset the files came from (default: the one in
+        /// `fetch.json` of the input directory), recorded in every item and
+        /// in the report.
         #[arg(long)]
         revision: Option<String>,
         /// Report JSON path (default: `<out>/external-<source>.report.json`).
@@ -113,6 +147,16 @@ pub enum ExternalCommand {
 
 pub fn run(command: ExternalCommand) -> Result<()> {
     match command {
+        ExternalCommand::Fetch {
+            source,
+            out,
+            subset,
+            force,
+        } => {
+            let summary = fetch(&HttpFetcher::new()?, source, &out, &subset, force)?;
+            println!("{summary}");
+            Ok(())
+        }
         ExternalCommand::Convert {
             source,
             input,
@@ -131,6 +175,158 @@ pub fn run(command: ExternalCommand) -> Result<()> {
     }
 }
 
+// ------------------------------------------------------------------- fetch
+
+/// What `fetch` needs from the network, so tests run without a socket.
+pub(crate) trait Fetcher {
+    /// The commit `main` points at for a dataset.
+    fn revision(&self, dataset: &str) -> Result<String>;
+    fn get(&self, url: &str) -> Result<Vec<u8>>;
+}
+
+struct HttpFetcher {
+    client: reqwest::Client,
+}
+
+impl HttpFetcher {
+    fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .user_agent("lci-xtask-gold-external")
+            .build()
+            .context("failed to build the HTTP client")?;
+        Ok(Self { client })
+    }
+
+    /// One GET on a fresh runtime on its own thread: `run` is called from
+    /// inside the xtask runtime, where `block_on` would panic.
+    fn download(&self, url: &str) -> Result<Vec<u8>> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| -> Result<Vec<u8>> {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(async {
+                        let response = self
+                            .client
+                            .get(url)
+                            .send()
+                            .await
+                            .with_context(|| format!("GET {url} failed"))?;
+                        let status = response.status();
+                        if !status.is_success() {
+                            bail!("GET {url} answered {status}");
+                        }
+                        Ok(response.bytes().await?.to_vec())
+                    })
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("the download thread panicked"))?
+        })
+    }
+}
+
+impl Fetcher for HttpFetcher {
+    fn revision(&self, dataset: &str) -> Result<String> {
+        let url = format!("https://huggingface.co/api/datasets/{dataset}/revision/main");
+        let value: Value =
+            serde_json::from_slice(&self.download(&url)?).context("revision answer is not JSON")?;
+        value["sha"]
+            .as_str()
+            .map(str::to_string)
+            .context("revision answer has no sha")
+    }
+
+    fn get(&self, url: &str) -> Result<Vec<u8>> {
+        self.download(url)
+    }
+}
+
+/// Download the source's files at one pinned revision into `<out>/<source>/`.
+/// Everything is downloaded and compared with what is on disk before anything
+/// is written, so a refusal leaves the directory as it was. Returns the
+/// summary line.
+pub(crate) fn fetch(
+    fetcher: &dyn Fetcher,
+    source: Source,
+    out: &Path,
+    subsets: &[String],
+    force: bool,
+) -> Result<String> {
+    if source == Source::LcaBugloc {
+        for subset in subsets {
+            if !LCA_SUBSETS.contains(&subset.as_str()) {
+                bail!("unknown lca-bugloc subset {subset:?} (py, java, kt)");
+            }
+        }
+    }
+    let dir = out.join(source.name());
+    let revision = fetcher.revision(source.dataset())?;
+    let record_path = dir.join("fetch.json");
+    let mut files: Map<String, Value> = read_fetch_record(&dir)
+        .and_then(|v| v["files"].as_object().cloned())
+        .unwrap_or_default();
+    let mut total = 0usize;
+    let mut downloaded = Vec::new();
+    for relative in source.fetch_files(subsets) {
+        let url = format!(
+            "https://huggingface.co/datasets/{}/resolve/{revision}/{relative}",
+            source.dataset()
+        );
+        let bytes = fetcher.get(&url)?;
+        let digest = hex(&Sha256::digest(&bytes));
+        let target = dir.join(&relative);
+        if let Ok(existing) = std::fs::read(&target)
+            && hex(&Sha256::digest(&existing)) != digest
+            && !force
+        {
+            bail!(
+                "{} already exists with different content; pass --force to overwrite",
+                target.display()
+            );
+        }
+        total += bytes.len();
+        files.insert(
+            relative.clone(),
+            json!({"url": url, "bytes": bytes.len(), "sha256": digest}),
+        );
+        downloaded.push((target, bytes));
+    }
+    for (target, bytes) in &downloaded {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, bytes)
+            .with_context(|| format!("failed to write {}", target.display()))?;
+    }
+    let record = json!({
+        "source": source.name(),
+        "dataset": source.dataset(),
+        "licence": source.licence(),
+        "url": source.url(),
+        "revision": revision,
+        "files": files,
+    });
+    write_file(
+        &record_path,
+        &(serde_json::to_string_pretty(&record)? + "\n"),
+    )?;
+    Ok(format!(
+        "fetched {}: {} files, {total} bytes, revision {revision}",
+        source.name(),
+        downloaded.len(),
+    ))
+}
+
+/// The record `fetch` wrote, when the directory has one.
+fn read_fetch_record(dir: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(dir.join("fetch.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// ----------------------------------------------------------------- convert
+
 fn run_convert(
     source: Source,
     input: &Path,
@@ -144,19 +340,27 @@ fn run_convert(
             bail!("--known-repo {repo:?} must be owner/name");
         }
     }
-    if source == Source::LcaBugloc {
-        bail!(
-            "lca-bugloc needs the parquet reader, which is not built yet (K4b); \
-             `lca_row_from_columns` is its adapter"
-        );
-    }
-    let file = input.join(source.data_file());
-    let bytes =
-        std::fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?;
-    let rows = read_polybench_csv(&bytes)?;
-    let provenance = Provenance {
-        revision: revision.map(str::to_string),
-        sha256: hex(&Sha256::digest(&bytes)),
+    let record = read_fetch_record(input);
+    let revision = revision
+        .map(str::to_string)
+        .or_else(|| record.as_ref()?["revision"].as_str().map(str::to_string));
+    let (rows, provenance) = match source {
+        Source::SwePolybenchVerified => {
+            let file = input.join("test.csv");
+            let bytes = std::fs::read(&file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            let sha256 = hex(&Sha256::digest(&bytes));
+            let files = BTreeMap::from([("test.csv".to_string(), sha256.clone())]);
+            (
+                read_polybench_csv(&bytes)?,
+                Provenance {
+                    revision,
+                    sha256,
+                    files,
+                },
+            )
+        }
+        Source::LcaBugloc => read_lca_dir(input, revision, record.as_ref())?,
     };
     let conversion = convert(source, &rows, &provenance, known_repos);
     let items_path = out.join(format!("external-{}.json", source.name()));
@@ -173,6 +377,85 @@ fn run_convert(
     )?;
     println!("{}", headline(&conversion.report));
     Ok(())
+}
+
+/// The rows of every `<subset>.jsonl` in the directory, each tagged with the
+/// hash of the parquet file it came from (the JSONL's own hash when the parquet
+/// file is not there). When `fetch.json` lists a parquet file, the file on disk
+/// must still match it. The report's `sha256` is the hash of the sorted
+/// `<name> <sha256>` lines of the parquet files (of the JSONL files when no
+/// parquet file is present).
+fn read_lca_dir(
+    input: &Path,
+    revision: Option<String>,
+    record: Option<&Value>,
+) -> Result<(Vec<Row>, Provenance)> {
+    let mut rows = Vec::new();
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    let mut converted: BTreeMap<String, String> = BTreeMap::new();
+    for subset in LCA_SUBSETS {
+        let jsonl = input.join(format!("{subset}.jsonl"));
+        if !jsonl.is_file() {
+            continue;
+        }
+        let bytes =
+            std::fs::read(&jsonl).with_context(|| format!("failed to read {}", jsonl.display()))?;
+        let converted_sha = hex(&Sha256::digest(&bytes));
+        let parquet_name = format!("{subset}/{LCA_TEST_FILE}");
+        let source_sha = match std::fs::read(input.join(&parquet_name)) {
+            Ok(parquet) => {
+                let sha = hex(&Sha256::digest(&parquet));
+                let listed = record.and_then(|r| r["files"][&parquet_name]["sha256"].as_str());
+                if listed.is_some_and(|listed| listed != sha) {
+                    bail!("{parquet_name} no longer matches fetch.json");
+                }
+                files.insert(parquet_name, sha.clone());
+                sha
+            }
+            Err(_) => converted_sha.clone(),
+        };
+        converted.insert(format!("{subset}.jsonl"), converted_sha);
+        for mut row in read_lca_jsonl(subset, &bytes)? {
+            row.source_sha256 = Some(source_sha.clone());
+            rows.push(row);
+        }
+    }
+    if converted.is_empty() {
+        bail!(
+            "no <subset>.jsonl (py, java, kt) in {}; convert the parquet files first",
+            input.display()
+        );
+    }
+    let hashed = if files.is_empty() { &converted } else { &files };
+    let mut digest = Sha256::new();
+    for (name, sha) in hashed {
+        digest.update(format!("{name} {sha}\n"));
+    }
+    files.extend(converted);
+    Ok((
+        rows,
+        Provenance {
+            revision,
+            sha256: hex(&digest.finalize()),
+            files,
+        },
+    ))
+}
+
+/// One LongCodeArena subset from its JSONL: one JSON object per line, the
+/// parquet column names as keys, list columns as arrays.
+pub(crate) fn read_lca_jsonl(subset: &str, bytes: &[u8]) -> Result<Vec<Row>> {
+    let text = std::str::from_utf8(bytes).context("LCA JSONL is not UTF-8")?;
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("LCA {subset} JSONL line {}", index + 1))?;
+        let Some(columns) = value.as_object() else {
+            bail!("LCA {subset} JSONL line {} is not an object", index + 1);
+        };
+        rows.push(lca_row_from_columns(subset, index, columns)?);
+    }
+    Ok(rows)
 }
 
 // ------------------------------------------------------------------- rows
@@ -199,6 +482,9 @@ pub(crate) struct Row {
     pub changed_files: Option<Vec<String>>,
     /// PolyBench `modified_nodes`: informational.
     pub nodes: Option<String>,
+    /// sha256 of the dataset file the row came from, when it differs from the
+    /// conversion's own (LCA: one parquet file per subset).
+    pub source_sha256: Option<String>,
 }
 
 /// The SWE-PolyBench Verified file: a CSV with quoted multi-line cells.
@@ -244,6 +530,7 @@ pub(crate) fn read_polybench_csv(bytes: &[u8]) -> Result<Vec<Row>> {
             patch: Some(cell(c_patch)),
             changed_files: None,
             nodes: c_nodes.map(cell),
+            source_sha256: None,
         });
     }
     Ok(rows)
@@ -253,10 +540,6 @@ pub(crate) fn read_polybench_csv(bytes: &[u8]) -> Result<Vec<Row>> {
 /// (the K4b parquet reader turns each arrow cell into one). Required columns:
 /// `repo_owner`, `repo_name`, `base_sha`, `issue_title`, `issue_body`,
 /// `changed_files`, `diff`, `id`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the K4b parquet reader is its only caller")
-)]
 pub(crate) fn lca_row_from_columns(
     subset: &str,
     index: usize,
@@ -304,6 +587,7 @@ pub(crate) fn lca_row_from_columns(
         patch: Some(text("diff")?),
         changed_files: Some(files),
         nodes: None,
+        source_sha256: None,
     })
 }
 
@@ -419,14 +703,45 @@ fn split_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// Whether the question gives a member away: it holds the member's stem as a
-/// whole word (the strata rule, `holds_stem`: generic and short stems never),
+/// Whether the question holds the member's stem under any spelling of its
+/// tokens. A one-token stem is the strata rule (`holds_stem`: generic and short
+/// stems never). A stem of several tokens (`user_service`, `UserService`) is
+/// held when a question word has the same letters and digits once separators
+/// are dropped (`UserService`, `user_service`) or the question holds its tokens
+/// next to each other (`user service`); a stem whose tokens are all generic
+/// never counts.
+fn holds_stem_tokens(words: &[String], question_tokens: &[String], path: &str) -> bool {
+    if holds_stem(words, path) {
+        return true;
+    }
+    let tokens = split_tokens(file_stem(path));
+    if tokens.len() < 2 || tokens.iter().all(|t| is_generic_token(t)) {
+        return false;
+    }
+    let collapsed: String = tokens.concat();
+    if collapsed.len() < 3 || GENERIC_STEMS.contains(&collapsed.as_str()) {
+        return false;
+    }
+    words.iter().any(|w| w.replace('_', "") == collapsed)
+        || question_tokens
+            .windows(tokens.len())
+            .any(|w| w == tokens.as_slice())
+}
+
+fn is_generic_token(token: &str) -> bool {
+    GENERIC_STEMS.contains(&token) || GENERIC_DIR_TOKENS.contains(&token)
+}
+
+/// Whether the question gives a member away: it holds the member's stem (as a
+/// whole word, or under another spelling of its tokens: `holds_stem_tokens`),
 /// holds the member's path verbatim, or holds a lower-cased token of 4 or more
 /// characters from the member's directories (split on `/`, `_`, `-`, `.` and
-/// camelCase; `src`, `lib`, `main`, `app`, `core`, `test` and the repository
-/// name never). Question words split on every non-alphanumeric character
-/// for the directory tokens (so `file_utils` gives `file` and `utils`).
+/// camelCase; the generic directory tokens, the repository name and the
+/// repository owner never). Question words split on every non-alphanumeric
+/// character for the directory tokens (so `file_utils` gives `file` and
+/// `utils`).
 pub(crate) fn leak_of(question: &str, members: &[String], repo: &str) -> bool {
+    let question_tokens = split_tokens(question);
     let words: Vec<String> = question
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty())
@@ -441,11 +756,14 @@ pub(crate) fn leak_of(question: &str, members: &[String], repo: &str) -> bool {
                 .map(str::to_ascii_lowercase),
         )
         .collect();
-    let repo_name = repo.rsplit('/').next().unwrap_or(repo);
-    let mut ignored: BTreeSet<String> = split_tokens(repo_name).into_iter().collect();
-    ignored.insert(repo_name.to_ascii_lowercase());
+    let (owner, repo_name) = repo.rsplit_once('/').unwrap_or(("", repo));
+    let mut ignored: BTreeSet<String> = BTreeSet::new();
+    for name in [owner, repo_name] {
+        ignored.extend(split_tokens(name));
+        ignored.insert(name.to_ascii_lowercase());
+    }
     members.iter().any(|path| {
-        if holds_stem(&words, path) || question.contains(path.as_str()) {
+        if holds_stem_tokens(&words, &question_tokens, path) || question.contains(path.as_str()) {
             return true;
         }
         let dirs = path.rsplit_once('/').map_or("", |(dirs, _)| dirs);
@@ -465,6 +783,8 @@ pub(crate) fn leak_of(question: &str, members: &[String], repo: &str) -> bool {
 pub(crate) struct Provenance {
     pub revision: Option<String>,
     pub sha256: String,
+    /// File name to sha256, for the report.
+    pub files: BTreeMap<String, String>,
 }
 
 pub(crate) struct Conversion {
@@ -596,7 +916,7 @@ fn convert_row(
             "licence": source.licence(),
             "url": source.url(),
             "revision": provenance.revision,
-            "sha256": provenance.sha256,
+            "sha256": row.source_sha256.as_deref().unwrap_or(&provenance.sha256),
             "row": row.row,
             "language": row.language,
             "repo": row.repo,
@@ -675,6 +995,7 @@ pub(crate) fn convert(
         "url": source.url(),
         "revision": provenance.revision,
         "sha256": provenance.sha256,
+        "files": provenance.files,
         "heldout": true,
         "rows": rows.len(),
         "items": items.len(),

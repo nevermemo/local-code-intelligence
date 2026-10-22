@@ -32,6 +32,7 @@ fn provenance() -> Provenance {
     Provenance {
         revision: Some("rev1".to_string()),
         sha256: "aa".repeat(32),
+        files: BTreeMap::new(),
     }
 }
 
@@ -540,9 +541,12 @@ fn convert_writes_the_gold_and_a_report_without_question_text() {
     let loaded =
         super::super::load_gold(&out.join("external-swe-polybench-verified.json")).unwrap();
     assert_eq!(loaded.len(), 1);
-    // The LCA source waits for the parquet reader (K4b) and says so.
+    // The LCA source without any converted JSONL says what to do first.
     let error = run_convert(Source::LcaBugloc, &input, &out, &[], None, None).unwrap_err();
-    assert!(format!("{error:#}").contains("K4b"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("convert the parquet"),
+        "{error:#}"
+    );
     // A malformed --known-repo is refused before anything is read.
     let error = run_convert(
         Source::SwePolybenchVerified,
@@ -554,5 +558,250 @@ fn convert_writes_the_gold_and_a_report_without_question_text() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("owner/name"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_stem_spelled_with_other_separators_or_case_counts_as_held() {
+    let leak = |question: &str, member: &str| leak_of(question, &[member.to_string()], "a/b");
+    // camelCase in the question against a snake_case stem, and back.
+    assert!(leak("UserService drops the session", "app/user_service.py"));
+    assert!(leak(
+        "user_service drops the session",
+        "app/UserService.java"
+    ));
+    assert!(leak("userservice drops the session", "app/user_service.py"));
+    // The tokens next to each other in plain words.
+    assert!(leak("the user service drops it", "app/user_service.py"));
+    // Only next to each other: the two words apart are no leak.
+    assert!(!leak("the user drops the service", "app/user_service.py"));
+    // A stem whose tokens are all generic says nothing in any spelling.
+    assert!(!leak("test utils broke", "app/test_utils.py"));
+    assert!(!leak("TestUtils broke", "app/test_utils.py"));
+}
+
+#[test]
+fn the_repository_owner_is_ignored_like_the_repository_name() {
+    let leak =
+        |question: &str, member: &str, repo: &str| leak_of(question, &[member.to_string()], repo);
+    assert!(!leak(
+        "the mozilla parser",
+        "mozilla/zzz/qqq.py",
+        "mozilla/widgets"
+    ));
+    assert!(!leak(
+        "the Mozilla parser",
+        "x/Mozilla/qqq.py",
+        "Mozilla/widgets"
+    ));
+    // A directory token that is not the owner or the name still leaks.
+    assert!(leak("the gecko parser", "gecko/qqq.py", "mozilla/widgets"));
+    // The owner is split like the name: `acmeCorp` ignores `acme` and `corp`.
+    assert!(!leak(
+        "the acmecorp parser",
+        "acme_corp/qqq.py",
+        "acmeCorp/widgets"
+    ));
+}
+
+#[test]
+fn language_and_layout_directories_are_generic() {
+    for dir in ["java", "python", "node", "packages", "common"] {
+        let member = format!("{dir}/zzz.py");
+        assert!(
+            !leak_of(&format!("the {dir} part is broken"), &[member], "a/b"),
+            "{dir}"
+        );
+    }
+}
+
+#[test]
+fn a_lca_jsonl_file_reads_into_rows_with_the_column_names() {
+    let line = |id: u32, files: &str| {
+        format!(
+            r#"{{"repo_owner":"acme","repo_name":"gadgets","base_sha":"b{id}","issue_title":"T{id}","issue_body":"Body \"{id}\"\nline two","changed_files":{files},"diff":"","id":{id},"extra":[1,2]}}"#
+        )
+    };
+    let text = format!(
+        "{}\n\n{}\n",
+        line(1, r#"["a/x.py"]"#),
+        line(2, r#"["a/y.py","a/z.kt"]"#)
+    );
+    let rows = read_lca_jsonl("py", text.as_bytes()).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, "lca:py:1");
+    assert_eq!(rows[1].row, 1);
+    assert_eq!(rows[1].changed_files.as_deref().unwrap().len(), 2);
+    assert_eq!(rows[0].question_parts[1], "Body \"1\"\nline two");
+    // A broken line names the subset and the line.
+    let error = read_lca_jsonl("java", b"{not json\n").unwrap_err();
+    assert!(format!("{error:#}").contains("java"), "{error:#}");
+    let error = read_lca_jsonl("java", b"[1]\n").unwrap_err();
+    assert!(error.to_string().contains("not an object"), "{error}");
+}
+
+#[test]
+fn convert_reads_the_lca_subsets_and_records_the_parquet_hashes() {
+    let dir = std::env::temp_dir().join(format!("lci-external-lca-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let (input, out) = (dir.join("in"), dir.join("gold"));
+    std::fs::create_dir_all(input.join("py")).unwrap();
+    let row = |id: u32, file: &str, title: &str| {
+        json!({
+            "repo_owner": "acme", "repo_name": "gadgets", "base_sha": "b",
+            "issue_title": title, "issue_body": "Body", "changed_files": [file],
+            "diff": "", "id": id,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        input.join("py.jsonl"),
+        format!(
+            "{}\n{}\n",
+            row(1, "pkg/a.py", "Crash"),
+            row(2, "pkg/b.kt", "Kotlin only")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        input.join("kt.jsonl"),
+        format!("{}\n", row(3, "k/c.kt", "Kt")),
+    )
+    .unwrap();
+    let parquet = b"stand-in bytes for the parquet file";
+    std::fs::write(input.join("py").join(LCA_TEST_FILE), parquet).unwrap();
+    let parquet_sha = hex(&Sha256::digest(parquet));
+    let record = json!({
+        "revision": "rev-lca",
+        "files": {format!("py/{LCA_TEST_FILE}"): {"sha256": parquet_sha}},
+    });
+    std::fs::write(input.join("fetch.json"), record.to_string()).unwrap();
+
+    run_convert(Source::LcaBugloc, &input, &out, &[], None, None).unwrap();
+    let items: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("external-lca-bugloc.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    assert_eq!(items[0]["id"], "lca:py:1");
+    assert_eq!(items[0]["external"]["revision"], "rev-lca");
+    assert_eq!(items[0]["external"]["sha256"], parquet_sha);
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("external-lca-bugloc.report.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["rows"], 3);
+    assert_eq!(report["dropped"]["no_member"], 2);
+    assert_eq!(report["licence"], "Apache-2.0");
+    assert!(report["files"][format!("py/{LCA_TEST_FILE}")].is_string());
+    assert!(report["files"]["py.jsonl"].is_string());
+    assert!(report["files"]["kt.jsonl"].is_string());
+
+    // A parquet file that changed since `fetch` is refused.
+    std::fs::write(input.join("py").join(LCA_TEST_FILE), b"different").unwrap();
+    let error = run_convert(Source::LcaBugloc, &input, &out, &[], None, None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no longer matches"),
+        "{error:#}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+struct FakeFetcher {
+    body: std::cell::RefCell<String>,
+    urls: std::cell::RefCell<Vec<String>>,
+}
+
+impl FakeFetcher {
+    fn new(body: &str) -> Self {
+        Self {
+            body: std::cell::RefCell::new(body.to_string()),
+            urls: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Fetcher for FakeFetcher {
+    fn revision(&self, _dataset: &str) -> Result<String> {
+        Ok("0123456789abcdef".to_string())
+    }
+
+    fn get(&self, url: &str) -> Result<Vec<u8>> {
+        self.urls.borrow_mut().push(url.to_string());
+        Ok(self.body.borrow().clone().into_bytes())
+    }
+}
+
+#[test]
+fn fetch_refuses_to_overwrite_a_file_with_another_hash() {
+    let dir = std::env::temp_dir().join(format!("lci-external-fetch-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let fetcher = FakeFetcher::new("first");
+    let summary = fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], false).unwrap();
+    assert!(summary.contains("1 files, 5 bytes"), "{summary}");
+    let file = dir.join("swe-polybench-verified").join("test.csv");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+    // The download is pinned at the revision, not at `main`.
+    assert_eq!(
+        fetcher.urls.borrow().as_slice(),
+        [
+            "https://huggingface.co/datasets/AmazonScience/SWE-PolyBench_Verified/resolve/0123456789abcdef/test.csv"
+        ]
+    );
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("swe-polybench-verified").join("fetch.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["revision"], "0123456789abcdef");
+    assert_eq!(record["files"]["test.csv"]["bytes"], 5);
+    assert_eq!(
+        record["files"]["test.csv"]["sha256"],
+        hex(&Sha256::digest(b"first"))
+    );
+
+    // The same content again is fine; other content is refused and changes nothing.
+    fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], false).unwrap();
+    *fetcher.body.borrow_mut() = "second".to_string();
+    let error = fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], false).unwrap_err();
+    assert!(error.to_string().contains("--force"), "{error}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+    // --force overwrites.
+    fetch(&fetcher, Source::SwePolybenchVerified, &dir, &[], true).unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_of_lca_takes_the_test_split_of_each_subset_and_rejects_unknown_ones() {
+    let dir = std::env::temp_dir().join(format!("lci-external-fetch2-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let fetcher = FakeFetcher::new("x");
+    let subsets = vec!["py".to_string(), "kt".to_string()];
+    fetch(&fetcher, Source::LcaBugloc, &dir, &subsets, false).unwrap();
+    let urls = fetcher.urls.borrow().clone();
+    assert_eq!(urls.len(), 3);
+    assert!(urls[0].ends_with("/py/test-00000-of-00001.parquet"));
+    assert!(urls[1].ends_with("/kt/test-00000-of-00001.parquet"));
+    assert!(urls[2].ends_with("/repos.json"));
+    assert!(
+        !urls
+            .iter()
+            .any(|u| u.contains("train") || u.contains("dev-"))
+    );
+    assert!(
+        dir.join("lca-bugloc")
+            .join("py")
+            .join(LCA_TEST_FILE)
+            .is_file()
+    );
+    let error = fetch(
+        &fetcher,
+        Source::LcaBugloc,
+        &dir,
+        &["rb".to_string()],
+        false,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("rb"), "{error}");
     std::fs::remove_dir_all(&dir).ok();
 }

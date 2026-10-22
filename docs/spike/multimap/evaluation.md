@@ -22,7 +22,7 @@ Gold files are private (outside the repository) except the two seed sets below. 
 | masked region (R1) | 146 kept (dev 58, test 88) | frozen; stage 2 done |
 | seed questions | 28 | public, `eval-seed.json` |
 | bug localisation | 34 | public, `gold-bugloc.json` |
-| external held-out (where-to exemplar, file) | SWE-PolyBench Verified (MIT) and LongCodeArena bug localization (Apache-2.0); counts after K4b | converter and leak check built (K4a, d484); data never in the repository; never used for tuning or for choosing defaults, cycle 2 reads it once, at the end, as a held-out check |
+| external held-out (where-to exemplar, file) | SWE-PolyBench Verified (MIT, revision `b3fca77`): 382 rows, 382 items (leak 298, clean 84); LongCodeArena bug localization test split (Apache-2.0, revision `f2bb26a`): 150 rows (py, java, kt), 100 items (leak 85, clean 15), the 50 Kotlin rows dropped as `no_member` | built (K4a d484, K4b d499); data in the owner's gold directory, never in the repository; never used for tuning or for choosing defaults, cycle 2 reads it once, at the end, as a held-out check; the leak stratum is large (78 % and 85 %), so cycle 2 reads leak and clean separately |
 | trait-dispatch / co-change | trait-dispatch not built (the trait-implementation set ran, d392) / co-change parked | see Set portfolio |
 
 ## Frozen tree rule
