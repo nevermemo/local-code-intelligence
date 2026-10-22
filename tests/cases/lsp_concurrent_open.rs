@@ -1,7 +1,9 @@
 //! Position requests that reach one shared language-server client at the same
 //! time for the same file (ASYNC-2 commit A, review fix): a request that finds
 //! the file's text already sent must not go out before that send has finished,
-//! its head start included. The fake is the documents-mode one, which answers
+//! its wait for the server's diagnostics included (here a wait the test ends;
+//! the real one is pinned in `lsp_diagnostics_wait`). The fake is the
+//! documents-mode one, which answers
 //! from the text it was sent, so a request that overtakes the `didOpen` is
 //! answered empty.
 
@@ -69,17 +71,17 @@ async fn started_fake(temp: &tempfile::TempDir) -> (Arc<JsonRpcClient>, std::pat
 struct Shared {
     client: Arc<JsonRpcClient>,
     sent: SentTexts,
-    /// Ends the sender's head start.
-    head_start: Notify,
-    /// Fired by the hook that sent the text, once it holds its head start.
-    in_head_start: Notify,
+    /// Ends the sender's diagnostics wait.
+    hold: Notify,
+    /// Fired by the hook that sent the text, once it is in its wait.
+    in_wait: Notify,
     /// What happened, in order.
     log: Mutex<Vec<&'static str>>,
 }
 
 /// A position request the way the manager makes one: the adapter's hook, then
-/// the request. The hook is a language adapter's, with its fixed head start
-/// replaced by a wait the test ends.
+/// the request. The hook is a language adapter's, with its wait for the
+/// server's diagnostics replaced by a wait the test ends.
 async fn request(shared: &Shared, file: &std::path::Path, name: &'static str) -> Value {
     let opened = open_if_changed(
         &shared.client,
@@ -92,8 +94,8 @@ async fn request(shared: &Shared, file: &std::path::Path, name: &'static str) ->
     .await
     .unwrap();
     if let Some(_opened) = opened {
-        shared.in_head_start.notify_one();
-        shared.head_start.notified().await;
+        shared.in_wait.notify_one();
+        shared.hold.notified().await;
     }
     lock(&shared.log).push(name);
     let column = LATE_CS.lines().nth(1).unwrap().find("Add").unwrap();
@@ -122,17 +124,17 @@ async fn a_request_for_a_file_being_opened_waits_for_the_open_to_finish() {
         let shared = Arc::new(Shared {
             client,
             sent: SentTexts::default(),
-            head_start: Notify::new(),
-            in_head_start: Notify::new(),
+            hold: Notify::new(),
+            in_wait: Notify::new(),
             log: Mutex::new(Vec::new()),
         });
 
-        // The first request sends the text and then holds its head start.
+        // The first request sends the text and then holds its wait.
         let first = tokio::spawn({
             let (shared, file) = (Arc::clone(&shared), file.clone());
             async move { request(&shared, &file, "first").await }
         });
-        shared.in_head_start.notified().await;
+        shared.in_wait.notified().await;
 
         // The second finds the text sent. It must park behind the open, not
         // go on to its request.
@@ -150,10 +152,10 @@ async fn a_request_for_a_file_being_opened_waits_for_the_open_to_finish() {
         assert_eq!(
             *lock(&shared.log),
             Vec::<&str>::new(),
-            "no request went out during the head start"
+            "no request went out during the diagnostics wait"
         );
 
-        shared.head_start.notify_one();
+        shared.hold.notify_one();
         let (first, second) = (first.await.unwrap(), second.await.unwrap());
         for (name, answer) in [("first", &first), ("second", &second)] {
             let places = answer.as_array().unwrap();
@@ -189,6 +191,60 @@ async fn a_request_for_a_file_being_opened_waits_for_the_open_to_finish() {
                 "textDocument/definition",
                 "textDocument/definition"
             ]
+        );
+    })
+    .await
+    .expect("within the outer bound");
+}
+
+/// A caller cancelled while its `didOpen` is being written must not leave the
+/// text recorded as sent when that write then fails: the server never got it,
+/// so the next caller has to send it. The server stops reading after
+/// `initialized` (`--never-read-stdin`) and the text is far larger than a pipe
+/// holds, so the write is still going on when the first caller is cancelled
+/// and ends only at the transport's write bound. The uri's gate is held by the
+/// write itself, so the second caller waits for that end and then finds the
+/// text unsent; recorded before the write, it would be taken for sent at once.
+#[tokio::test]
+async fn a_cancelled_open_whose_write_fails_is_not_taken_for_sent() {
+    tokio::time::timeout(LOADED_BUDGET, async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        write(
+            &root,
+            "src/Big.py",
+            &format!("# {}\n", "x".repeat(4 * 1024 * 1024)),
+        );
+        let file = root.join("src/Big.py");
+        let transport = TransportConfig {
+            executable: env!("CARGO_BIN_EXE_fake-lsp-server").to_owned(),
+            args: vec![
+                "--mode".to_owned(),
+                "definition".to_owned(),
+                "--never-read-stdin".to_owned(),
+                "--state".to_owned(),
+                temp.path().join("state").to_string_lossy().into_owned(),
+            ],
+            working_dir: temp.path().to_owned(),
+            // The write bound: a write the server does not take ends here.
+            timeout: Duration::from_secs(2),
+            label: "fake".to_owned(),
+        };
+        let client = JsonRpcClient::spawn(&transport, &[], Box::new(|_| false))
+            .await
+            .unwrap();
+        // The server stops reading when it has this.
+        client.notify("initialized", json!({})).await.unwrap();
+        let sent = SentTexts::default();
+        let open = || open_if_changed(&client, &sent, &file, "src/Big.py", "fake", "python");
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), open()).await;
+        assert!(cancelled.is_err(), "the write was still going on");
+
+        let second = open().await;
+        assert!(
+            !matches!(second, Ok(None)),
+            "the text was taken for sent although its write never finished"
         );
     })
     .await

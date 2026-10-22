@@ -14,6 +14,8 @@ mod indexing;
 mod lsp_breaker;
 #[path = "cases/lsp_concurrent_open.rs"]
 mod lsp_concurrent_open;
+#[path = "cases/lsp_diagnostics_wait.rs"]
+mod lsp_diagnostics_wait;
 #[path = "cases/markdown_lsp.rs"]
 mod markdown_lsp;
 #[path = "cases/mcp.rs"]
