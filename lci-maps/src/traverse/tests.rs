@@ -3268,6 +3268,7 @@ mod corroboration;
 
 mod accounting;
 
+mod arbitration;
 mod bound;
 mod confirm;
 mod continuation;
