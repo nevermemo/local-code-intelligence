@@ -408,15 +408,18 @@ impl Map for LspMap<'_> {
             .await;
         let calls = (providers.len() * symbol_queries.len()) as u32;
         let hits = App::map_lsp_locations(self.universe, channel.locations, request.limit);
-        let note = if channel.over_budget.is_empty() {
-            None
-        } else {
-            Some(
+        // The notes `search_once` reports, in its order: what the tree barrier
+        // did, then the providers past the budget. A map carries one note, so
+        // they are joined with "; " (N110).
+        let mut notes = crate::app::navigation::barrier_notes(&channel.restarted, &channel.reused);
+        if !channel.over_budget.is_empty() {
+            notes.push(
                 self.app
                     .lsp_over_budget_note(&channel.over_budget, &self.workspace.id)
                     .await,
-            )
-        };
+            );
+        }
+        let note = (!notes.is_empty()).then(|| notes.join("; "));
         let warning =
             (!channel.failures.is_empty()).then(|| lsp_failure_warning(&channel.failures));
         let status = lsp_status(

@@ -145,7 +145,9 @@ use crate::{
 use lci_core::{
     config::LspSync,
     language,
-    lsp::{HierarchyCall, HierarchyItem, Location, Manager, WalkSessions, adapter::LspAdapter},
+    lsp::{
+        HierarchyCall, HierarchyItem, Location, Manager, Restart, WalkSessions, adapter::LspAdapter,
+    },
     node::{NodeId, NodeKind},
     workspace::Workspace,
 };
@@ -333,9 +335,9 @@ pub struct ManagerBackend {
     /// The enabled servers whose binary answered the version probe, each with
     /// the manager whose session answers its requests.
     adapters: Vec<(Arc<dyn LspAdapter>, Arc<Manager>)>,
-    /// The providers whose kept session the tree barrier stopped because the
-    /// tree changed since its last check (see [`Self::open_split`]).
-    restarted: Vec<&'static str>,
+    /// The providers whose kept session the tree barrier stopped, each with
+    /// the reason (see [`Self::open_split`]).
+    restarted: Vec<Restart>,
     /// The sessions this walk's requests acquired, and which of them it found
     /// running instead of starting (see [`WalkSessions`]).
     walk: Arc<WalkSessions>,
@@ -431,9 +433,10 @@ impl ManagerBackend {
     }
 
     /// The providers whose kept session the barrier stopped when this backend
-    /// opened: the tree changed since its last check, so the walk's server
-    /// starts from the disk.
-    pub fn restarted(&self) -> &[&'static str] {
+    /// opened (the tree changed since its last check, or the barrier had no
+    /// stamp to compare: [`Restart::reason`]), so the walk's server starts
+    /// from the disk.
+    pub fn restarted(&self) -> &[Restart] {
         &self.restarted
     }
 
