@@ -8402,21 +8402,76 @@ async fn lsp_live_skips_a_dead_server_for_the_window_and_a_live_one_closes_it() 
         assert!(!notes.contains("lsp breaker"), "{call}: {notes}");
     }
 
-    // Key on: the first walk names the probe failure and opens the window; the
-    // second is refused by it without a probe.
+    // Key on, a missing binary: it is probed on every walk, fails the same way
+    // and opens no window (it costs under a millisecond and its note is the
+    // same on every walk; K11b-1).
     config.run_profile.lsp.breaker = true;
-    let manager_a = indexed_manager(&config, &workspace);
+    let manager_missing = indexed_manager(&config, &workspace);
+    let windows_missing = manager_missing.breakers().expect("breaker = true");
+    for call in 1..=2 {
+        let notes = notes_of(
+            &traverse_add(
+                &config,
+                &workspace,
+                &index,
+                LspSessions::Shared,
+                &manager_missing,
+            )
+            .await,
+        );
+        assert!(notes.contains("lsp.live is unavailable"), "{call}: {notes}");
+        assert!(
+            notes.contains("definitely-missing-csharp-ls"),
+            "{call}: {notes}"
+        );
+        assert!(!notes.contains("lsp breaker"), "{call}: {notes}");
+        assert!(
+            windows_missing.remaining("csharp-ls").is_none(),
+            "{call}: {notes}"
+        );
+    }
+
+    // Key on, a server that starts and dies: the first walk names the start
+    // failure and opens the window; the second is refused by it without a
+    // start.
+    let temp_dead = tempfile::tempdir().unwrap();
+    let (mut config_dead, workspace_dead, state_dead, index_dead) =
+        shared_sessions_fixture(&temp_dead);
+    config_dead.csharp.args.push("--exit-at-start".to_owned());
+    config_dead.run_profile.lsp.breaker = true;
+    let manager_a = indexed_manager(&config_dead, &workspace_dead);
     let breakers = manager_a.breakers().expect("breaker = true");
-    let first =
-        notes_of(&traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager_a).await);
-    assert!(first.contains("lsp.live is unavailable"), "{first}");
-    assert!(first.contains("definitely-missing-csharp-ls"), "{first}");
+    let first = notes_of(
+        &traverse_add(
+            &config_dead,
+            &workspace_dead,
+            &index_dead,
+            LspSessions::Shared,
+            &manager_a,
+        )
+        .await,
+    );
+    // The server was found and started, so the failure is the start's (its own
+    // retry meets the window the failure opened).
+    assert!(first.contains("csharp-ls exited"), "{first}");
     assert!(breakers.remaining("csharp-ls").is_some(), "{first}");
-    let second =
-        notes_of(&traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager_a).await);
-    assert!(second.contains("lsp.live is unavailable"), "{second}");
+    assert_eq!(spawns_started(&state_dead), 1, "{first}");
+    let second = notes_of(
+        &traverse_add(
+            &config_dead,
+            &workspace_dead,
+            &index_dead,
+            LspSessions::Shared,
+            &manager_a,
+        )
+        .await,
+    );
     assert!(second.contains("lsp breaker"), "{second}");
-    assert!(!second.contains("definitely-missing-csharp-ls"), "{second}");
+    assert_eq!(
+        spawns_started(&state_dead),
+        1,
+        "a refused start spawns nothing: {second}"
+    );
 
     // A manager of a working configuration that shares the windows is refused
     // as well; closing them lets the next walk through, and its probe and

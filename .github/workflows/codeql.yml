@@ -1,0 +1,88 @@
+name: CodeQL
+
+# Advanced setup (replaces GitHub's "default setup", which must be switched
+# off: uploads from this workflow are rejected while it is on).
+#
+# Every rule runs on every path. The analysis result is written to a SARIF
+# file instead of being uploaded directly, then advanced-security/filter-sarif
+# drops two rules, and only for test and bench-tooling paths, before
+# upload-sarif sends it. CodeQL's own `paths-ignore` would drop all rules for
+# a path and `query-filters` would drop a rule for the whole repository, so
+# neither can express "rule X only under path Y". Product code keeps every
+# rule. See docs/development/testing.md "CodeQL".
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays 04:17 UTC, so new CodeQL queries also reach unchanged code.
+    - cron: "17 4 * * 1"
+
+# A newer push to the same pull request replaces the older run.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# No workflow-wide default: the job lists what it needs.
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Rust, Python and Actions are analyzed without a build
+        # (build-mode none). For Rust that is the only mode the CodeQL
+        # documentation lists; it is what default setup used as well.
+        language: [actions, python, rust]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          # The default query suite, the same as default setup. No
+          # `queries:` input: security-extended would add noise.
+
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
+          output: sarif-results
+          # Keep the SARIF on disk; it is uploaded below after filtering.
+          # `failure-only` still uploads when the analysis itself fails, so
+          # the tool status page shows the diagnostics.
+          upload: failure-only
+
+      # Rule exclusions for test and tooling paths only. Each line is
+      # `-<file pattern>:<rule id>`; a result is dropped when its location
+      # matches a path and its rule matches. Everything else is kept.
+      - uses: advanced-security/filter-sarif@2da736ff05ef065cb2894ac6892e47b5eac2c3c0 # v1.1
+        with:
+          input: sarif-results/${{ matrix.language }}.sarif
+          # In place, as the action's README does: it creates no directory.
+          output: sarif-results/${{ matrix.language }}.sarif
+          patterns: |
+            -tests/**:rust/hard-coded-cryptographic-value
+            -xtask/**:rust/hard-coded-cryptographic-value
+            -**/tests/**:rust/hard-coded-cryptographic-value
+            -**/tests.rs:rust/hard-coded-cryptographic-value
+            -**/*_tests.rs:rust/hard-coded-cryptographic-value
+            -tests/**:rust/cleartext-logging
+            -xtask/**:rust/cleartext-logging
+            -**/tests/**:rust/cleartext-logging
+            -**/tests.rs:rust/cleartext-logging
+            -**/*_tests.rs:rust/cleartext-logging
+
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: sarif-results/${{ matrix.language }}.sarif
+          category: /language:${{ matrix.language }}

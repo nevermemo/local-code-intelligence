@@ -548,6 +548,57 @@ fn with_fake_documents_server_as(
     config
 }
 
+/// `config` with rust-analyzer replaced by a copy of the fake language server in
+/// `documents` mode with rust-analyzer's status notifications
+/// (`--status-cycle --status-shape rust`: `experimental/serverStatus` with
+/// `quiescent` true after `initialized`, which the adapter's readiness wait
+/// ends on), recording under `state_dir`; `extra` are more fake-server flags.
+/// rust-analyzer takes no command-line arguments, so the copy
+/// `<temp>/rust-analyzer-fake(.exe)` reads its arguments from the sidecar
+/// `rust-analyzer-fake.args` beside it (see `fake_lsp.rs`); the copy and its
+/// sidecar are the test's own, so no two tests share either. Keep `config` from
+/// [`fixture`].
+#[allow(dead_code)]
+fn with_fake_rust_analyzer(
+    mut config: Config,
+    temp: &Path,
+    state_dir: &Path,
+    extra: &[&str],
+) -> Config {
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let copy = temp.join(format!("rust-analyzer-fake{suffix}"));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-lsp-server"), &copy).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let state = state_dir.to_string_lossy().into_owned();
+    let arguments: Vec<String> = [
+        "--mode",
+        "documents",
+        "--state",
+        state.as_str(),
+        "--status-cycle",
+        "--status-shape",
+        "rust",
+        "--ignore-watched-files",
+    ]
+    .into_iter()
+    .chain(extra.iter().copied())
+    .map(str::to_owned)
+    .collect();
+    std::fs::write(
+        temp.join("rust-analyzer-fake.args"),
+        arguments.join("\n") + "\n",
+    )
+    .unwrap();
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
+    config.rust_analyzer_path = copy.to_string_lossy().into_owned();
+    config
+}
+
 /// Removes every `LCI_*` variable the test process has from the environment
 /// `command` will spawn with, so what a developer's own shell exports
 /// (`LCI_CONFIG`, `LCI_PORT`, `LCI_DATA_DIR`, `LCI_CANDIDATE_DUMP`, any
