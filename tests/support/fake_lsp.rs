@@ -1,9 +1,12 @@
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process, str, thread,
+    process, str,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -81,6 +84,17 @@ pub struct FakeLspConfig {
     /// Milliseconds to sleep before answering `textDocument/definition`
     /// (`--definition-delay-ms`).
     pub definition_delay_ms: u64,
+    /// Milliseconds between a `textDocument/didOpen` and the
+    /// `textDocument/publishDiagnostics` the server sends for that document
+    /// (`--diagnostics-delay-ms`, default 0: at once, before the next message
+    /// is read), in every scenario. A delayed publication is sent while the
+    /// server waits for input, so a request that arrives before it is read
+    /// first; the server records that as `request_during_pending_diagnostics.txt`
+    /// (a client that waits for the publication never causes one).
+    pub diagnostics_delay_ms: u64,
+    /// `--no-diagnostics`: the server never publishes diagnostics, as one
+    /// that does not for opened documents.
+    pub no_diagnostics: bool,
     /// The first process exits on its first definition request
     /// (`--exit-on-definition-request`), leaving the replacement healthy.
     pub exit_on_definition_request: bool,
@@ -313,6 +327,10 @@ pub fn run_from_env() -> io::Result<()> {
         definition_delay_ms: cli_arg(&cli, "--definition-delay-ms")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
+        diagnostics_delay_ms: cli_arg(&cli, "--diagnostics-delay-ms")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        no_diagnostics: cli.iter().any(|arg| arg == "--no-diagnostics"),
         exit_on_definition_request: cli.iter().any(|arg| arg == "--exit-on-definition-request"),
         answer_unhandled: cli.iter().any(|arg| arg == "--answer-unhandled"),
         ignore_shutdown,
@@ -416,6 +434,33 @@ fn record_event(state_dir: Option<&Path>, name: &str) {
     }
 }
 
+/// Sends the `textDocument/publishDiagnostics` (no diagnostics) that have
+/// fallen due and records each as `diagnostics_sent.txt`, before the write, so
+/// a client that has read the notification finds the record.
+fn send_due_diagnostics<W: Write>(
+    pending: &mut VecDeque<(Instant, String, Option<i64>)>,
+    stdout: &mut W,
+    config: &FakeLspConfig,
+) -> io::Result<()> {
+    while pending
+        .front()
+        .is_some_and(|(due, ..)| *due <= Instant::now())
+    {
+        let Some((_, uri, version)) = pending.pop_front() else {
+            break;
+        };
+        record_event(config.state_dir.as_deref(), "diagnostics_sent.txt");
+        write_message(
+            stdout,
+            &json_notification(
+                "textDocument/publishDiagnostics",
+                json!({"uri": uri, "version": version, "diagnostics": []}),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 /// Claims the lowest free start ordinal: creates `spawns/<n>` with
 /// `create_new`, which only one process can do for a given `n`, so servers
 /// started together each get their own ordinal (a read, increment and write
@@ -485,8 +530,48 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         )
     });
 
+    // The `textDocument/publishDiagnostics` still to send, `(due, uri)` in the
+    // order of the `didOpen`s. With a delay the input is read on a thread, so
+    // a publication that falls due while the server waits is sent then and a
+    // request that arrives first is read first.
+    let mut pending_diagnostics: VecDeque<(Instant, String, Option<i64>)> = VecDeque::new();
+    let threaded_input = (config.diagnostics_delay_ms > 0 && !config.no_diagnostics).then(|| {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut stdin = io::stdin();
+            loop {
+                let frame = read_frame(&mut stdin);
+                let last = !matches!(frame, Ok(Some(_)));
+                if sender.send(frame).is_err() || last {
+                    break;
+                }
+            }
+        });
+        receiver
+    });
+
     loop {
-        let Some(frame) = read_frame(&mut stdin)? else {
+        let frame = loop {
+            send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
+            let Some(input) = &threaded_input else {
+                break read_frame(&mut stdin)?;
+            };
+            let received = match pending_diagnostics.front() {
+                Some((due, ..)) => {
+                    input.recv_timeout(due.saturating_duration_since(Instant::now()))
+                }
+                None => input
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+            match received {
+                Ok(frame) => break frame?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            }
+        };
+        send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
+        let Some(frame) = frame else {
             if config.keep_alive_on_eof {
                 loop {
                     thread::sleep(Duration::from_secs(60));
@@ -511,6 +596,18 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         // disk is busy.
         if method == Some("exit") {
             record_event(config.state_dir.as_deref(), "exit_seen.txt");
+        }
+
+        // A document request read while a publication for an opened document
+        // is still to come: the client did not wait for it.
+        if !pending_diagnostics.is_empty()
+            && id.is_some()
+            && method.is_some_and(|method| method.starts_with("textDocument/"))
+        {
+            record_event(
+                config.state_dir.as_deref(),
+                "request_during_pending_diagnostics.txt",
+            );
         }
 
         request_count += 1;
@@ -685,8 +782,20 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 write_message(&mut stdout, &json_response(id, serde_json::Value::Null))?;
             }
         } else if method == Some("textDocument/didOpen") {
-            // A notification: nothing to answer, only counted.
+            // A notification: nothing to answer, only counted. The document
+            // is then published (empty diagnostics) after the configured
+            // delay, which is none by default.
             record_event(config.state_dir.as_deref(), "did_open_seen.txt");
+            if !config.no_diagnostics
+                && let Some(uri) = request["params"]["textDocument"]["uri"].as_str()
+            {
+                pending_diagnostics.push_back((
+                    Instant::now() + Duration::from_millis(config.diagnostics_delay_ms),
+                    uri.to_owned(),
+                    request["params"]["textDocument"]["version"].as_i64(),
+                ));
+                send_due_diagnostics(&mut pending_diagnostics, &mut stdout, &config)?;
+            }
         } else if method == Some("exit") {
             if !config.ignore_shutdown {
                 process::exit(0);

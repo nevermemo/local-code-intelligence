@@ -192,6 +192,13 @@ pub trait LspAdapter: Send + Sync {
 /// a per-file size cap to share (roadmap N18 part f).
 pub const MAX_DID_OPEN_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The longest a hook waits for the server's `publishDiagnostics` after a
+/// `didOpen` (the wait is also bounded by the configured request timeout, and
+/// is the smaller of the two): the worst case of the fixed head start it
+/// replaced. To be lifted once a real-server run shows
+/// `diagnostics_wait_timeouts == 0` for the servers that wait (K11d-2).
+pub const MAX_DIAGNOSTICS_WAIT: Duration = Duration::from_secs(3);
+
 /// Reads `file` for a `textDocument/didOpen` to `server`, or `None` when it is
 /// larger than [`MAX_DID_OPEN_BYTES`]. The read itself stops one byte past
 /// the cap, so no separate size check is needed (and a file that grows
@@ -224,29 +231,59 @@ pub async fn read_for_did_open(
 }
 
 /// The texts one session has sent in `textDocument/didOpen`, by document URI,
-/// as the content hash of each. A new session starts empty, so a restarted
-/// server is sent its files again.
+/// as the content hash and the `version` of each. A text is recorded only once
+/// its `didOpen` is on the pipe, so a failed or abandoned send is sent again.
+/// A new session starts empty, so a restarted server is sent its files again.
 ///
 /// It also holds one gate per URI. [`open_if_changed`] takes it before the
 /// comparison and an [`OpenedDocument`] keeps it until the hook that sent the
-/// text is done (its head start included), so a concurrent request for the
+/// text is done (its diagnostics wait included), so a concurrent request for the
 /// same file waits for an open in flight instead of skipping it and reaching
-/// the server before the text or before the head start has passed. Both maps
+/// the server before the text or before the server has taken it in. Both maps
 /// keep one entry per navigated file for the session's life.
 #[derive(Debug, Default)]
 pub struct SentTexts {
-    hashes: Mutex<HashMap<String, String>>,
+    texts: Arc<Mutex<HashMap<String, SentText>>>,
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// What one `didOpen` of a document carried, as the session recorded it.
+#[derive(Debug, Clone)]
+struct SentText {
+    hash: String,
+    version: i64,
+}
+
 /// A document this hook just sent in `textDocument/didOpen`. Holding it keeps
-/// the URI's gate, so a hook that waits after the open (a head start) keeps
-/// the waiting inside the value, and drops it when the wait is over.
+/// the URI's gate, so a hook that waits after the open (for the server's
+/// diagnostics, see [`Self::wait_for_diagnostics`]) keeps the waiting inside
+/// the value, and drops it when the wait is over.
 #[derive(Debug)]
 pub struct OpenedDocument {
     /// The document URI.
     pub uri: String,
+    /// How many `publishDiagnostics` the server had sent for the URI when the
+    /// `didOpen` was written, read just before the write: a publication
+    /// counted past it answers this open.
+    diagnostics_before: u64,
+    /// The `version` the `didOpen` carried: 1 for the first text of the
+    /// document in the session, then one more for each text sent after it, so
+    /// a publication that names an older version is not for this text.
+    version: i64,
     _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl OpenedDocument {
+    /// Waits for the server's `publishDiagnostics` for this document after the
+    /// `didOpen`, the event that says the server has taken the text in, for at
+    /// most `cap` ([`JsonRpcClient::wait_diagnostics`]). `false` when the cap
+    /// passed first. A best-effort signal, not proof that the server holds the
+    /// current text (see [`crate::lsp::transport::Diagnostics`]). The caller's
+    /// own deadline cancels the future.
+    pub async fn wait_for_diagnostics(&self, rpc: &JsonRpcClient, cap: Duration) -> bool {
+        rpc.wait_diagnostics(&self.uri, self.diagnostics_before, self.version, cap)
+            .await
+    }
 }
 
 impl SentTexts {
@@ -277,39 +314,56 @@ impl SentTexts {
             .map_or(0, |gate| Arc::strong_count(gate).saturating_sub(2))
     }
 
-    /// Records `hash` as the text sent for `uri`. `true` when it differs from
-    /// what was recorded (or nothing was), that is, when the text must be sent.
-    pub fn changed(&self, uri: &str, hash: &str) -> bool {
-        let mut sent = self.hashes.lock().unwrap_or_else(PoisonError::into_inner);
-        if sent.get(uri).is_some_and(|known| known == hash) {
-            return false;
-        }
-        sent.insert(uri.to_owned(), hash.to_owned());
-        true
-    }
-
-    /// Forgets `uri`, so the next [`Self::changed`] answers `true` (a send
-    /// that failed).
-    fn forget(&self, uri: &str) {
-        self.hashes
+    /// Whether `hash` is the text this session last sent for `uri`.
+    fn is_current(&self, uri: &str, hash: &str) -> bool {
+        self.texts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(uri);
+            .get(uri)
+            .is_some_and(|sent| sent.hash == hash)
+    }
+
+    /// The `version` the next `didOpen` of `uri` carries.
+    fn next_version(&self, uri: &str) -> i64 {
+        self.texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(uri)
+            .map_or(1, |sent| sent.version + 1)
+    }
+
+    /// What records `hash` and `version` as sent for `uri`, to run once the
+    /// `didOpen` is written (it outlives the caller, see
+    /// [`JsonRpcClient::notify_holding`]).
+    fn recorder(&self, uri: &str, hash: String, version: i64) -> impl FnOnce() + Send + 'static {
+        let (texts, uri) = (Arc::clone(&self.texts), uri.to_owned());
+        move || {
+            texts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(uri, SentText { hash, version });
+        }
     }
 }
 
-/// Sends `file`'s current disk text in `textDocument/didOpen` (version 1) unless
-/// this session already sent that exact text, and answers the document URI
-/// when it sent. `None`: the text is unchanged since the last send, or the file
+/// Sends `file`'s current disk text in `textDocument/didOpen` unless this
+/// session already sent that exact text, and answers the document when it
+/// sent. The text is recorded as sent when the write has finished, not before,
+/// and the URI's gate is held until then even when the caller is cancelled
+/// mid-write (the write runs on a task that owns the gate), so a later caller
+/// never sees the text as sent while its `didOpen` is still to be written. `None`: the text is unchanged since the last send, or the file
 /// is above [`MAX_DID_OPEN_BYTES`] and is not sent (see
 /// [`read_for_did_open`]).
 ///
 /// The call first waits for any open of the same URI in flight on this
 /// session, so a request that finds the text already sent returns only after
 /// the `didOpen` has been written (the write is awaited to the end) and after
-/// the sending hook let go of its [`OpenedDocument`], head start included.
+/// the sending hook let go of its [`OpenedDocument`], diagnostics wait included.
 /// Hold the returned value across a wait that must also hold other requests
-/// for the file back; drop it when the wait is over.
+/// for the file back; drop it when the wait is over. The diagnostics count the
+/// wait needs is read here, after the gate is taken and just before the
+/// `didOpen` is written, so a publication cannot slip in between the reading
+/// and the write.
 pub async fn open_if_changed(
     rpc: &JsonRpcClient,
     sent: &SentTexts,
@@ -325,27 +379,33 @@ pub async fn open_if_changed(
     let Some(content) = read_for_did_open(file, relative, server).await? else {
         return Ok(None);
     };
-    if !sent.changed(&uri, &crate::workspace::hash(&content)) {
+    let hash = crate::workspace::hash(&content);
+    if sent.is_current(&uri, &hash) {
         return Ok(None);
     }
-    let notified = rpc
-        .notify(
+    let version = sent.next_version(&uri);
+    let diagnostics_before = rpc.diagnostics_seen(&uri);
+    let gate = rpc
+        .notify_holding(
             "textDocument/didOpen",
             json!({
                 "textDocument": {
                     "uri": uri,
                     "languageId": language_id,
-                    "version": 1,
+                    "version": version,
                     "text": content
                 }
             }),
+            gate,
+            sent.recorder(&uri, hash, version),
         )
-        .await;
-    if let Err(error) = notified {
-        sent.forget(&uri);
-        return Err(error);
-    }
-    Ok(Some(OpenedDocument { uri, _gate: gate }))
+        .await?;
+    Ok(Some(OpenedDocument {
+        uri,
+        diagnostics_before,
+        version,
+        _gate: gate,
+    }))
 }
 
 /// What identifies a binary for the process-wide probe memo. The invocation is
@@ -436,7 +496,11 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
     let run = async {
         let mut command = tokio::process::Command::new(&resolved);
         command.arg("--version");
+        // tokio's `output()` pipes only stdout and stderr, so without this the
+        // child inherits our stdin: under the MCP stdio transport that is the
+        // client's JSON-RPC stream (N107).
         command
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -460,25 +524,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn sent_texts_report_a_change_once_per_new_hash() {
+    fn sent_texts_are_current_only_once_recorded() {
         let sent = SentTexts::default();
-        assert!(sent.changed("file:///a", "h1"), "first text");
-        assert!(!sent.changed("file:///a", "h1"), "same text again");
+        assert!(!sent.is_current("file:///a", "h1"), "nothing recorded yet");
+        assert_eq!(sent.next_version("file:///a"), 1);
+        sent.recorder("file:///a", "h1".into(), 1)();
+        assert!(sent.is_current("file:///a", "h1"), "same text again");
         assert!(
-            sent.changed("file:///b", "h1"),
+            !sent.is_current("file:///b", "h1"),
             "another uri is its own entry"
         );
-        assert!(sent.changed("file:///a", "h2"), "a new text");
-        assert!(!sent.changed("file:///a", "h2"));
+        assert_eq!(sent.next_version("file:///a"), 2);
+        assert!(!sent.is_current("file:///a", "h2"), "a new text");
+        sent.recorder("file:///a", "h2".into(), 2)();
+        assert!(sent.is_current("file:///a", "h2"));
         assert!(
-            sent.changed("file:///a", "h1"),
+            !sent.is_current("file:///a", "h1"),
             "back to the old text is a change"
         );
-        sent.forget("file:///a");
-        assert!(
-            sent.changed("file:///a", "h1"),
-            "a forgotten uri is sent again"
-        );
+        assert_eq!(sent.next_version("file:///a"), 3);
     }
 
     #[tokio::test]

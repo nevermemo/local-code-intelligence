@@ -194,6 +194,167 @@ impl TransportConfig {
     }
 }
 
+/// What the server has published for one document: how many publications, and
+/// the `version` the latest carried (`None` when it carried none).
+#[derive(Debug, Default, Clone, Copy)]
+struct Published {
+    count: u64,
+    version: Option<i64>,
+}
+
+/// How many `textDocument/publishDiagnostics` notifications the server has
+/// sent for each document URI, and the wait on them. A server that publishes
+/// diagnostics for a document it was just sent has taken the text in and
+/// analysed it, so the next request for that document sees it: the event the
+/// adapters wait for after a `textDocument/didOpen`, in place of a fixed head
+/// start.
+///
+/// Only counts and versions are kept, never the diagnostics. The count of a
+/// URI is read before the `didOpen` goes out ([`Self::seen`]) and the wait ends
+/// when the count passes that reading ([`Self::wait_after`]) with a
+/// publication that is not for an older text: one that carries a `version`
+/// below the version the wait opened is not an answer to this open. It is a
+/// best-effort signal, not proof that the server holds the current text: a
+/// server that publishes without a version, or a late publication for the
+/// previous text that carries the same version, can still end a wait early.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    by_uri: std::sync::Mutex<HashMap<String, Published>>,
+    notify: tokio::sync::Notify,
+    /// How many waits ended at their cap (each one is counted).
+    wait_timeouts: AtomicU64,
+}
+
+/// The key a document is counted under: the same file spelled two ways is one
+/// key. Our URIs come from `Url::from_file_path` (`file:///C:/w/a.py`), while a
+/// server written on `vscode-uri` publishes `file:///c%3A/w/a.py`. A `file`
+/// URI is percent-decoded and its drive letter is lower-cased; any other URI
+/// (or text that is not a URI) is its own key.
+fn canonical_uri(uri: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(uri) else {
+        return uri.to_owned();
+    };
+    if url.scheme() != "file" {
+        return uri.to_owned();
+    }
+    let raw = url.path().as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while at < raw.len() {
+        let hex = |digit: u8| char::from(digit).to_digit(16);
+        match raw.get(at..at + 3) {
+            Some([b'%', high, low]) if hex(*high).is_some() && hex(*low).is_some() => {
+                bytes.push((hex(*high).unwrap_or(0) * 16 + hex(*low).unwrap_or(0)) as u8);
+                at += 3;
+            }
+            _ => {
+                bytes.push(raw[at]);
+                at += 1;
+            }
+        }
+    }
+    // `/C:/w/a.py` and `/c:/w/a.py` name one file on Windows.
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        bytes[1] = bytes[1].to_ascii_lowercase();
+    }
+    format!(
+        "file://{}{}",
+        url.host_str().unwrap_or_default(),
+        String::from_utf8_lossy(&bytes)
+    )
+}
+
+impl Diagnostics {
+    /// Counts one publication for `uri`, which carried `version` when the
+    /// server sent one, and wakes the waiters. The document is identified by
+    /// [`canonical_uri`], not by the spelling the server used.
+    pub fn note(&self, uri: &str, version: Option<i64>) {
+        tracing::debug!(uri, ?version, "publishDiagnostics");
+        let mut by_uri = self
+            .by_uri
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let published = by_uri.entry(canonical_uri(uri)).or_default();
+        published.count += 1;
+        published.version = version;
+        drop(by_uri);
+        self.notify.notify_waiters();
+    }
+
+    /// How many publications for `uri` have arrived so far; 0 for a URI never
+    /// published.
+    pub fn seen(&self, uri: &str) -> u64 {
+        self.published(&canonical_uri(uri)).count
+    }
+
+    /// What the server has published for a key already made by
+    /// [`canonical_uri`].
+    fn published(&self, key: &str) -> Published {
+        self.by_uri
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Whether a publication for `key` after the reading `seen_before` answers
+    /// the open of `version`: one has arrived, and the latest does not carry
+    /// an older version.
+    fn answers(&self, key: &str, seen_before: u64, version: i64) -> bool {
+        let published = self.published(key);
+        published.count > seen_before && published.version.is_none_or(|sent| sent >= version)
+    }
+
+    /// Waits until a publication for `uri` has arrived after the reading
+    /// `seen_before` that answers the open of `version` (see the type's
+    /// notes), for at most `cap`. `true` when one has. `false` when the cap
+    /// passed first; that is counted ([`Self::wait_timeouts`]) and logged at
+    /// debug, and every later wait waits again: one wait that ran out is not
+    /// proof that the server never publishes (pyright publishes after 3 s
+    /// when it starts cold).
+    pub async fn wait_after(
+        &self,
+        uri: &str,
+        seen_before: u64,
+        version: i64,
+        cap: Duration,
+    ) -> bool {
+        let key = canonical_uri(uri);
+        let published = async {
+            loop {
+                // Registered before the count is read, so a publication in
+                // between wakes this wait instead of being missed.
+                let notified = self.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.answers(&key, seen_before, version) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        if self.answers(&key, seen_before, version) {
+            return true;
+        }
+        if tokio::time::timeout(cap, published).await.is_ok() {
+            return true;
+        }
+        self.wait_timeouts.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            uri,
+            cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
+            "no publishDiagnostics for an opened document within the wait"
+        );
+        false
+    }
+
+    /// How many waits ended at their cap.
+    pub fn wait_timeouts(&self) -> u64 {
+        self.wait_timeouts.load(Ordering::Relaxed)
+    }
+}
+
 /// What the readiness and busy predicates have reported so far, see
 /// [`JsonRpcClient::state`]. It is a report: nothing in it changes how a
 /// request is sent, repeated or answered.
@@ -249,6 +410,8 @@ pub struct JsonRpcClient {
     /// `lsp.rs`). Only that one method counts: any other message would make a
     /// server that chats forever look busy.
     progress: Arc<AtomicU64>,
+    /// The `textDocument/publishDiagnostics` notifications seen, by document.
+    diagnostics: Arc<Diagnostics>,
     /// Why the reader task stopped (end of output, or a protocol failure such
     /// as a frame over [`MAX_FRAME_BYTES`]); `None` while it runs. It is set
     /// before the pending requests are failed, so a request that arrives later
@@ -316,12 +479,14 @@ impl JsonRpcClient {
         let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_activity: LastActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
         let progress = Arc::new(AtomicU64::new(0));
+        let diagnostics = Arc::new(Diagnostics::default());
         let reader_writer = Arc::clone(&writer);
         let reader_pending = Arc::clone(&pending);
         let reader_ready = Arc::clone(&ready);
         let reader_is_ready = Arc::clone(&is_ready);
         let reader_last_activity = Arc::clone(&last_activity);
         let reader_progress = Arc::clone(&progress);
+        let reader_diagnostics = Arc::clone(&diagnostics);
         let (state_sender, state) = watch::channel(ServerState {
             busy: false,
             changes: 0,
@@ -339,6 +504,7 @@ impl JsonRpcClient {
                 reader_is_ready,
                 reader_last_activity,
                 reader_progress,
+                reader_diagnostics,
                 ready_predicate,
                 busy_predicate,
                 state_sender,
@@ -377,6 +543,7 @@ impl JsonRpcClient {
             state,
             last_activity,
             progress,
+            diagnostics,
             reader_stopped,
             #[cfg(windows)]
             job,
@@ -389,10 +556,69 @@ impl JsonRpcClient {
         self.progress.load(Ordering::Relaxed)
     }
 
+    /// How many `textDocument/publishDiagnostics` notifications the server
+    /// has sent for `uri` so far. Read it BEFORE sending the `didOpen` the
+    /// publication is awaited for, and pass it to
+    /// [`Self::wait_diagnostics`].
+    pub fn diagnostics_seen(&self, uri: &str) -> u64 {
+        self.diagnostics.seen(uri)
+    }
+
+    /// Waits until the server has published diagnostics for `uri` after the
+    /// reading `seen_before` ([`Self::diagnostics_seen`]) that answer the open
+    /// of `version` (a publication carrying an older `version` does not), for
+    /// at most `cap`. `false` when the cap passed first. A best-effort signal
+    /// (see [`Diagnostics`]). It waits on the server's own notifications,
+    /// never on a timer.
+    pub async fn wait_diagnostics(
+        &self,
+        uri: &str,
+        seen_before: u64,
+        version: i64,
+        cap: Duration,
+    ) -> bool {
+        self.diagnostics
+            .wait_after(uri, seen_before, version, cap)
+            .await
+    }
+
+    /// How many [`Self::wait_diagnostics`] calls ended at their cap.
+    pub fn diagnostics_wait_timeouts(&self) -> u64 {
+        self.diagnostics.wait_timeouts()
+    }
+
     /// Sends a JSON-RPC notification (no response expected).
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .await
+    }
+
+    /// [`Self::notify`] for a notification whose write must finish whether or
+    /// not the caller is still there: `hold` (a lock the notification is
+    /// ordered by) goes into the write task and lives until the write ends, so
+    /// a caller that is cancelled mid-write does not release it early; and
+    /// `written` runs in that task once the write succeeded (never after a
+    /// failure), so state that says "the server was sent this" is recorded
+    /// only for a notification that is on the pipe. Answers `hold` back when
+    /// the write succeeded.
+    pub async fn notify_holding<H: Send + 'static>(
+        &self,
+        method: &str,
+        params: Value,
+        hold: H,
+        written: impl FnOnce() + Send + 'static,
+    ) -> Result<H> {
+        let writer = Arc::clone(&self.writer);
+        let value = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        tokio::spawn(async move {
+            let outcome = writer.write_framed(&value).await;
+            if outcome.is_ok() {
+                written();
+            }
+            outcome.map(|()| hold)
+        })
+        .await
+        .context("language-server write task ended unexpectedly")?
     }
 
     /// Sends a JSON-RPC request and waits for the correlated response.
@@ -729,6 +955,7 @@ async fn read_messages(
     is_ready: Arc<std::sync::atomic::AtomicBool>,
     last_activity: LastActivity,
     progress: Arc<AtomicU64>,
+    diagnostics: Arc<Diagnostics>,
     ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     busy_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     state: watch::Sender<ServerState>,
@@ -776,6 +1003,12 @@ async fn read_messages(
         }
         if request_id.is_none() && method == Some("$/progress") {
             progress.fetch_add(1, Ordering::Relaxed);
+        }
+        if request_id.is_none()
+            && method == Some("textDocument/publishDiagnostics")
+            && let Some(uri) = message["params"]["uri"].as_str()
+        {
+            diagnostics.note(uri, message["params"]["version"].as_i64());
         }
         // Notifications (no id): evaluate readiness predicate.
         if request_id.is_none() && ready_predicate(&message) {
@@ -1164,5 +1397,148 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("shim-ran arg"),
             "{output:?}"
         );
+    }
+
+    /// The wait is on the document it was made for, and only on publications
+    /// after the reading it was given. The clock is paused: a wait that only
+    /// ends at its cap would be seen as such.
+    #[tokio::test(start_paused = true)]
+    async fn a_diagnostics_wait_ends_on_its_uri_not_another() {
+        let (a, b) = ("file:///work/a.py", "file:///work/b.py");
+        let diagnostics = Arc::new(Diagnostics::default());
+        // A publication for an earlier text of `a`: counted before the reading.
+        diagnostics.note(a, None);
+        let before = diagnostics.seen(a);
+        assert_eq!(before, 1);
+        assert_eq!(diagnostics.seen(b), 0);
+
+        let wait = tokio::spawn({
+            let diagnostics = Arc::clone(&diagnostics);
+            async move {
+                diagnostics
+                    .wait_after(a, before, 1, Duration::from_secs(3600))
+                    .await
+            }
+        });
+        // Lets the wait park on the notification.
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "nothing was published after the reading"
+        );
+
+        diagnostics.note(b, None);
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "another document's publication ended the wait"
+        );
+
+        diagnostics.note(a, None);
+        assert!(
+            wait.await.unwrap(),
+            "a publication for its own document ends it"
+        );
+        assert_eq!(diagnostics.wait_timeouts(), 0);
+    }
+
+    /// A publication that carries the version of an older text is not the
+    /// answer to a newer open; one without a version, or with a version at
+    /// least as new, is.
+    #[tokio::test(start_paused = true)]
+    async fn a_publication_for_an_older_version_does_not_end_the_wait() {
+        let uri = "file:///work/a.py";
+        let diagnostics = Arc::new(Diagnostics::default());
+        let before = diagnostics.seen(uri);
+        let wait = tokio::spawn({
+            let diagnostics = Arc::clone(&diagnostics);
+            async move {
+                diagnostics
+                    .wait_after(uri, before, 2, Duration::from_secs(3600))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // The late publication for version 1, the previous text.
+        diagnostics.note(uri, Some(1));
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "the older text's publication ended it");
+
+        diagnostics.note(uri, Some(2));
+        assert!(wait.await.unwrap(), "the open's own version ends it");
+
+        // Without a version it is counted as it always was.
+        let other = "file:///work/b.py";
+        let before = diagnostics.seen(other);
+        diagnostics.note(other, None);
+        assert!(
+            diagnostics
+                .wait_after(other, before, 5, Duration::from_secs(1))
+                .await
+        );
+        assert_eq!(diagnostics.wait_timeouts(), 0);
+    }
+
+    /// The same file spelled two ways is one document: ours comes from
+    /// `Url::from_file_path` (`file:///C:/...`), a `vscode-uri` server
+    /// publishes `file:///c%3A/...`.
+    #[tokio::test(start_paused = true)]
+    async fn a_publication_is_matched_to_its_file_whatever_the_spelling() {
+        let ours = "file:///C:/w/my%20dir/a.py";
+        let theirs = "file:///c%3A/w/my%20dir/a.py";
+        let other = "file:///c%3A/w/my%20dir/b.py";
+        assert_eq!(canonical_uri(ours), canonical_uri(theirs));
+        assert_ne!(canonical_uri(ours), canonical_uri(other));
+        // A non-file URI is its own key, and so is text that is no URI.
+        assert_eq!(canonical_uri("untitled:Untitled-1"), "untitled:Untitled-1");
+        assert_eq!(canonical_uri("not a uri"), "not a uri");
+
+        let diagnostics = Arc::new(Diagnostics::default());
+        let wait = tokio::spawn({
+            let diagnostics = Arc::clone(&diagnostics);
+            async move {
+                diagnostics
+                    .wait_after(ours, 0, 1, Duration::from_secs(3600))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        diagnostics.note(other, None);
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "another file's publication ended the wait"
+        );
+        diagnostics.note(theirs, None);
+        assert!(
+            wait.await.unwrap(),
+            "the other spelling of its file ends it"
+        );
+        assert_eq!(diagnostics.seen(ours), 1);
+        assert_eq!(diagnostics.seen(theirs), 1);
+        assert_eq!(diagnostics.wait_timeouts(), 0);
+    }
+
+    /// A server that does not publish ends a wait at its cap, and the next
+    /// wait waits again: one run-out wait is not proof that none will come.
+    #[tokio::test(start_paused = true)]
+    async fn every_wait_that_reaches_its_cap_is_counted_and_waits_in_full() {
+        let diagnostics = Diagnostics::default();
+        let cap = Duration::from_secs(10);
+
+        for (index, uri) in ["file:///work/a.py", "file:///work/b.py"]
+            .into_iter()
+            .enumerate()
+        {
+            let started = tokio::time::Instant::now();
+            assert!(!diagnostics.wait_after(uri, 0, 1, cap).await);
+            assert_eq!(started.elapsed(), cap, "{uri}: the wait ran to its cap");
+            assert_eq!(diagnostics.wait_timeouts(), index as u64 + 1);
+        }
+
+        diagnostics.note("file:///work/c.py", None);
+        assert!(diagnostics.wait_after("file:///work/c.py", 0, 1, cap).await);
+        assert_eq!(diagnostics.wait_timeouts(), 2);
     }
 }
