@@ -1,0 +1,97 @@
+{
+  "effective_policy": {
+    "hash": "abe626e6377c1a59",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": false,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": false,
+        "id": "structure.contains",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "grep.structural is off ([run_profile.grep] structural = false): the map gives no edges"
+  ],
+  "question": "Combine",
+  "results": [
+    {
+      "depth": 0,
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 16,
+        "line": 4,
+        "path": "src/Calculator.cs"
+      },
+      "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+      "via": null,
+      "witness": null
+    }
+  ],
+  "seed_hits": [],
+  "seed_sites": {
+    "sym:rust:Calculator.cs::Combine/fn": {
+      "col": 16,
+      "line": 4,
+      "path": "src/Calculator.cs"
+    }
+  },
+  "seed_source": "given",
+  "seeds": [
+    "sym:rust:Calculator.cs::Combine/fn"
+  ],
+  "status": "complete",
+  "steering": [],
+  "stop_reason": "complete",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "first_stage": {
+      "exact": 0,
+      "seeds": 1,
+      "walk": 0
+    },
+    "hops": 0,
+    "per_map": {
+      "graph.scip": {
+        "expands": 1
+      }
+    },
+    "physical_external_calls": 0,
+    "physical_map_calls": 1,
+    "pops": 1,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 0
+  },
+  "trace": {
+    "events": 3,
+    "hash": "73b1abec135d6ef7"
+  }
+}
