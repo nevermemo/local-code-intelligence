@@ -22,10 +22,10 @@ use crate::{
     edge::{CONF_MAX, Edge, MapCard, WitnessClass, sort_edges},
 };
 use futures::FutureExt;
-use lci_core::node::NodeId;
+use lci_core::node::{NodeId, SymbolKind};
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     panic::AssertUnwindSafe,
     sync::OnceLock,
     time::Instant,
@@ -196,6 +196,101 @@ pub fn fuse(edges: Vec<Edge>) -> Vec<FusedEdge> {
     fused
 }
 
+/// An authority map's answer overruling the edges of subordinate maps (a
+/// language server over a stale index). Applied before fusion by
+/// [`arbitrate`]: per expansion and claim family where the authority offered
+/// at least one edge, a subordinate edge to a destination the authority also
+/// names is confirmed, one it does not name is removed and counted as
+/// overruled. A family the authority offered nothing in is left alone (no
+/// answer is not a disagreement), the authority's own edges are never
+/// touched, and only symbol destinations of [`Arbitration::kinds`] are
+/// arbitrated (the kinds the authority can place and so can confirm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arbitration {
+    /// The map whose answer wins.
+    pub authority: MapId,
+    /// The maps that give way, each for one claim family (a map may be listed
+    /// for several).
+    pub subordinate: Vec<(MapId, ClaimFamily)>,
+    /// The symbol kinds of the destinations that may be overruled.
+    pub kinds: Vec<SymbolKind>,
+}
+
+impl Arbitration {
+    /// Whether `map` is a subordinate map (for any family).
+    pub fn is_subordinate(&self, map: &str) -> bool {
+        self.subordinate.iter().any(|(id, _)| *id == map)
+    }
+
+    /// Whether an edge to `dst` can be arbitrated: a symbol of a listed kind.
+    fn arbitrates(&self, dst: &NodeId) -> bool {
+        matches!(dst, NodeId::Symbol(key) if self.kinds.contains(&key.kind))
+    }
+}
+
+/// What an arbitration did to the edges of one map (or, summed, of a walk).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArbitrationCounts {
+    /// Edges the authority also named.
+    pub confirmed: u32,
+    /// Edges the authority did not name: removed.
+    pub overruled: u32,
+}
+
+impl ArbitrationCounts {
+    /// Adds `other` to these counts.
+    pub fn add(&mut self, other: Self) {
+        self.confirmed = self.confirmed.saturating_add(other.confirmed);
+        self.overruled = self.overruled.saturating_add(other.overruled);
+    }
+}
+
+/// Applies `a` to the raw edges of one expansion (`raw`, in registry order,
+/// before [`fuse`]) and sets [`ExpandCall::arbitration`] on the call of every
+/// subordinate map (`Some`, zero when it had nothing arbitrated). Edges that
+/// stay keep their order.
+pub fn arbitrate(raw: &mut Vec<Edge>, calls: &mut [ExpandCall], a: &Arbitration) {
+    // What the authority named at this node, per family. A family it offered
+    // no edge of has no entry: it stands.
+    let mut answered: HashMap<ClaimFamily, HashSet<NodeId>> = HashMap::new();
+    for edge in raw.iter().filter(|edge| edge.map == a.authority) {
+        answered
+            .entry(ClaimFamily::of(edge.kind))
+            .or_default()
+            .insert(edge.dst.clone());
+    }
+    let mut counts: BTreeMap<MapId, ArbitrationCounts> = BTreeMap::new();
+    raw.retain(|edge| {
+        let family = ClaimFamily::of(edge.kind);
+        if edge.map == a.authority
+            || !a
+                .subordinate
+                .iter()
+                .any(|(map, of)| *map == edge.map && *of == family)
+            || !a.arbitrates(&edge.dst)
+        {
+            return true;
+        }
+        let Some(named) = answered.get(&family) else {
+            return true;
+        };
+        let count = counts.entry(edge.map).or_default();
+        if named.contains(&edge.dst) {
+            count.confirmed += 1;
+            true
+        } else {
+            count.overruled += 1;
+            false
+        }
+    });
+    for call in calls
+        .iter_mut()
+        .filter(|call| call.map != a.authority && a.is_subordinate(call.map))
+    {
+        call.arbitration = Some(counts.get(call.map).copied().unwrap_or_default());
+    }
+}
+
 /// One map's part in an expansion.
 #[derive(Debug, Clone)]
 pub struct ExpandCall {
@@ -210,6 +305,10 @@ pub struct ExpandCall {
     /// adjacency, which makes no call). Only reported: it is left out of the
     /// comparison, so equal expansions are equal whatever the machine did.
     pub ms: f64,
+    /// What an [`Arbitration`] did to this map's edges: `Some` for a
+    /// subordinate map whenever one is attached to the source, else `None`.
+    /// `n_edges` stays what the map offered.
+    pub arbitration: Option<ArbitrationCounts>,
 }
 
 impl PartialEq for ExpandCall {
@@ -218,6 +317,7 @@ impl PartialEq for ExpandCall {
             && self.n_edges == other.n_edges
             && self.cost == other.cost
             && self.failure == other.failure
+            && self.arbitration == other.arbitration
     }
 }
 
@@ -306,6 +406,8 @@ pub struct OnTheFly<'r, 'a, 'v> {
     blobs: OnceLock<FileBlobs>,
     /// What hops are priced with (see [`CostTable`]).
     costs: CostTable,
+    /// The arbitration applied between `ask` and `fuse`, when attached.
+    arbitration: Option<Arbitration>,
 }
 
 impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
@@ -317,7 +419,16 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
             off: HashSet::new(),
             blobs: OnceLock::new(),
             costs: CostTable::record(registry),
+            arbitration: None,
         }
+    }
+
+    /// Lets the authority of `arbitration` overrule the subordinate maps'
+    /// edges in [`EdgeSource::edges`] (default: none attached, no edge
+    /// changes). [`OnTheFly::ask`] still returns the raw answers.
+    pub fn with_arbitration(mut self, arbitration: Arbitration) -> Self {
+        self.arbitration = Some(arbitration);
+        self
     }
 
     /// Prices hops with `costs` instead of the maps' p50 as of now, so that
@@ -398,6 +509,7 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
             cost,
             failure,
             ms: started.elapsed().as_secs_f64() * 1000.0,
+            arbitration: None,
         };
         let remaining = budget.deadline.saturating_duration_since(Instant::now());
         let answer = tokio::time::timeout(
@@ -437,7 +549,10 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
 #[crate::async_trait]
 impl EdgeSource for OnTheFly<'_, '_, '_> {
     async fn edges(&self, node: &NodeId, budget: Budget) -> Expansion {
-        let (all, calls) = self.ask(node, budget).await;
+        let (mut all, mut calls) = self.ask(node, budget).await;
+        if let Some(arbitration) = &self.arbitration {
+            arbitrate(&mut all, &mut calls, arbitration);
+        }
         Expansion {
             edges: fuse(all),
             calls,
