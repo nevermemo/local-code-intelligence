@@ -1,0 +1,133 @@
+{
+  "completeness": {
+    "complete": false,
+    "degraded": [
+      "lsp.live"
+    ],
+    "estimate": null,
+    "why": "degraded"
+  },
+  "effective_policy": {
+    "hash": "cf3f55c8144165ee",
+    "ladder": [],
+    "maps": [
+      {
+        "enabled": true,
+        "id": "seeds.hybrid",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "seeds.scip_names",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "graph.scip",
+        "weight": 1.0
+      },
+      {
+        "enabled": true,
+        "id": "structure.contains",
+        "weight": 1.0
+      }
+    ],
+    "preset": "explore",
+    "rules": [],
+    "stops": null,
+    "tau": null
+  },
+  "mode": "traverse",
+  "notes": [
+    "lsp.live is unavailable: no language server is available (rust-analyzer: start definitely-missing-rust-analyzer: program not found)",
+    "partial answer (degraded): lsp.live was unavailable or had failed calls, so the results lack what it would add"
+  ],
+  "question": "Combine",
+  "results": [
+    {
+      "depth": 0,
+      "freshness": "unverified",
+      "maps": [],
+      "n_maps": 0,
+      "node": "sym:rust:Calculator.cs::Combine/fn",
+      "origin": "seed",
+      "potential": 1.0,
+      "ranked_potential": 1.0,
+      "seed_rank": 1,
+      "site": {
+        "col": 16,
+        "line": 4,
+        "path": "src/Calculator.cs"
+      },
+      "text": "sym:rust:Calculator.cs::Combine/fn | seed | p1.00 d0",
+      "via": null,
+      "witness": null
+    },
+    {
+      "depth": 1,
+      "fanout": 1,
+      "freshness": "unverified",
+      "maps": [
+        "structure.contains"
+      ],
+      "n_maps": 1,
+      "node": "file:src/Calculator.cs",
+      "node_kind": "file",
+      "origin": "walk",
+      "overlap": 0.0,
+      "potential": 0.5,
+      "ranked_potential": 0.5,
+      "site": {
+        "col": 1,
+        "line": 1,
+        "path": "src/Calculator.cs"
+      },
+      "text": "file:src/Calculator.cs | structure.contains/exact | p0.50 d1",
+      "via": "structure.contains",
+      "witness": "exact"
+    }
+  ],
+  "seed_hits": [],
+  "seed_sites": {
+    "sym:rust:Calculator.cs::Combine/fn": {
+      "col": 16,
+      "line": 4,
+      "path": "src/Calculator.cs"
+    }
+  },
+  "seed_source": "given",
+  "seeds": [
+    "sym:rust:Calculator.cs::Combine/fn"
+  ],
+  "status": "complete",
+  "steering": [],
+  "stop_reason": "complete",
+  "totals": {
+    "cross_map_hops": 0,
+    "external_calls": 0,
+    "first_stage": {
+      "exact": 0,
+      "seeds": 1,
+      "walk": 1
+    },
+    "hops": 1,
+    "per_map": {
+      "graph.scip": {
+        "expands": 1
+      },
+      "structure.contains": {
+        "expands": 2
+      }
+    },
+    "physical_external_calls": 0,
+    "physical_map_calls": 3,
+    "pops": 2,
+    "steers": 0,
+    "stops": 0,
+    "tokens": 12
+  },
+  "trace": {
+    "events": 5,
+    "hash": "1487973a5eb23a20"
+  }
+}
