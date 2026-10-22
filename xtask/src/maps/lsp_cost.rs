@@ -1940,8 +1940,17 @@ fn merged_report(members: Vec<(&PathBuf, (RunData, ReportMeta))>) -> String {
             .keys()
             .map(|(condition, arm)| format!("{condition}/{arm}"))
             .collect();
+        // Per run, since the one Setup block is the last run's and `--places`
+        // changes what an arm measures (a run before the flag had none: scip).
+        let places = run_meta
+            .summary
+            .iter()
+            .find(|(key, _)| key == "places")
+            .map_or("scip", |(_, value)| {
+                value.split_whitespace().next().unwrap_or("scip")
+            });
         notes.push(format!(
-            "merged run {} ({}): {}",
+            "merged run {} ({}, places {places}): {}",
             dir.file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
             run_meta.stamp,
@@ -2576,6 +2585,53 @@ mod tests {
         assert_eq!(names, ["base", "shared"]);
         let base = quiet.arms[0].1.as_ref().unwrap();
         assert_eq!(base[0].machine_cpu_pct, 95.0);
+    }
+
+    #[test]
+    fn a_merged_report_names_the_places_of_every_run() {
+        let run = |arm: &str| {
+            let mut samples = BTreeMap::new();
+            samples.insert(
+                ("quiet".to_owned(), arm.to_owned()),
+                vec![sample(1, 1, 100.0, 2, 4)],
+            );
+            RunData {
+                conditions: vec![CondMeta {
+                    condition: "quiet".into(),
+                    ..CondMeta::default()
+                }],
+                samples,
+            }
+        };
+        let meta = |stamp: &str, places: Option<&str>| ReportMeta {
+            stamp: stamp.into(),
+            summary: places
+                .map(|p| vec![("places".to_owned(), p.to_owned())])
+                .unwrap_or_default(),
+            ..ReportMeta::default()
+        };
+        let (old, new) = (PathBuf::from("old"), PathBuf::from("new"));
+        let report = merged_report(vec![
+            (&old, (run("base"), meta("s1", None))),
+            (
+                &new,
+                (
+                    run("shared"),
+                    meta(
+                        "s2",
+                        Some("outline (`[run_profile.lsp] places`, every arm)"),
+                    ),
+                ),
+            ),
+        ]);
+        assert!(
+            report.contains("merged run old (s1, places scip): quiet/base"),
+            "{report}"
+        );
+        assert!(
+            report.contains("merged run new (s2, places outline): quiet/shared"),
+            "{report}"
+        );
     }
 
     #[test]
