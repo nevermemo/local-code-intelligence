@@ -157,6 +157,19 @@ impl RepoMap {
         (scores, done)
     }
 
+    /// The personalisation a list of scored matches gives: `(node index,
+    /// score)` for the matches that are nodes of this graph and have a finite,
+    /// positive score. Empty when there is none, and the caller then ranks
+    /// nothing: [`Self::pagerank`] would fall back to a uniform jump, whose top
+    /// nodes are the graph's global hubs, and no question asks for those.
+    fn personalisation(&self, scored: Vec<(NodeId, String, f64)>) -> Vec<(usize, f64)> {
+        scored
+            .into_iter()
+            .filter(|(_, _, score)| score.is_finite() && *score > 0.0)
+            .filter_map(|(node, _, score)| Some((*self.index.get(&node)?, score)))
+            .collect()
+    }
+
     /// The best `limit` nodes for the question: the BM25 entity index's best
     /// [`PERSONALISE_K`] matches are the personalisation, the rank runs with the
     /// constants above, and the nodes that gained any mass come back best first
@@ -168,16 +181,12 @@ impl RepoMap {
         question: &str,
         limit: usize,
     ) -> (Vec<(NodeId, String, f64)>, Stats) {
-        let personal: Vec<(usize, f64)> = bm25
-            .matches(question, PERSONALISE_K)
-            .into_iter()
-            .filter_map(|(node, _, score)| Some((*self.index.get(&node)?, score)))
-            .collect();
-        let none = Stats {
-            iterations: 0,
-            personalised: 0,
-        };
-        if !personal.iter().any(|(_, weight)| *weight > 0.0) {
+        let personal = self.personalisation(bm25.matches(question, PERSONALISE_K));
+        if personal.is_empty() {
+            let none = Stats {
+                iterations: 0,
+                personalised: 0,
+            };
             return (Vec::new(), none);
         }
         let personalised = personal.len();
@@ -519,6 +528,28 @@ mod tests {
         assert!(none.is_empty());
         assert_eq!((stats.iterations, stats.personalised), (0, 0));
         assert!(repo.matches(&bm25, "", 8).0.is_empty());
+    }
+
+    #[test]
+    fn a_match_without_a_finite_positive_score_is_no_personalisation() {
+        let scip = graph(&[("a", "h"), ("b", "h")]);
+        let repo = RepoMap::new(&scip);
+        let scored = |score: f64| (scip.node_id(at(&scip, "a")).clone(), "a".to_owned(), score);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            assert!(repo.personalisation(vec![scored(bad)]).is_empty(), "{bad}");
+        }
+        // Only the usable ones count, and a node the graph lacks counts for nothing.
+        let other = scip.node_id(at(&scip, "b")).clone();
+        let mixed = vec![
+            scored(f64::NAN),
+            (other, "b".to_owned(), 2.0),
+            scored(1.0),
+            (NodeId::file("elsewhere.rs").unwrap(), "x".to_owned(), 3.0),
+        ];
+        assert_eq!(
+            repo.personalisation(mixed),
+            [(at(&scip, "b"), 2.0), (at(&scip, "a"), 1.0)]
+        );
     }
 
     #[test]
