@@ -539,3 +539,17 @@ fn strip_lci_env_named(
     }
     command
 }
+
+/// Notes without the ones the tree barrier adds for a language server a call
+/// found running or restarted (`lsp: <provider> kept session; ...`,
+/// `lsp: <provider> restarted: ...`, N104, N109): which of two calls starts
+/// the server decides which of them carries such a note, so tests that compare
+/// two calls' notes compare them without these.
+#[allow(dead_code)]
+fn without_barrier_notes(notes: &[String]) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|note| !note.starts_with("lsp: "))
+        .cloned()
+        .collect()
+}

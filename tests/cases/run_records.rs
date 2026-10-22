@@ -83,7 +83,10 @@ async fn a_registry_run_writes_a_schema_valid_run_record() {
         .unwrap();
     assert_eq!(recorded.value.rows, plain.rows);
     assert_eq!(recorded.value.warnings, plain.warnings);
-    assert_eq!(recorded.value.notes, plain.notes);
+    assert_eq!(
+        without_barrier_notes(&recorded.value.notes),
+        without_barrier_notes(&plain.notes)
+    );
 
     let (_, lines) = read_lines(&path);
     for line in &lines {
@@ -274,7 +277,10 @@ async fn an_unwritable_record_directory_never_fails_the_run() {
         .unwrap();
     assert_eq!(recorded.value.rows, plain.rows);
     assert_eq!(recorded.value.warnings, plain.warnings);
-    assert_eq!(recorded.value.notes, plain.notes);
+    assert_eq!(
+        without_barrier_notes(&recorded.value.notes),
+        without_barrier_notes(&plain.notes)
+    );
     task.abort();
 }
 

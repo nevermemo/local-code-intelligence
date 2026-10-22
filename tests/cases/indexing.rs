@@ -3736,18 +3736,6 @@ fn spawn_count(state: &Path) -> u64 {
         .unwrap()
 }
 
-/// A search report's notes without the ones the tree barrier adds for a
-/// language server the search found running or restarted (`lsp: <provider>
-/// kept session; ...`, `lsp: <provider> restarted: ...`, N104): the tests here
-/// are about the notes of a start and a budget, not of a kept session.
-fn without_barrier_notes(notes: &[String]) -> Vec<String> {
-    notes
-        .iter()
-        .filter(|note| !note.starts_with("lsp: "))
-        .cloned()
-        .collect()
-}
-
 /// The note of a language server a search or a map run found running.
 #[cfg(feature = "map-equivalence")]
 const KEPT_CSHARP_LS: &str = "lsp: csharp-ls kept session; tree stamp unchanged since N s ago";
