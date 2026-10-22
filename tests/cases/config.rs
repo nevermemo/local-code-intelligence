@@ -573,6 +573,35 @@ impl Serve {
         Self { child, log }
     }
 
+    /// Polls the log until `serve` reports the port it bound, failing if the
+    /// process exits first.
+    async fn wait_bound_port(&mut self) -> u16 {
+        const MARKER: &str = "MCP: http://127.0.0.1:";
+        for _ in 0..240 {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "serve exited early ({status}): {}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            if let Some(start) = log.find(MARKER) {
+                let digits: String = log[start + MARKER.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(port) = digits.parse() {
+                    return port;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!(
+            "serve never reported its port: {}",
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        );
+    }
+
     /// Polls `/health` on `port` until it answers, failing if the process
     /// exits first.
     async fn wait_healthy(&mut self, port: u16, client: &reqwest::Client) {
@@ -658,6 +687,51 @@ async fn serve_binds_the_port_the_overlay_sets_and_the_openapi_document_names_it
     // Serving created the data directory; the earlier tests prove `config`
     // alone does not.
     assert!(sandbox.data_dir().exists());
+}
+
+/// `serve --port 0` takes any free port; the log, `/openapi.json` and the
+/// Origin check must all name the port it got, never 0.
+#[tokio::test]
+async fn serve_port_zero_names_the_bound_port_in_the_log_openapi_and_origin_check() {
+    let sandbox = Sandbox::new("");
+    let mut server = Serve::spawn(&sandbox, &["serve", "--port", "0"], &[]);
+    let client = reqwest::Client::new();
+    let port = server.wait_bound_port().await;
+    assert_ne!(port, 0);
+    server.wait_healthy(port, &client).await;
+
+    let document: Value = client
+        .get(format!("http://127.0.0.1:{port}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        document["servers"][0]["url"],
+        format!("http://127.0.0.1:{port}")
+    );
+    let with_origin = |origin: String| {
+        client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .header("Origin", origin)
+            .send()
+    };
+    assert!(
+        with_origin(format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        with_origin("http://127.0.0.1:0".into())
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
 }
 
 #[tokio::test]

@@ -343,9 +343,28 @@ pub(crate) async fn probe_endpoint_reach(
     Ok(())
 }
 
+/// The OpenAI-compatible model listing URL for a configured service URL: the
+/// configured URL's path prefix followed by `/v1/models`. `…/prefix/v1` (the
+/// embedder form) lists at `…/prefix/v1/models`, and an endpoint URL such as
+/// `…/prefix/rerank` or `…/prefix/embeddings` at `…/prefix/v1/models`. A URL
+/// with no path lists at `/v1/models`. The query and fragment are dropped.
+pub(crate) fn model_listing_url(url: &reqwest::Url) -> reqwest::Url {
+    let path = url.path().trim_end_matches('/');
+    let path = ["/rerank", "/embeddings"]
+        .iter()
+        .find_map(|endpoint| path.strip_suffix(endpoint))
+        .unwrap_or(path);
+    let prefix = path.strip_suffix("/v1").unwrap_or(path);
+    let mut models_url = url.clone();
+    models_url.set_path(&format!("{prefix}/v1/models"));
+    models_url.set_query(None);
+    models_url.set_fragment(None);
+    models_url
+}
+
 /// Reads the model ids the OpenAI-compatible listing endpoint derived from
-/// the configured URL's origin (`/v1/models`) reports. A 404/405 means the
-/// listing is not exposed. Errors identify the dependency generically via
+/// the configured URL (see [`model_listing_url`]) reports. A 404/405 means
+/// the listing is not exposed. Errors identify the dependency generically via
 /// `label` (with HTTP status where relevant) because configured URLs may
 /// contain credentials or query secrets that must not be echoed into
 /// readiness reports.
@@ -359,10 +378,7 @@ pub(crate) async fn fetch_model_ids(
         Ok(u) => u,
         Err(e) => return ModelIds::Failed(format!("invalid {label} URL: {e}")),
     };
-    let mut models_url = parsed;
-    models_url.set_path("/v1/models");
-    models_url.set_query(None);
-    models_url.set_fragment(None);
+    let models_url = model_listing_url(&parsed);
     let response = match client.get(models_url).timeout(timeout).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -447,6 +463,38 @@ mod tests {
         assert_eq!(
             elsewhere.detail.as_deref(),
             Some("data_dir is 300 characters")
+        );
+    }
+
+    #[test]
+    fn model_listing_url_keeps_the_configured_path_prefix() {
+        let derive = |url: &str| model_listing_url(&reqwest::Url::parse(url).unwrap()).to_string();
+        // Defaults and origin-only URLs list at the origin's `/v1/models`.
+        assert_eq!(
+            derive("http://localhost:8766/v1"),
+            "http://localhost:8766/v1/models"
+        );
+        assert_eq!(
+            derive("http://localhost:8766/v1/"),
+            "http://localhost:8766/v1/models"
+        );
+        assert_eq!(
+            derive("http://localhost:8767/rerank"),
+            "http://localhost:8767/v1/models"
+        );
+        assert_eq!(derive("http://h:1"), "http://h:1/v1/models");
+        // A path prefix is kept, and the query and fragment are dropped.
+        assert_eq!(
+            derive("https://gateway.test/models/embed/v1"),
+            "https://gateway.test/models/embed/v1/models"
+        );
+        assert_eq!(
+            derive("https://gateway.test/team/rerank?key=secret#frag"),
+            "https://gateway.test/team/v1/models"
+        );
+        assert_eq!(
+            derive("https://gateway.test/team/v1/embeddings"),
+            "https://gateway.test/team/v1/models"
         );
     }
 
