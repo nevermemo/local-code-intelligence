@@ -21,7 +21,9 @@
 //! processes.
 
 use crate::config::JavaLspConfig;
-use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
+use crate::lsp::adapter::{
+    InitializeVariant, LspAdapter, SentTexts, initialize_params_for, open_if_changed,
+};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use crate::workspace;
 use anyhow::{Context, Result};
@@ -326,30 +328,7 @@ impl LspAdapter for JavaServer {
         if !self.enabled() {
             return None;
         }
-        let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
-        let name = root
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("workspace")
-            .to_string();
-        Some(json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "definition": {},
-                    "references": {},
-                    "synchronization": {}
-                },
-                "workspace": {
-                    "symbol": {},
-                    "workspaceFolders": true,
-                    "configuration": true
-                }
-            },
-            "workspaceFolders": [{ "uri": root_uri, "name": name }],
-            "initializationOptions": {}
-        }))
+        initialize_params_for(root, InitializeVariant::Base)
     }
 
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
@@ -476,6 +455,39 @@ mod tests {
             assert_eq!(params["processId"], std::process::id());
             assert!(params["rootUri"].as_str().is_some());
         }
+    }
+
+    #[test]
+    fn the_java_initialize_params_are_pinned() {
+        let (root, uri) = crate::lsp::adapter::contract::pin_root();
+        let jdtls = fake_jdtls_install();
+        let config = config_with_java(JavaLspConfig {
+            path: Some(jdtls.path().to_string_lossy().into_owned()),
+            args: vec![],
+            disabled: false,
+        });
+        let params = JavaServer::new(&config, Duration::from_secs(30)).initialize_params(root);
+        assert_eq!(
+            params,
+            Some(json!({
+                "processId": std::process::id(),
+                "rootUri": uri,
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {},
+                        "synchronization": {}
+                    },
+                    "workspace": {
+                        "symbol": {},
+                        "workspaceFolders": true,
+                        "configuration": true
+                    }
+                },
+                "workspaceFolders": [{ "uri": uri, "name": "proj" }],
+                "initializationOptions": {}
+            }))
+        );
     }
 
     #[test]
