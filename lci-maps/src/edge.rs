@@ -241,8 +241,10 @@ pub fn cap_edges(edges: &mut Vec<Edge>, cap: usize) {
 /// capped edges (`edges_of` gives them and how many there were before the
 /// cap), merged, sorted, one hit per destination, cut to the request's limit.
 /// Hits score `conf` as a unit interval and cite the site through `detail`.
-/// A cap that dropped edges makes the status `Partial`, with `noun` in the note.
-pub fn ranked_hits(
+/// `cap` is only reported, not applied here (`edges_of` applies it): a cap
+/// that dropped edges makes the status `Partial`, its note naming `noun` and
+/// `cap`.
+pub fn scip_ranked_hits(
     descriptor: &MapDescriptor,
     request: &MapRequest<'_>,
     view: &SnapshotView<'_>,

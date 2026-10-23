@@ -48,7 +48,8 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, FreshnessModel, Map, MapDescriptor, MapId,
     MapRequest, MapResponse, SnapshotView, SourceLabel,
     edge::{
-        CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges, ranked_hits,
+        CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges,
+        scip_ranked_hits,
     },
     impact::ImpactIndex,
     live_grep::CostLog,
@@ -321,7 +322,7 @@ impl Map for ImpactMap {
     }
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
-        ranked_hits(
+        scip_ranked_hits(
             &self.descriptor,
             request,
             view,

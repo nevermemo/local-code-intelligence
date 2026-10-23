@@ -543,3 +543,85 @@ async fn graph_scip_and_scip_impact_over_one_index_corroborate_once() {
     );
     assert_eq!(reached.n_maps(), 1, "one index, one piece of evidence");
 }
+
+// ---- pins: the seeded `query` output -------------------------------------------------
+
+async fn ask(map: &ImpactMap, seeds: &[(NodeId, f32)], limit: usize) -> MapResponse {
+    let params = serde_json::Value::Null;
+    map.query(
+        &MapRequest {
+            text: None,
+            seeds,
+            limit,
+            budget: budget(),
+            params: &params,
+            as_of: None,
+        },
+        &view(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn query_pins_the_partial_note_and_the_first_hit() {
+    let (ix, target) = crowd(100);
+    let map = ImpactMap::new(ix, &|_| None, ImpactOptions { cap: 5 });
+    let node = map.node_of(&target).unwrap().clone();
+    let response = ask(&map, &[(node.clone(), 1.0)], 100).await;
+    assert_eq!(
+        response.status,
+        MapStatus::Partial {
+            note: Some("95 more users than the cap of 5 were not offered".to_string()),
+            warning: None,
+        }
+    );
+    assert_eq!(response.hits.len(), 5);
+    let hit = &response.hits[0];
+    assert_eq!(hit.rank, 1);
+    assert_eq!(hit.score, Some(1.0));
+    assert_eq!(response.hits[4].rank, 5);
+    assert_eq!(hit.evidence.len(), 1);
+    let evidence = &hit.evidence[0];
+    assert_eq!(evidence.via, Some(node));
+    assert_eq!(evidence.edge, EdgeKind::CallsOrRefs);
+    assert_eq!(evidence.label, crate::SourceLabel::Scip);
+    assert_eq!(
+        evidence.detail.as_deref(),
+        Some("references the seed at a.rs:2")
+    );
+}
+
+#[tokio::test]
+async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
+    let map = map();
+    let foo = map.node_of(&sym("a/Foo#")).unwrap().clone();
+    let run = method("run");
+    // Both seeds reach `use_foo` (Foo at a.rs:3 col 15, run at a.rs:3 col 20);
+    // only Foo reaches the enum E.
+    let seeds = [(foo.clone(), 1.0), (run, 1.0)];
+    let all = ask(&map, &seeds, 10).await;
+    assert_eq!(all.status, MapStatus::Ok);
+    let dsts: Vec<&NodeId> = all.hits.iter().map(|h| &h.node).collect();
+    assert_eq!(dsts.len(), 2, "{dsts:?}");
+    let use_foo = all
+        .hits
+        .iter()
+        .find(|h| h.node == function("use_foo"))
+        .expect("use_foo is offered once");
+    // The first edge in sort order survives: the one with the smaller site.
+    assert_eq!(use_foo.evidence[0].via, Some(foo));
+    assert_eq!(
+        use_foo.evidence[0].detail.as_deref(),
+        Some("references the seed at a.rs:3")
+    );
+    assert_eq!(
+        all.hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    let one = ask(&map, &seeds, 1).await;
+    assert_eq!(one.hits.len(), 1);
+    assert_eq!(one.hits[0].rank, 1);
+    assert_eq!(one.hits[0].node, all.hits[0].node);
+    assert_eq!(one.status, MapStatus::Ok);
+}

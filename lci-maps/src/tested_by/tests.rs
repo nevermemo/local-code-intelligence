@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    SnapshotRef,
+    MapStatus, SnapshotRef,
     edge::sort_edges,
     impact::ImpactIndex,
     kit_c3::check_expand,
@@ -286,6 +286,117 @@ async fn query_offers_one_hit_per_test_unit_with_scip_evidence() {
             .as_deref()
             .is_some_and(|d| d.starts_with("tests the seed at tests/a_test.rs:1"))
     );
+}
+
+// ---- pins: the seeded `query` output -------------------------------------------------
+
+async fn ask(map: &TestedByMap, seeds: &[(NodeId, f32)], limit: usize) -> MapResponse {
+    let params = serde_json::Value::Null;
+    map.query(
+        &MapRequest {
+            text: None,
+            seeds,
+            limit,
+            budget: budget(),
+            params: &params,
+            as_of: None,
+        },
+        &view(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn query_pins_the_partial_note_and_the_first_hit() {
+    let (ix, target) = crowd(EXPAND_LIMIT + 5);
+    let shared = impact(ix);
+    let map = TestedByMap::new(shared.clone());
+    let node = shared.node_of(&target).unwrap().clone();
+    let response = ask(&map, &[(node.clone(), 1.0)], 3).await;
+    assert_eq!(
+        response.status,
+        MapStatus::Partial {
+            note: Some("5 more test units than the cap of 256 were not offered".to_string()),
+            warning: None,
+        }
+    );
+    assert_eq!(response.hits.len(), 3);
+    let hit = &response.hits[0];
+    assert_eq!(hit.rank, 1);
+    assert_eq!(hit.score, Some(1.0));
+    assert_eq!(response.hits[2].rank, 3);
+    assert_eq!(name_of(&hit.node), "t_000");
+    assert_eq!(hit.evidence.len(), 1);
+    let evidence = &hit.evidence[0];
+    assert_eq!(evidence.via, Some(node));
+    assert_eq!(evidence.edge, EdgeKind::Tests);
+    assert_eq!(evidence.label, SourceLabel::Scip);
+    assert_eq!(
+        evidence.detail.as_deref(),
+        Some("tests the seed at tests/crowd.rs:1")
+    );
+}
+
+#[tokio::test]
+async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
+    let foo = sym("a/foo().");
+    let bar = sym("a/bar().");
+    let t_both = sym("a_test/t_both().");
+    let t_foo = sym("a_test/t_foo().");
+    let docs = vec![
+        RawDocument {
+            path: "src/a.rs".into(),
+            occurrences: vec![
+                occ((0, 3, 0, 6), &foo, 1, Some((0, 0, 0, 12))),
+                occ((1, 3, 1, 6), &bar, 1, Some((1, 0, 1, 12))),
+            ],
+        },
+        RawDocument {
+            path: "tests/a_test.rs".into(),
+            occurrences: vec![
+                occ((0, 3, 0, 9), &t_both, 1, Some((0, 0, 0, 30))),
+                occ((0, 12, 0, 15), &foo, 0, None),
+                occ((0, 20, 0, 23), &bar, 0, None),
+                occ((1, 3, 1, 9), &t_foo, 1, Some((1, 0, 1, 30))),
+                occ((1, 12, 1, 15), &foo, 0, None),
+            ],
+        },
+    ];
+    let kinds: HashMap<String, Kind> = [foo.clone(), bar.clone(), t_both, t_foo]
+        .into_iter()
+        .map(|s| (s, Kind::Function))
+        .collect();
+    let shared = impact(ImpactIndex::build(docs, &kinds, None));
+    let map = TestedByMap::new(shared.clone());
+    let foo = shared.node_of(&foo).unwrap().clone();
+    let bar = shared.node_of(&bar).unwrap().clone();
+    // Both seeds reach t_both (foo at tests/a_test.rs:1 col 12, bar at col 20);
+    // only foo reaches t_foo.
+    let seeds = [(foo.clone(), 1.0), (bar, 1.0)];
+    let all = ask(&map, &seeds, 10).await;
+    assert_eq!(all.status, MapStatus::Ok);
+    assert_eq!(all.hits.len(), 2, "{:?}", all.hits);
+    assert_eq!(
+        all.hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let both = all
+        .hits
+        .iter()
+        .find(|h| name_of(&h.node) == "t_both")
+        .expect("t_both is offered once");
+    // The first edge in sort order survives: the one with the smaller site.
+    assert_eq!(both.evidence[0].via, Some(foo));
+    assert_eq!(
+        both.evidence[0].detail.as_deref(),
+        Some("tests the seed at tests/a_test.rs:1")
+    );
+
+    let one = ask(&map, &seeds, 1).await;
+    assert_eq!(one.hits.len(), 1);
+    assert_eq!(one.hits[0].rank, 1);
+    assert_eq!(one.hits[0].node, all.hits[0].node);
+    assert_eq!(one.status, MapStatus::Ok);
 }
 
 #[test]
