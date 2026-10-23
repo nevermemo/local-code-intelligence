@@ -623,10 +623,13 @@ mode = "cache"
 # sessions = "shared" (default): the calls of this process may keep a server
 # across calls, the one that navigation and the search channel use, so a cold
 # start is paid once, but only a server that lists the configuration files its
-# tree stamp covers (every adapter but jdtls) and sees an edit on its own (today
-# rust-analyzer) or is told by sync = "watch". Every other server
-# (csharp-ls, typescript-language-server, pyright, gopls, clangd; jdtls and marksman always)
-# is started by each call and stopped when its walk ends, as under "per_call".
+# tree stamp covers (every adapter but jdtls and marksman) and sees an edit on
+# its own (today rust-analyzer) or is told by sync = "watch" (the default). So
+# by default every server but jdtls and marksman is kept; with sync = "off",
+# rust-analyzer alone is, and every other server (csharp-ls,
+# typescript-language-server, pyright, gopls, clangd) is started by each call
+# and stopped when its walk ends, as under "per_call". jdtls and marksman are
+# always started by each call.
 # Before a walk (and before navigation and the search channel) uses a kept
 # server it passes a tree barrier: a stamp of the
 # server's indexed files, their directories and ancestors (child names too),
@@ -646,8 +649,12 @@ mode = "cache"
 # an edit that keeps modification time and length. A workspace with no index
 # snapshot has no sharing. A kept server stops when it has been idle for
 # lsp_idle_timeout_seconds (which only limits residency), on release_workspace
-# and at service shutdown, not when a walk ends; a kept rust-analyzer holds
-# about 4 GB while it runs. "per_call": every traverse call starts its own
+# and at service shutdown, not when a walk ends. A kept server holds memory while
+# it runs; peak resident size measured during walks (a measurement, not a limit,
+# and idle use is at most that): rust-analyzer about 4 GB, typescript-language-server
+# about 460 MB, csharp-ls about 190 MB, pyright and gopls about 120 MB each (gopls
+# 250 MB without the sync). A workspace in all of those languages holds about 0.9 GB
+# beside rust-analyzer's 4 GB. "per_call": every traverse call starts its own
 # servers and stops them when its walk ends (the off switch; it changes the
 # profile hash). The recipes never run lsp.live and are the same under both.
 # outline_cache = false (default): every file outline lsp.live needs
@@ -661,7 +668,7 @@ mode = "cache"
 # typescript-language-server (they are not resent the text) are asked every time.
 # At most 4096 outlines per manager (a new one past that clears them). Within one
 # walk under "per_call" (and for a server a "shared" walk starts per call), across
-# calls in the service's manager under "shared" with sync = "watch".
+# calls in the service's manager under "shared" with sync = "watch" (the default).
 # The recipes never run lsp.live and are the same under both values.
 # implementations = false (default): lsp.live asks a symbol for its definition
 # and its references. true: it also asks textDocument/implementation (one more
@@ -676,17 +683,21 @@ mode = "cache"
 # destination), seen at the call. A server without call hierarchy refuses the
 # request: that is noted and the other edges stay. Servers miss some calls
 # (macro arguments, for one): this complements graph.scip.
-# sync = "off" (default): a language server is told nothing about edits after it
-# starts. "watch": this process's language-server manager watches each workspace
-# that has a running session and sends every source-file change to its servers
-# (workspace/didChangeWatchedFiles), so a long-lived session (search_symbols, the
-# search channel, a "shared" lsp.live) answers the tree as it is. It falls back to
-# polling every watch_poll_milliseconds when the platform watcher cannot start,
-# and stops with the workspace's last session. Independent of index watching. A
-# per-call manager (sessions = "per_call") never syncs. A shared lsp.live walk
-# restarts a kept server after an edit whatever the sync did (the tree barrier
-# above), so for lsp.live the sync no longer avoids a restart. The recipes are the same
-# under both values.
+# sync = "watch" (default): this process's language-server manager watches each
+# workspace that has a running session and sends every source-file change to its
+# servers (workspace/didChangeWatchedFiles), so a long-lived session
+# (search_symbols, the search channel, a "shared" lsp.live) answers the tree as it
+# is, and a server that lists its stamp's configuration files is kept by
+# "shared" (see above). It falls back to polling (a scan of the tree) every
+# watch_poll_milliseconds when the platform watcher cannot start, and stops with
+# the workspace's last session. If both watchers fail, or the Windows watcher
+# silently stops, a kept server that does not watch on its own is told nothing
+# and relies on the tree stamp alone. Independent of index watching. "off": a
+# language server is told nothing about edits after it starts (the default before
+# K11b-4). A per-call manager (sessions = "per_call") never syncs. A shared
+# lsp.live walk restarts a kept server after an edit whatever the sync did (the
+# tree barrier above), so for lsp.live the sync is what makes a server worth
+# keeping, not what avoids a restart. The recipes are the same under both values.
 # places = "auto" (default): per walk, "scip" when the SCIP graph read for the
 # workspace has at least one node (that walk is the "scip" walk), else "outline",
 # so a tree with no index read (scip.mode = "off", or "cache" with no file) still
@@ -749,7 +760,7 @@ sessions = "shared"
 outline_cache = false
 implementations = false
 call_hierarchy = false
-sync = "off"
+sync = "watch"
 places = "auto"
 breaker = true
 live = true

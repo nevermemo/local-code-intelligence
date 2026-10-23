@@ -357,9 +357,10 @@ pub enum LspSessions {
     /// `release_workspace` or service shutdown. Only a server that lists the
     /// configuration files of its tree stamp (`LspAdapter::keeps_session`) and
     /// sees an edit on its own (`LspAdapter::watches_workspace`, today
-    /// rust-analyzer) or is told by `[run_profile.lsp] sync = "watch"` keeps
-    /// its session across calls; every other server behaves as under
-    /// `per_call`. A kept session first passes the tree barrier of each walk
+    /// rust-analyzer) or is told by `[run_profile.lsp] sync = "watch"` (the
+    /// default) keeps its session across calls; every other server (all but
+    /// rust-analyzer under `sync = "off"`, and jdtls and marksman always)
+    /// behaves as under `per_call`. A kept session first passes the tree barrier of each walk
     /// (`Manager::tree_barrier`: a stamp from the index's file list; a changed
     /// or failed stamp restarts the server), so a reused server is never
     /// staler than under `per_call` for a change inside the stamp's coverage,
@@ -397,12 +398,12 @@ impl std::str::FromStr for LspSessions {
 #[serde(rename_all = "snake_case")]
 pub enum LspSync {
     /// A server walks the tree when it starts and is told nothing after.
-    /// Today's behaviour.
-    #[default]
+    /// The behaviour before K11b-4.
     Off,
     /// While a workspace has a live session, a watcher of the workspace sends
     /// every source-file change to each of its servers as
-    /// `workspace/didChangeWatchedFiles` (see `lsp::sync`).
+    /// `workspace/didChangeWatchedFiles` (see `lsp::sync`). The default.
+    #[default]
     Watch,
 }
 
@@ -515,12 +516,19 @@ pub struct LspProfile {
     /// edges. A server that refuses a request costs the other edges nothing.
     /// The recipes walk no `lsp.live` and run the same under both values.
     pub call_hierarchy: bool,
-    /// `"off"` (default): a language server is told nothing about edits after
-    /// it starts. `"watch"`: a long-lived manager (the MCP and REST server's,
+    /// `"watch"` (default): a long-lived manager (the MCP and REST server's,
     /// the one `lci traverse` builds under `sessions = "shared"`) watches each
     /// workspace that has a live session and sends every source-file change
-    /// to its servers (see [`LspSync`]). A per-call manager never watches:
-    /// under `sessions = "per_call"` it changes nothing for `lsp.live`. The
+    /// to its servers (see [`LspSync`]); a server that lists the
+    /// configuration files of its tree stamp then keeps its session across
+    /// `lsp.live` walks under `sessions = "shared"`. `"off"`: a language
+    /// server is told nothing about edits after it starts, and only
+    /// rust-analyzer (which sees an edit on its own) keeps its session. A
+    /// per-call manager never watches: under `sessions = "per_call"` it
+    /// changes nothing for `lsp.live`. Residuals under `"watch"`: a workspace
+    /// whose watchers both failed, or whose Windows watcher silently stopped,
+    /// keeps a non-watching server on the strength of the tree stamp alone;
+    /// the poll fallback scans the tree every `watch_poll_milliseconds`. The
     /// recipes walk no `lsp.live` and run the same under both values.
     pub sync: LspSync,
     /// `"auto"` (default): per walk, `"scip"` when the SCIP graph read for the
@@ -867,7 +875,7 @@ mod tests {
         config.run_profile.seeds.literal = true;
         config.run_profile.seeds.repo_map = true;
         config.run_profile.grep.structural = true;
-        config.run_profile.lsp.sync = LspSync::Watch;
+        config.run_profile.lsp.sync = LspSync::Off;
         config.run_profile.lsp.places = LspPlaces::Outline;
         config.run_profile.lsp.breaker = false;
         config.run_profile.lsp.live = false;
@@ -1693,33 +1701,35 @@ mode = \"sometimes\"
     }
 
     #[test]
-    fn lsp_sync_is_off_by_default_and_is_part_of_the_profile() {
-        let off = Config::default();
-        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
-        let watch: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nsync = \"watch\"\n",
-            base_toml()
-        ))
-        .unwrap();
-        watch.validate().unwrap();
+    fn lsp_sync_is_on_by_default_and_off_changes_the_profile_hash() {
+        let watch = Config::default();
         assert_eq!(watch.run_profile.lsp.sync, LspSync::Watch);
-        assert_eq!(watch.run_profile.lsp.sessions, LspSessions::Shared);
-        assert!(!watch.run_profile.lsp.outline_cache);
-        assert_eq!(
-            serde_json::to_value(&watch).unwrap()["run_profile"]["lsp"]["sync"],
-            "watch"
-        );
-        let (off, watch) = (off.run_profile(), watch.run_profile());
-        assert_eq!(off.value["run_profile"]["lsp"]["sync"], "off");
-        assert_eq!(watch.value["run_profile"]["lsp"]["sync"], "watch");
-        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.sync"));
-        assert_ne!(off.hash, watch.hash);
-        let spelled: Config = toml::from_str(&format!(
+        assert_eq!(LspSync::default(), LspSync::Watch);
+        let off: Config = toml::from_str(&format!(
             "{}[run_profile.lsp]\nsync = \"off\"\n",
             base_toml()
         ))
         .unwrap();
-        assert_eq!(spelled.run_profile().hash, off.hash);
+        off.validate().unwrap();
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
+        assert!(!off.run_profile.lsp.outline_cache);
+        assert_eq!(
+            serde_json::to_value(&off).unwrap()["run_profile"]["lsp"]["sync"],
+            "off"
+        );
+        let (off, watch) = (off.run_profile(), watch.run_profile());
+        assert_eq!(off.value["run_profile"]["lsp"]["sync"], "off");
+        assert_eq!(watch.value["run_profile"]["lsp"]["sync"], "watch");
+        assert!(watch.keys.iter().any(|key| key == "run_profile.lsp.sync"));
+        assert_ne!(off.hash, watch.hash);
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nsync = \"watch\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile.lsp.sync, LspSync::Watch);
+        assert_eq!(spelled.run_profile().hash, watch.hash);
         for bad in [
             "[run_profile.lsp]\nsync = \"on\"\n",
             "[run_profile.lsp]\nsync = \"Watch\"\n",
@@ -1756,7 +1766,7 @@ mode = \"sometimes\"
         assert_eq!(outline.run_profile.lsp.places, LspPlaces::Outline);
         // Only the named leaf moves.
         assert_eq!(outline.run_profile.lsp.sessions, LspSessions::Shared);
-        assert_eq!(outline.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(outline.run_profile.lsp.sync, LspSync::Watch);
         assert!(!outline.run_profile.lsp.implementations);
         assert_eq!(
             serde_json::to_value(&outline).unwrap()["run_profile"]["lsp"]["places"],
@@ -1805,7 +1815,7 @@ mode = \"sometimes\"
         assert!(!off.run_profile.lsp.breaker);
         // Only the named leaf moves.
         assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
-        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Watch);
         assert_eq!(off.run_profile.lsp.places, LspPlaces::Auto);
         assert!(off.run_profile.lsp.live);
         assert!(!off.run_profile.lsp.implementations);
@@ -1846,7 +1856,7 @@ mode = \"sometimes\"
         assert!(!off.run_profile.lsp.live);
         // Only the named leaf moves.
         assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
-        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Watch);
         assert_eq!(off.run_profile.lsp.places, LspPlaces::Auto);
         assert!(off.run_profile.lsp.breaker);
         assert!(!off.run_profile.lsp.implementations);

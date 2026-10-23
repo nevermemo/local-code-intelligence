@@ -378,7 +378,8 @@ pub struct Call<'a> {
     /// sessions = "shared"` (the default): the MCP and REST server's own, one
     /// per process for `lci traverse`. Used only under `shared`, and only for
     /// a server that sees an edit on its own (`LspAdapter::watches_workspace`)
-    /// or when `sync = "watch"`, and lists its tree stamp's configuration files
+    /// or when `sync = "watch"` (the default), and lists its tree stamp's
+    /// configuration files
     /// (`LspAdapter::keeps_session`); every other server starts on the call's own
     /// manager, as under `per_call`. `None` there (a caller with no manager of
     /// its own, the recipes) starts all the call's servers as under `per_call`.
@@ -1277,7 +1278,7 @@ pub async fn run_with_trait_seeds(
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
         // stops when the map drops. `shared`: a server that sees an edit on its
-        // own (or every server under `sync = "watch"`) runs on the caller's
+        // own (or every server under `sync = "watch"`, the default) runs on the caller's
         // manager, whose owner stops it (idle sweeper, release, shutdown); the
         // other servers run on the call's own manager, as under `per_call`.
         let workspace = dunce::canonicalize(root)

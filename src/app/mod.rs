@@ -102,8 +102,10 @@ pub struct App {
     watchers: Mutex<HashMap<String, (crate::workspace::Workspace, CancellationToken)>>,
     /// The language servers: navigation, the search channel and, under
     /// `[run_profile.lsp] sessions = "shared"` (the default), the traverse
-    /// calls share it for the servers that see an edit on their own, or for
-    /// every server under `sync = "watch"` (see [`Self::language_servers`]).
+    /// calls share it for every server that lists its tree stamp's
+    /// configuration files under `sync = "watch"` (the default), or only for
+    /// the ones that see an edit on their own under `sync = "off"` (see
+    /// [`Self::language_servers`]).
     analyzer: Arc<lsp::Manager>,
     /// Whether the first touch of a workspace warms its language servers
     /// (see [`Self::warm_language_servers`]); fixed by the configuration:
@@ -214,7 +216,7 @@ impl App {
     /// in the service's manager: `sessions = "shared"` and
     /// `LspAdapter::keeps_session` (the server lists its tree stamp's
     /// configuration files and sees an edit on its own or `sync = "watch"`
-    /// tells it). These sessions pass the tree barrier of a traverse walk
+    /// (the default) tells it). These sessions pass the tree barrier of a traverse walk
     /// (`lsp::Manager::tree_barrier`); navigation passes the same barrier, once
     /// per call, and records it in the same way. The search channel passes
     /// `Manager::search_barrier`, which records the same stamps except that it
@@ -234,10 +236,12 @@ impl App {
     /// default map set (`[run_profile.lsp] live`, on by default) or a
     /// `[traverse.policies.*]` `extra_maps` names `lsp.live` (under `per_call`
     /// nothing starts), and once per workspace and process. Only the servers a
-    /// walk would share start: those that see an edit on their own
-    /// (`LspAdapter::watches_workspace`), or every server under
-    /// `sync = "watch"`; a walk starts the others per call, so a warm one
-    /// would be unused. It is bounded by nothing but its abort
+    /// walk would share start: under the default `sync = "watch"` every
+    /// configured server of the index's languages that lists its tree stamp's
+    /// configuration files (so a polyglot workspace starts several at once),
+    /// under `sync = "off"` only those that see an edit on their own
+    /// (`LspAdapter::watches_workspace`); a walk starts the others per call,
+    /// so a warm one would be unused. It is bounded by nothing but its abort
     /// (`stop_warm_starts`): a server that is slow to start keeps starting in
     /// its session and the first walk shares that start. It changes which
     /// request pays for a start, never an answer.

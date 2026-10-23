@@ -100,7 +100,7 @@
 //! * the process's own manager (`sessions = "shared"`, the default: the MCP
 //!   and REST server's, the one navigation and the search channel use; only
 //!   for a server that watches its workspace, today rust-analyzer, or under
-//!   `sync = "watch"`): dropping the map stops nothing. The server stays for
+//!   `sync = "watch"`, the default): dropping the map stops nothing. The server stays for
 //!   the next call and ends with that manager's idle sweeper
 //!   (`lsp_idle_timeout_seconds`), `release_workspace`, a stuck-session
 //!   replacement or service shutdown.
@@ -371,7 +371,7 @@ impl ManagerBackend {
     /// the version probes run through `shared`, so its per-provider cache
     /// holds, and each probed server is then routed to `shared` when it sees
     /// an edit on its own ([`LspAdapter::watches_workspace`]) or `shared`
-    /// syncs edits to its servers (`sync = "watch"`) and it lists the
+    /// syncs edits to its servers (`sync = "watch"`, the default) and it lists the
     /// configuration files of its tree stamp ([`LspAdapter::keeps_session`]),
     /// and to `own` otherwise.
     /// A server on `own` starts after the last edit, as under `per_call`, and
