@@ -688,7 +688,8 @@ mode = "cache"
 # servers (workspace/didChangeWatchedFiles). Before each request the manager
 # sends what the watcher has already reported; the notification goes out before
 # the request, but the manager does not wait for the server to apply it, and an
-# event that arrives after that send reaches the next request. So a long-lived
+# event the watcher reports after that send goes out with the first request that
+# drains after the report. So a long-lived
 # session (search_symbols, the search channel, a "shared" lsp.live) is told of
 # the edits the watcher has seen, which is what makes a server that lists its
 # stamp's configuration files worth keeping by "shared" (see above). The
