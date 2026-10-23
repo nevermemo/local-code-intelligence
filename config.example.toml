@@ -593,14 +593,25 @@ card_paths = false
 # node): equal to "rank" at n = gate, so continuous at the gate for every node,
 # and flatter above it (80 callers price the 9th edge at 1 / 1.8, not 1 / 9).
 # At or below the gate nothing changes.
-# All three keys are part of the run-profile hash. A handle keeps groups and
-# grep_corroboration; it does not carry pricing (like the gate and the beam),
-# so a resumed call prices under the profile it is given and a walk can mix
-# pricings across resumes.
+# confirm = false (default): a text hop stays as grep.live found it. true: with
+# grep.live and lsp.live both in the call, the hops an expansion keeps whose
+# only witnesses are grep.live text matches, the best top_k by hop value, are
+# sent in one call to the language server: textDocument/definition at each
+# hop's site. A definition that is the expanded node confirms the hop (it
+# becomes a server answer); a definition that is another node drops it; no
+# answer, an error, the deadline or no external call left leaves it as it was.
+# Each proposal is at most one external call, counted in max_external_calls;
+# a failure never ends a walk. Without either map the walk runs unconfirmed
+# and says so in a note.
+# All four keys are part of the run-profile hash. A handle keeps groups,
+# grep_corroboration and confirm (with its top_k and the places arm); it does
+# not carry pricing (like the gate and the beam), so a resumed call prices
+# under the profile it is given and a walk can mix pricings across resumes.
 [run_profile.walk]
 groups = "tool"
 grep_corroboration = 1.0
 pricing = "rank"
+confirm = false
 
 # [run_profile.scip]: what a traversal does with the SCIP index (index.scip).
 # mode = "cache" (default): the index is read when the file is there and

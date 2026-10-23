@@ -1304,6 +1304,29 @@ async fn flow_from_runs_the_same_with_seeds_literal_on() {
     assert!(!on.to_string().contains("literal"), "{on}");
 }
 
+/// `[run_profile.walk] confirm` reaches the recipes' walk (the profile is the
+/// one they run under) and changes nothing there: the walk names its maps
+/// ([`FLOW_WALK_MAPS`]), which hold neither `grep.live` nor `lsp.live`, so the
+/// confirm frontier is not built (one note, not shown in the recipe's answer)
+/// and nothing is proposed under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_walk_confirm_on() {
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::live_grep::GREP_LIVE_MAP_ID));
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.walk.confirm = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("confirm"), "{on}");
+}
+
 /// `[run_profile.grep] structural` reaches the recipes' walk (the profile is
 /// the one they run under) and changes nothing there: the walk names its maps
 /// ([`FLOW_WALK_MAPS`]), and the key adds `grep.structural` only to the default

@@ -823,6 +823,14 @@ pub async fn run_with_trait_seeds(
             .check_arbitration(arbitration.as_ref().map(Arbitration::identity).as_deref())
             .map_err(|e| anyhow!("{e}"))?;
     }
+    // `[run_profile.walk] confirm`: the same for the confirm frontier, which
+    // a handle keeps with its `top_k` and the confirmer's identity.
+    let confirm_identity = built.confirmer.as_ref().map(|c| c.identity());
+    if let Some(snapshot) = &snapshot {
+        snapshot
+            .check_confirm(confirm_identity.as_deref().map(|i| (call.top_k, i)))
+            .map_err(|e| anyhow!("{e}"))?;
+    }
     // The trait and trait-method paths of the question join the start nodes
     // (K39a: this ran inside the `scip.implements` registration).
     if snapshot.is_none()
@@ -1055,6 +1063,10 @@ pub async fn run_with_trait_seeds(
         Some(a) => traversal.arbitration(a.clone()),
         None => traversal,
     };
+    let traversal = match &built.confirmer {
+        Some(c) => traversal.confirm_frontier(Arc::clone(c), call.top_k),
+        None => traversal,
+    };
     // The cap on model calls covers the reranker frontier's calls.
     let traversal = if rescorer.is_some() {
         traversal.model_calls(limits.max_model_calls)
@@ -1137,6 +1149,19 @@ pub async fn run_with_trait_seeds(
             if built.outline { "outline" } else { "scip" },
             counts.confirmed,
             counts.overruled
+        ));
+    }
+    // What the confirm frontier did in this call (counts are per call).
+    if result.confirm_top_k.is_some() {
+        let totals = &result.totals;
+        notes.push(format!(
+            "walk.confirm: {} grep.live hops proposed, {} confirmed, {} refuted, {} unknown, {} confirmer calls (places {})",
+            totals.confirm_proposals,
+            totals.confirm_confirmed,
+            totals.confirm_refuted,
+            totals.confirm_unknown,
+            totals.confirm_calls,
+            if built.outline { "outline" } else { "scip" },
         ));
     }
     // A server that is not ready when the walk ends says why a node may have

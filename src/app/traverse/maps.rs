@@ -36,6 +36,7 @@ use lci_maps::{
     structural::{Ripgrep, STRUCTURAL_ID, Structural, StructuralOptions},
     tested_by::{TESTED_BY_ID, TestedByMap},
     traverse::{
+        confirm::{Confirmation, FrontierConfirmer, Proposal},
         source::{Arbitration, ClaimFamily},
         trace::PlanMap,
     },
@@ -347,8 +348,35 @@ pub(super) struct Built<'a> {
     /// The places arm `lsp.live` resolved to for this call (`true`: the
     /// outline arm); `false` when it is not registered.
     pub outline: bool,
+    /// The confirm frontier's confirmer (`[run_profile.walk] confirm`): set
+    /// when the key is on and the call registered both `grep.live` and
+    /// `lsp.live`; `None` otherwise (the walk runs unconfirmed).
+    pub confirmer: Option<Arc<dyn FrontierConfirmer>>,
     pub setup: Instant,
     pub early: Duration,
+}
+
+/// `lsp.live`'s confirmer with the places arm the call resolved to in its
+/// identity, so a handle refuses a resume under another places mode (the
+/// map's own identity names the server and the question, not the places).
+struct PlacesConfirmer {
+    inner: Arc<dyn FrontierConfirmer>,
+    places: &'static str,
+}
+
+#[lci_maps::async_trait]
+impl FrontierConfirmer for PlacesConfirmer {
+    async fn confirm(
+        &self,
+        proposals: &[Proposal],
+        max_calls: u32,
+    ) -> Result<Confirmation, String> {
+        self.inner.confirm(proposals, max_calls).await
+    }
+
+    fn identity(&self) -> String {
+        format!("{} places {}", self.inner.identity(), self.places)
+    }
 }
 
 /// Registers the maps the call wants, in the order the registry lists them,
@@ -716,6 +744,39 @@ pub(super) async fn build<'a>(
             }
         }
     }
+    // `[run_profile.walk] confirm`: the server confirms the text proposals of
+    // `grep.live`, so the call needs both maps. Off: nothing is built and no
+    // note is written.
+    let mut confirmer: Option<Arc<dyn FrontierConfirmer>> = None;
+    if profile.walk.confirm {
+        match &lsp_live {
+            Some(map) if wants(GREP_LIVE_MAP_ID) && call.scip_root.is_some() => {
+                confirmer = Some(Arc::new(PlacesConfirmer {
+                    inner: map.confirmer(),
+                    places: if lsp_live_outline { "outline" } else { "scip" },
+                }));
+            }
+            _ => {
+                let mut missing: Vec<&str> = Vec::new();
+                if call.scip_root.is_none() {
+                    missing.push("no tree root");
+                } else {
+                    if !wants(GREP_LIVE_MAP_ID) {
+                        missing.push("grep.live not named");
+                    }
+                    if !wants(LSP_LIVE_ID) {
+                        missing.push("lsp.live not named");
+                    } else if lsp_live.is_none() {
+                        missing.push("lsp.live unavailable");
+                    }
+                }
+                notes.push(format!(
+                    "walk.confirm is off for this call: it needs grep.live and lsp.live ({})",
+                    missing.join(", ")
+                ));
+            }
+        }
+    }
     // The maps above that read the tree and were skipped without a word for lack of one.
     if call.scip_root.is_none() {
         unavailable.extend(
@@ -917,6 +978,7 @@ pub(super) async fn build<'a>(
         lsp_live_sessions,
         lsp_live_walk,
         outline: lsp_live_outline,
+        confirmer,
         setup,
         early,
     })
