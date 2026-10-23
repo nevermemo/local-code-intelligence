@@ -159,7 +159,10 @@
 //! `totals` has the sum over the call's expansions (none of this appears
 //! when nothing is attached). [`TraversalResult::arbitration`] and
 //! [`TraversalResult::arbitration_by_map`] carry the same counts, for this
-//! call only: a resume starts them again, and a retried pop counts again.
+//! call only: a resume starts them again, and a retried pop counts again. The
+//! `start` event names the arbitration (`authority`, `subordinate`, `kinds`);
+//! a handle keeps its [identity](source::Arbitration::identity) and refuses a
+//! resume under another ([`handle::Snapshot::check_arbitration`]).
 //!
 //! Logical and physical work: the caps above charge a retried pop only what its
 //! earlier run did not pay (`tokens`, `external_calls`), the logical work. The
@@ -1184,6 +1187,18 @@ impl<'s> Run<'s> {
             }
             if let (Some((_, top_k)), Some(object)) = (&self.t.confirm, start.as_object_mut()) {
                 object.insert("confirm".into(), json!({"top_k": top_k}));
+            }
+            if let (Some(a), Some(object)) = (&self.t.arbitration, start.as_object_mut()) {
+                object.insert(
+                    "arbitration".into(),
+                    json!({
+                        "authority": a.authority,
+                        "subordinate": a.subordinate.iter()
+                            .map(|(map, family)| json!([map, family.as_str()]))
+                            .collect::<Vec<_>>(),
+                        "kinds": a.kinds.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
+                    }),
+                );
             }
             if let (false, Some(object)) = (self.t.score_bound, start.as_object_mut()) {
                 object.insert("score_bound".into(), json!(false));

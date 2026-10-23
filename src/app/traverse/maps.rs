@@ -13,7 +13,11 @@ use super::{
 };
 use crate::config::{LspPlaces, LspSessions, RunProfileConfig};
 use anyhow::{Result, anyhow, bail};
-use lci_core::{config::TraversePolicy, lexical, node::NodeId};
+use lci_core::{
+    config::{TraversePolicy, profile::ScipMode},
+    lexical,
+    node::{NodeId, SymbolKind},
+};
 use lci_maps::{
     Map, MapId, Registry,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
@@ -31,7 +35,10 @@ use lci_maps::{
     },
     structural::{Ripgrep, STRUCTURAL_ID, Structural, StructuralOptions},
     tested_by::{TESTED_BY_ID, TestedByMap},
-    traverse::trace::PlanMap,
+    traverse::{
+        source::{Arbitration, ClaimFamily},
+        trace::PlanMap,
+    },
 };
 use std::{
     collections::HashSet,
@@ -337,6 +344,9 @@ pub(super) struct Built<'a> {
     pub lsp_live: Option<Arc<LspLive>>,
     pub lsp_live_sessions: Vec<(&'static str, Arc<lci_core::lsp::Manager>, String)>,
     pub lsp_live_walk: Option<Arc<lci_core::lsp::WalkSessions>>,
+    /// The places arm `lsp.live` resolved to for this call (`true`: the
+    /// outline arm); `false` when it is not registered.
+    pub outline: bool,
     pub setup: Instant,
     pub early: Duration,
 }
@@ -604,6 +614,7 @@ pub(super) async fn build<'a>(
         Vec::new();
     let mut lsp_live_workspace = String::new();
     let mut lsp_live_walk: Option<Arc<lci_core::lsp::WalkSessions>> = None;
+    let mut lsp_live_outline = false;
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
@@ -679,6 +690,7 @@ pub(super) async fn build<'a>(
                     LspPlaces::Outline => true,
                     LspPlaces::Auto => loaded.scip.graph().nodes.is_empty(),
                 };
+                lsp_live_outline = outline;
                 let places: Arc<dyn SymbolPlaces> = if outline {
                     Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
                 } else {
@@ -904,8 +916,52 @@ pub(super) async fn build<'a>(
         lsp_live,
         lsp_live_sessions,
         lsp_live_walk,
+        outline: lsp_live_outline,
         setup,
         early,
+    })
+}
+
+/// The arbitration of a call (`[run_profile.scip] arbitration`): `None` unless
+/// the key is on, `scip.mode` is not `authoritative` and `lsp.live` was built.
+/// The server is the authority over the SCIP maps the call registered and
+/// built: `scip.impact` (`Refers`), `scip.implements` (`Implements`, with
+/// `[run_profile.lsp] implementations`) and `structure.contains`
+/// (`Structure`). `graph.scip` is never listed: its edges are callees and a
+/// claim family carries no direction. Only function and method destinations
+/// are judged under either places arm (the index's place table holds nothing
+/// else). `None` when no listed map is part of the call.
+pub(super) fn arbitration(
+    built: &Built<'_>,
+    selection: &Selection,
+    profile: &RunProfileConfig,
+) -> Option<Arbitration> {
+    if !profile.scip.arbitration
+        || profile.scip.mode == ScipMode::Authoritative
+        || built.lsp_live.is_none()
+    {
+        return None;
+    }
+    let built_ok = |id: MapId, map_built: bool| {
+        selection.wants(id) && map_built && !built.unavailable.contains(&id)
+    };
+    let mut subordinate: Vec<(MapId, ClaimFamily)> = Vec::new();
+    if built_ok(SCIP_IMPACT_ID, built.impact.is_some()) {
+        subordinate.push((SCIP_IMPACT_ID, ClaimFamily::Refers));
+    }
+    if profile.lsp.implementations && built_ok(SCIP_IMPLEMENTS_ID, built.implements.is_some()) {
+        subordinate.push((SCIP_IMPLEMENTS_ID, ClaimFamily::Implements));
+    }
+    if selection.wants(CONTAINS_MAP_ID) {
+        subordinate.push((CONTAINS_MAP_ID, ClaimFamily::Structure));
+    }
+    if subordinate.is_empty() {
+        return None;
+    }
+    Some(Arbitration {
+        authority: LSP_LIVE_ID,
+        subordinate,
+        kinds: vec![SymbolKind::Function, SymbolKind::Method],
     })
 }
 

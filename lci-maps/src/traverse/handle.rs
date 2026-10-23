@@ -26,7 +26,8 @@
 //! the ranking and the early stop depend on is kept and checked: the
 //! corroboration boost ([`Snapshot::check_boost`]), the score bound's `k`
 //! ([`Snapshot::check_top_k`]), the hop priors, the tie-break file, the
-//! reranker, the confirm frontier ([`Snapshot::check_confirm`]); a caller
+//! reranker, the confirm frontier ([`Snapshot::check_confirm`]), the
+//! arbitration ([`Snapshot::check_arbitration`]); a caller
 //! refuses a handle whose setting it does not repeat. The
 //! budget is absolute for the whole traversal (`pops`, `est_tokens`,
 //! `external_calls` and the reranker calls count from the first call), with a
@@ -47,8 +48,9 @@
 //!   store and a 65-character one does not.
 //! - Content: `VERSION` 10; another version, and a `bandit` key, are `Corrupt`.
 //!   Written only when not the default: `fusion` (`rrf`, `log_odds`), `grouping`, `priors`,
-//!   `tie_break`, `rerank_identity` and `confirm` (the confirm frontier's `top_k`
-//!   and identity, with its `confirm_*` totals), and per state `groups` and `reach`; under
+//!   `tie_break`, `rerank_identity`, `arbitration` (the identity of the
+//!   arbitration, [`Snapshot::check_arbitration`]) and `confirm` (the confirm
+//!   frontier's `top_k` and identity, with its `confirm_*` totals), and per state `groups` and `reach`; under
 //!   `card_paths` (the call's switch, [`Traversal::card_paths`]) `"card_paths": true`
 //!   and per state the `kind` of the edge that found it (not for a start node); an
 //!   absent key loads as the default, so older handles keep their text. Object
@@ -154,6 +156,14 @@ pub enum HandleError {
         found: String,
         expected: String,
     },
+    /// The handle was made with another arbitration than the caller gives (see
+    /// [`Snapshot::check_arbitration`]); each side is the arbitration's
+    /// [identity](super::source::Arbitration::identity), or `none`.
+    WrongArbitration {
+        handle: String,
+        found: String,
+        expected: String,
+    },
     /// The handle ranked with another corroboration boost than the caller
     /// gives (see [`Snapshot::check_boost`]).
     WrongBoost {
@@ -230,6 +240,16 @@ impl fmt::Display for HandleError {
                 "handle {handle} was made with the confirm frontier {found}, this call has \
                  {expected}; give the same walk.confirm, top_k and maps (grep.live and lsp.live), \
                  or start a new traversal"
+            ),
+            Self::WrongArbitration {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} was made with the arbitration {found}, this call has \
+                 {expected}; give the same scip.arbitration, scip.mode and maps (lsp.live, \
+                 scip.impact, scip.implements, structure.contains), or start a new traversal"
             ),
             Self::WrongBoost {
                 handle,
@@ -332,6 +352,11 @@ pub struct Snapshot {
     /// (none: it was off). Written to the handle only when on; the caller
     /// passes the confirmer again and checks it with [`Snapshot::check_confirm`].
     pub confirm: Option<(usize, String)>,
+    /// The [identity](super::source::Arbitration::identity) of the arbitration
+    /// the first call ran with (none: it had none). Written to the handle only
+    /// when there is one; the caller checks it with
+    /// [`Snapshot::check_arbitration`].
+    pub arbitration: Option<String>,
     /// Whether the score bound could end the walk; a resume keeps it.
     pub score_bound: bool,
     /// The `k` of the score bound the first call ran with (0: it had none).
@@ -392,6 +417,9 @@ impl Snapshot {
             }
             if self.card_paths {
                 object.insert("card_paths".into(), json!(true));
+            }
+            if let Some(identity) = &self.arbitration {
+                object.insert("arbitration".into(), json!(identity));
             }
             // The confirm frontier's counters are written only with the
             // setting, so a handle made without it is what it was.
@@ -580,6 +608,23 @@ impl Snapshot {
             handle: self.handle(),
             found: show(found),
             expected: show(setting),
+        })
+    }
+
+    /// Refuses a snapshot made with another arbitration than `expected` (the
+    /// [identity](super::source::Arbitration::identity) of the call's, or none):
+    /// the arbitration removes edges, so a walk resumed under another one is
+    /// not the walk the handle paused. The arbitration itself is not in a
+    /// handle, so the caller checks what it passes.
+    pub fn check_arbitration(&self, expected: Option<&str>) -> Result<(), HandleError> {
+        if self.arbitration.as_deref() == expected {
+            return Ok(());
+        }
+        let show = |identity: Option<&str>| identity.unwrap_or("none").to_owned();
+        Err(HandleError::WrongArbitration {
+            handle: self.handle(),
+            found: show(self.arbitration.as_deref()),
+            expected: show(expected),
         })
     }
 
@@ -914,6 +959,10 @@ impl Snapshot {
                     let v = v.as_object().ok_or("confirm is not an object")?;
                     Some((usize_of(get(v, "top_k")?)?, string_of(get(v, "identity")?)?))
                 }
+            },
+            arbitration: match obj.get("arbitration") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(string_of(v)?),
             },
             score_bound: get(obj, "score_bound")?
                 .as_bool()
@@ -1274,6 +1323,7 @@ impl Run<'_> {
                 .confirm
                 .as_ref()
                 .map(|(confirmer, top_k)| (*top_k, confirmer.identity())),
+            arbitration: self.t.arbitration.as_ref().map(|a| a.identity()),
             score_bound: self.t.score_bound,
             top_k: self.t.bound.map_or(0, |(k, _)| k),
             priors: self
