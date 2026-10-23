@@ -249,7 +249,8 @@ impl fmt::Display for HandleError {
                 f,
                 "handle {handle} was made with the arbitration {found}, this call has \
                  {expected}; give the same scip.arbitration, scip.mode and maps (lsp.live, \
-                 scip.impact, scip.implements, structure.contains), or start a new traversal"
+                 scip.impact, scip.implements, structure.contains; a server that did not start \
+                 leaves this call with no arbitration), or start a new traversal"
             ),
             Self::WrongBoost {
                 handle,
