@@ -14,12 +14,15 @@
 //! being present.
 
 use crate::config::TypeScriptLspConfig;
-use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
+use crate::lsp::adapter::{
+    InitializeVariant, LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, initialize_params_for,
+    open_if_changed,
+};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use crate::path::has_extension_ignore_case;
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{path::Path, time::Duration};
 
 /// Every Tree-sitter language identifier one typescript-language-server
@@ -102,31 +105,7 @@ impl LspAdapter for TypeScriptServer {
         if !self.enabled() {
             return None;
         }
-        let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
-        let name = root
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("workspace")
-            .to_string();
-        Some(json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "definition": {},
-                    "references": {},
-                    "synchronization": {},
-                    // typescript-language-server publishes diagnostics only to
-                    // a client that declares it takes them; the hook waits for
-                    // the publication of a file it opened (measured against a
-                    // real server: none without this, one with it).
-                    "publishDiagnostics": {}
-                },
-                "workspace": { "symbol": {}, "workspaceFolders": true }
-            },
-            "workspaceFolders": [{ "uri": root_uri, "name": name }],
-            "initializationOptions": {}
-        }))
+        initialize_params_for(root, InitializeVariant::PublishDiagnostics)
     }
 
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
@@ -198,6 +177,7 @@ fn language_id_for(relative: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::lsp::adapter::contract;
+    use serde_json::json;
 
     fn server(path: Option<&str>, args: &[&str], disabled: bool) -> TypeScriptServer {
         let config = TypeScriptLspConfig {
@@ -206,6 +186,30 @@ mod tests {
             disabled,
         };
         TypeScriptServer::new(&config, Duration::from_secs(60))
+    }
+
+    #[test]
+    fn the_typescript_initialize_params_are_pinned() {
+        let (root, uri) = contract::pin_root();
+        let params = server(Some("typescript-language-server"), &[], false).initialize_params(root);
+        assert_eq!(
+            params,
+            Some(json!({
+                "processId": std::process::id(),
+                "rootUri": uri,
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {},
+                        "synchronization": {},
+                        "publishDiagnostics": {}
+                    },
+                    "workspace": { "symbol": {}, "workspaceFolders": true }
+                },
+                "workspaceFolders": [{ "uri": uri, "name": "proj" }],
+                "initializationOptions": {}
+            }))
+        );
     }
 
     #[test]

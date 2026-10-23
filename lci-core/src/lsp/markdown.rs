@@ -29,11 +29,13 @@
 //! [`joins_search_channel`]: LspAdapter::joins_search_channel
 
 use crate::config::MarkdownLspConfig;
-use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
+use crate::lsp::adapter::{
+    InitializeVariant, LspAdapter, SentTexts, initialize_params_for, open_if_changed,
+};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{path::Path, time::Duration};
 
 pub const LANGUAGE_IDENTIFIER: &str = "markdown";
@@ -102,30 +104,7 @@ impl LspAdapter for MarkdownServer {
         if !self.enabled() {
             return None;
         }
-        let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
-        let name = root
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("workspace")
-            .to_string();
-        Some(json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "definition": {},
-                    "references": {},
-                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
-                    "synchronization": {}
-                },
-                "workspace": {
-                    "symbol": {},
-                    "workspaceFolders": true
-                }
-            },
-            "workspaceFolders": [{ "uri": root_uri, "name": name }],
-            "initializationOptions": {}
-        }))
+        initialize_params_for(root, InitializeVariant::DocumentSymbol)
     }
 
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
@@ -164,6 +143,7 @@ impl LspAdapter for MarkdownServer {
 mod tests {
     use super::*;
     use crate::lsp::adapter::contract;
+    use serde_json::json;
 
     fn server(path: Option<&str>, args: &[&str], disabled: bool) -> MarkdownServer {
         let config = MarkdownLspConfig {
@@ -172,6 +152,33 @@ mod tests {
             disabled,
         };
         MarkdownServer::new(&config, Duration::from_secs(60))
+    }
+
+    #[test]
+    fn the_markdown_initialize_params_are_pinned() {
+        let (root, uri) = contract::pin_root();
+        let params = server(Some("marksman"), &[], false).initialize_params(root);
+        assert_eq!(
+            params,
+            Some(json!({
+                "processId": std::process::id(),
+                "rootUri": uri,
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {},
+                        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                        "synchronization": {}
+                    },
+                    "workspace": {
+                        "symbol": {},
+                        "workspaceFolders": true
+                    }
+                },
+                "workspaceFolders": [{ "uri": uri, "name": "proj" }],
+                "initializationOptions": {}
+            }))
+        );
     }
 
     #[test]

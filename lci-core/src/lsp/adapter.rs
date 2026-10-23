@@ -191,6 +191,51 @@ pub trait LspAdapter: Send + Sync {
     }
 }
 
+/// How the `initialize` payload of a plain stdio adapter differs from the
+/// base one (definition, references, synchronization, workspace symbols and
+/// folders, `workspace/configuration`, empty `initializationOptions`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InitializeVariant {
+    /// The base payload: the server may ask for `workspace/configuration`.
+    Base,
+    /// The base payload without `workspace.configuration`, plus a
+    /// hierarchical `documentSymbol` (marksman's heading outline).
+    DocumentSymbol,
+    /// The base payload without `workspace.configuration`, plus
+    /// `publishDiagnostics`: typescript-language-server publishes diagnostics
+    /// only to a client that declares it takes them, and the open hook waits
+    /// for the publication of a file it opened (measured against a real
+    /// server: none without this, one with it).
+    PublishDiagnostics,
+}
+
+/// The `initialize` params of an adapter with no server-specific options: the
+/// process id, the root as `rootUri` and the single workspace folder, and the
+/// capabilities the variant names. `None` when `root` has no `file:` URI.
+pub(crate) fn initialize_params_for(root: &Path, variant: InitializeVariant) -> Option<Value> {
+    let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
+    let name = root
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("workspace");
+    let mut text_document = json!({ "definition": {}, "references": {}, "synchronization": {} });
+    let mut workspace = json!({ "symbol": {}, "workspaceFolders": true });
+    match variant {
+        InitializeVariant::Base => workspace["configuration"] = json!(true),
+        InitializeVariant::DocumentSymbol => {
+            text_document["documentSymbol"] = json!({ "hierarchicalDocumentSymbolSupport": true });
+        }
+        InitializeVariant::PublishDiagnostics => text_document["publishDiagnostics"] = json!({}),
+    }
+    Some(json!({
+        "processId": std::process::id(),
+        "rootUri": root_uri,
+        "capabilities": { "textDocument": text_document, "workspace": workspace },
+        "workspaceFolders": [{ "uri": root_uri, "name": name }],
+        "initializationOptions": {}
+    }))
+}
+
 /// The largest file a `before_position_request` hook reads and sends whole in
 /// `textDocument/didOpen`. While it is sent the text is held about three
 /// times over (the read, the JSON value the transport clones, and the frame),
@@ -1227,6 +1272,16 @@ pub(crate) mod contract {
             !make(Some(usable_path), true).enabled(),
             "explicitly disabled even with a path"
         );
+    }
+
+    /// A fixed absolute root for pinning `initialize` payloads, with the
+    /// `file:` URI it maps to (its last component, `proj`, is the folder name).
+    pub(crate) fn pin_root() -> (&'static Path, &'static str) {
+        if cfg!(windows) {
+            (Path::new(r"C:\lci-pin\proj"), "file:///C:/lci-pin/proj/")
+        } else {
+            (Path::new("/lci-pin/proj"), "file:///lci-pin/proj/")
+        }
     }
 
     /// The initialize payload can be built without a process.

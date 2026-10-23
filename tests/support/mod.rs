@@ -558,7 +558,6 @@ fn with_fake_documents_server_as(
 /// `rust-analyzer-fake.args` beside it (see `fake_lsp.rs`); the copy and its
 /// sidecar are the test's own, so no two tests share either. Keep `config` from
 /// [`fixture`].
-#[allow(dead_code)]
 fn with_fake_rust_analyzer(
     mut config: Config,
     temp: &Path,
@@ -631,7 +630,6 @@ fn strip_lci_env_named(
 /// `lsp: <provider> restarted: ...`, N104, N109): which of two calls starts
 /// the server decides which of them carries such a note, so tests that compare
 /// two calls' notes compare them without these.
-#[allow(dead_code)]
 fn without_barrier_notes(notes: &[String]) -> Vec<String> {
     notes
         .iter()

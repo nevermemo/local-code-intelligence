@@ -15,7 +15,8 @@
 
 use crate::config::GoLspConfig;
 use crate::lsp::adapter::{
-    LspAdapter, MAX_DIAGNOSTICS_WAIT, ProbeExit, SentTexts, open_if_changed, probe_subprocess,
+    InitializeVariant, LspAdapter, MAX_DIAGNOSTICS_WAIT, ProbeExit, SentTexts,
+    initialize_params_for, open_if_changed, probe_subprocess,
 };
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
@@ -99,30 +100,7 @@ impl LspAdapter for GoServer {
         if !self.enabled() {
             return None;
         }
-        let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
-        let name = root
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("workspace")
-            .to_string();
-        Some(json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "definition": {},
-                    "references": {},
-                    "synchronization": {}
-                },
-                "workspace": {
-                    "symbol": {},
-                    "workspaceFolders": true,
-                    "configuration": true
-                }
-            },
-            "workspaceFolders": [{ "uri": root_uri, "name": name }],
-            "initializationOptions": {}
-        }))
+        initialize_params_for(root, InitializeVariant::Base)
     }
 
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
@@ -210,6 +188,33 @@ mod tests {
         )
         .await
         .unwrap_err();
+    }
+
+    #[test]
+    fn the_go_initialize_params_are_pinned() {
+        let (root, uri) = contract::pin_root();
+        let params = server(Some("gopls"), &[], false).initialize_params(root);
+        assert_eq!(
+            params,
+            Some(json!({
+                "processId": std::process::id(),
+                "rootUri": uri,
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {},
+                        "synchronization": {}
+                    },
+                    "workspace": {
+                        "symbol": {},
+                        "workspaceFolders": true,
+                        "configuration": true
+                    }
+                },
+                "workspaceFolders": [{ "uri": uri, "name": "proj" }],
+                "initializationOptions": {}
+            }))
+        );
     }
 
     #[test]
