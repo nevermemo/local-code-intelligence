@@ -6072,10 +6072,23 @@ pub(super) async fn indexed_warm_service(
     extra_args: &[&str],
     tweak: impl FnOnce(&mut Config),
 ) -> WarmService {
+    indexed_warm_service_with(extra_args, &[], tweak).await
+}
+
+/// [`indexed_warm_service`] with more files in the workspace (`files`: path
+/// and text), written before it is indexed.
+pub(super) async fn indexed_warm_service_with(
+    extra_args: &[&str],
+    files: &[(&str, &str)],
+    tweak: impl FnOnce(&mut Config),
+) -> WarmService {
     let (temp, config, fake, models_task) = fixture().await;
     let state = temp.path().join("state");
     let path = temp.path().join("workspace");
     write_csharp_workspace(&path);
+    for (name, text) in files {
+        write(&path, name, text);
+    }
     let mut config = with_lsp_live_warm_start(with_fake_documents_server(
         config,
         &state,
@@ -8993,6 +9006,119 @@ async fn lsp_live_default_places_follow_the_index() {
     service.models_task.abort();
 }
 
+/// K11b-6: `places = "auto"` (the default) resolves per language. On a tree
+/// of C# files the index covers and a python file it does not, the python
+/// file takes the server's outline (so `lsp.live` has cards for its symbols and
+/// asks pyright), while the C# files keep the index's table alone: the walk of
+/// a C# seed is the `scip` walk, in its cards, its external calls and the
+/// outlines it asks of csharp-ls. The explicit arms are untouched: `scip`
+/// places nothing in the python file, `outline` outlines the C# files too.
+/// Fails if the gate ignores the language (b, d), is inverted (a), reads the
+/// language from the node keys (the test index names C# files with `sym:rust:`
+/// ids, so b), or lets the index's files learn an outline (b).
+#[tokio::test]
+async fn lsp_live_default_places_are_per_language_on_a_mixed_tree() {
+    use local_code_intelligence::config::{LspPlaces, LspSessions};
+    const PYTHON_FILE: &str = "file:src/calculator.py";
+    let python_state = tempfile::tempdir().unwrap();
+    let python_dir = python_state.path().to_path_buf();
+    let service =
+        indexed_warm_service_with(&[], &[("src/calculator.py", CALCULATOR_PY)], |config| {
+            config.traverse.policies.clear();
+            config.python = PythonLspConfig {
+                path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+                args: vec![
+                    "--mode".to_owned(),
+                    "documents".to_owned(),
+                    "--state".to_owned(),
+                    python_dir.to_string_lossy().into_owned(),
+                ],
+                disabled: false,
+            };
+        })
+        .await;
+    let (app, workspace, state) = (&service.app, &service.workspace, &service.state);
+    let index = csharp_scip_index(&service.temp, workspace);
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    let manager = app.language_servers();
+    let walk = |seed: &'static str, places: Option<LspPlaces>| {
+        let (config, index, manager) = (&service.config, &index, &manager);
+        async move {
+            traverse_add_maps(
+                config,
+                workspace,
+                index,
+                LspSessions::Shared,
+                Some(manager),
+                (None, None),
+                None,
+                seed,
+                |profile| {
+                    if let Some(places) = places {
+                        profile.lsp.places = places;
+                    }
+                },
+            )
+            .await
+        }
+    };
+    let python_outlines = || requests_of(&python_dir, "textDocument/documentSymbol");
+    let csharp_outlines = || requests_of(state, "textDocument/documentSymbol");
+    let python_cards = |answer: &Value| {
+        lsp_live_symbol_cards(answer)
+            .into_iter()
+            .filter(|node| node.starts_with("sym:python:"))
+            .collect::<Vec<_>>()
+    };
+
+    // (a) The default: the index covers C# only, so the python file is
+    // outlined by pyright and its symbols are cards.
+    assert_eq!(python_outlines(), 0);
+    let by_default_py = walk(PYTHON_FILE, None).await;
+    assert!(
+        !python_cards(&by_default_py).is_empty(),
+        "the default gave the python file no place: {by_default_py}"
+    );
+    assert!(python_outlines() >= 1, "pyright was asked for the outline");
+
+    // (c) The explicit `scip` is the index's table alone: the file seed is still
+    // outlined (a file node always is) but names no member, so no python card.
+    let by_scip_py = walk(PYTHON_FILE, Some(LspPlaces::Scip)).await;
+    assert!(python_cards(&by_scip_py).is_empty(), "{by_scip_py}");
+
+    // (b) A C# seed: the default is the `scip` walk, byte for byte in what it
+    // reaches and pays and in the outlines csharp-ls is asked for.
+    let start = csharp_outlines();
+    let by_default = walk(ADD_SEED, None).await;
+    let default_outlines = csharp_outlines() - start;
+    let by_scip = walk(ADD_SEED, Some(LspPlaces::Scip)).await;
+    let scip_outlines = csharp_outlines() - start - default_outlines;
+    assert!(reached_run_through_lsp_live(&by_default), "{by_default}");
+    assert_eq!(
+        lsp_live_symbol_cards(&by_default),
+        lsp_live_symbol_cards(&by_scip),
+        "{by_default}"
+    );
+    assert_eq!(
+        by_default["totals"]["external_calls"], by_scip["totals"]["external_calls"],
+        "{by_default}"
+    );
+    assert_eq!(default_outlines, scip_outlines, "{by_default}");
+
+    // (d) The count measures something: `outline` outlines the C# files too.
+    let by_outline = walk(ADD_SEED, Some(LspPlaces::Outline)).await;
+    assert!(reached_run_through_lsp_live(&by_outline), "{by_outline}");
+    assert!(
+        csharp_outlines() - start - default_outlines - scip_outlines > scip_outlines,
+        "{by_outline}"
+    );
+
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
+}
+
 /// K11b-3: fail-open under the default. A csharp-ls that starts and exits
 /// (`--exit-at-start`, N106) costs the walk a note and the map, never the
 /// answer: the SCIP maps still answer, nothing is an error, and the second
@@ -9800,7 +9926,7 @@ async fn a_stale_scip_caller_the_server_does_not_see_is_overruled_and_a_live_one
     let notes = notes_of(on);
     assert!(
         notes.contains(
-            "scip.arbitration: lsp.live judged scip.impact (function and method destinations, places scip) in this call: 1 edges confirmed, 1 overruled"
+            "scip.arbitration: lsp.live judged scip.impact (function and method destinations, places auto (scip for csharp; outline otherwise)) in this call: 1 edges confirmed, 1 overruled"
         ),
         "{notes}"
     );
@@ -10279,7 +10405,10 @@ async fn walk_confirm_asks_the_fake_server_for_the_grep_sites() {
             .contains("walk.confirm: 1 grep.live hops proposed, 1 confirmed, 0 refuted, 0 unknown"),
         "{notes}"
     );
-    assert!(notes.contains("confirmer calls (places scip)"), "{notes}");
+    assert!(
+        notes.contains("confirmer calls (places auto (scip for csharp; outline otherwise))"),
+        "{notes}"
+    );
     assert!(!notes.contains("walk.confirm is off"), "{notes}");
     // A confirmed text hop is a server answer: its card says so.
     let card = response["results"]
@@ -10462,7 +10591,7 @@ async fn a_handle_made_with_the_confirm_frontier_is_refused_without_it_and_under
     .expect("the key is off in the resume");
     assert!(
         refused.contains(&format!(
-            "handle {handle} was made with the confirm frontier on at top_k 8 with \"lsp.live definition places scip\", this call has off"
+            "handle {handle} was made with the confirm frontier on at top_k 8 with \"lsp.live definition places auto (scip for csharp; outline otherwise)\", this call has off"
         )),
         "{refused}"
     );
@@ -10482,7 +10611,7 @@ async fn a_handle_made_with_the_confirm_frontier_is_refused_without_it_and_under
     .err()
     .expect("the places arm is another one in the resume");
     assert!(
-        refused.contains("with \"lsp.live definition places scip\", this call has on at top_k 8 with \"lsp.live definition places outline\""),
+        refused.contains("with \"lsp.live definition places auto (scip for csharp; outline otherwise)\", this call has on at top_k 8 with \"lsp.live definition places outline\""),
         "{refused}"
     );
 

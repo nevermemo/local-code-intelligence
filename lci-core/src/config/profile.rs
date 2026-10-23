@@ -454,14 +454,14 @@ impl std::str::FromStr for LspSync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LspPlaces {
-    /// Per walk: [`Scip`](Self::Scip) when the SCIP graph read for the
-    /// workspace has at least one node, else [`Outline`](Self::Outline) (no
-    /// index is read under `scip.mode = "off"`, or under `"cache"` with no
-    /// file, and an index of a tree with no symbols has none either). Where an
-    /// index has nodes the walk is the `"scip"` walk, byte for byte. The
-    /// choice is per workspace, not per language: an index with nodes that
-    /// lacks a language of the tree still takes `Scip` places, so that
-    /// language gets no `lsp.live` cards; set `"outline"` for such a tree.
+    /// Per language, by file: a file of a language the SCIP graph read for
+    /// the workspace covers (a language one of its nodes' files is in) is
+    /// placed as under [`Scip`](Self::Scip), byte for byte; a file of any
+    /// other language is placed as under [`Outline`](Self::Outline). With no
+    /// node read (no index is read under `scip.mode = "off"`, or under
+    /// `"cache"` with no file, and an index of a tree with no symbols has
+    /// none either) every file is. A language the index covers only in part
+    /// stays `Scip` for that language.
     #[default]
     Auto,
     /// The SCIP index's table alone: a symbol has a place only if the index
@@ -552,9 +552,11 @@ pub struct LspProfile {
     /// the poll fallback scans the tree every `watch_poll_milliseconds`. The
     /// recipes walk no `lsp.live` and run the same under both values.
     pub sync: LspSync,
-    /// `"auto"` (default): per walk, `"scip"` when the SCIP graph read for the
-    /// workspace has nodes, else `"outline"` (so `lsp.live` gives cards also
-    /// where no index is read). `"scip"`: `lsp.live` places a symbol only
+    /// `"auto"` (default): per language, by file: `"scip"` for the files of a
+    /// language the SCIP graph read for the workspace covers, `"outline"` for
+    /// the files of any other language and for every file when no node is read
+    /// (so `lsp.live` gives cards also where no index is read, and for the
+    /// language an index lacks). `"scip"`: `lsp.live` places a symbol only
     /// where the SCIP index has a node for it, so it asks nothing about a
     /// symbol the index lacks and, under `scip.mode = "off"`, nothing at all.
     /// `"outline"`: the index's table first, then the server's live outline of

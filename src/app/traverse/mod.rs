@@ -1146,7 +1146,7 @@ pub async fn run_with_trait_seeds(
             "scip.arbitration: {} judged {} (function and method destinations, places {}) in this call: {} edges confirmed, {} overruled",
             a.authority,
             judged.join(", "),
-            if built.outline { "outline" } else { "scip" },
+            built.places.label(),
             counts.confirmed,
             counts.overruled
         ));
@@ -1161,7 +1161,7 @@ pub async fn run_with_trait_seeds(
             totals.confirm_refuted,
             totals.confirm_unknown,
             totals.confirm_calls,
-            if built.outline { "outline" } else { "scip" },
+            built.places.label(),
         ));
     }
     // A server that is not ready when the walk ends says why a node may have

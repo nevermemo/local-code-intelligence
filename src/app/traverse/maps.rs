@@ -42,7 +42,7 @@ use lci_maps::{
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -345,9 +345,9 @@ pub(super) struct Built<'a> {
     pub lsp_live: Option<Arc<LspLive>>,
     pub lsp_live_sessions: Vec<(&'static str, Arc<lci_core::lsp::Manager>, String)>,
     pub lsp_live_walk: Option<Arc<lci_core::lsp::WalkSessions>>,
-    /// The places arm `lsp.live` resolved to for this call (`true`: the
-    /// outline arm); `false` when it is not registered.
-    pub outline: bool,
+    /// The places arm `lsp.live` resolved to for this call; `Scip` when it is
+    /// not registered.
+    pub places: PlacesArm,
     /// The confirm frontier's confirmer (`[run_profile.walk] confirm`): set
     /// when the key is on and the call registered both `grep.live` and
     /// `lsp.live`; `None` otherwise (the walk runs unconfirmed).
@@ -356,12 +356,41 @@ pub(super) struct Built<'a> {
     pub early: Duration,
 }
 
+/// The places arm `lsp.live` resolved to for a call (`[run_profile.lsp]
+/// places`, with `auto` read against the loaded index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacesArm {
+    /// The index's table alone.
+    Scip,
+    /// The index's table, then the server's outline for every file (also what
+    /// `auto` resolves to when the loaded index has no node).
+    Outline,
+    /// `auto` with an index: the index's table alone for the files of the
+    /// languages it covers (by node file), the server's outline for the files
+    /// of every other language.
+    Auto { indexed: BTreeSet<&'static str> },
+}
+
+impl PlacesArm {
+    /// The arm as the notes and the confirmer's identity name it.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Scip => "scip".to_owned(),
+            Self::Outline => "outline".to_owned(),
+            Self::Auto { indexed } => format!(
+                "auto (scip for {}; outline otherwise)",
+                indexed.iter().copied().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+}
+
 /// `lsp.live`'s confirmer with the places arm the call resolved to in its
 /// identity, so a handle refuses a resume under another places mode (the
 /// map's own identity names the server and the question, not the places).
 struct PlacesConfirmer {
     inner: Arc<dyn FrontierConfirmer>,
-    places: &'static str,
+    places: String,
 }
 
 #[lci_maps::async_trait]
@@ -642,7 +671,7 @@ pub(super) async fn build<'a>(
         Vec::new();
     let mut lsp_live_workspace = String::new();
     let mut lsp_live_walk: Option<Arc<lci_core::lsp::WalkSessions>> = None;
-    let mut lsp_live_outline = false;
+    let mut lsp_live_places = PlacesArm::Scip;
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
@@ -708,22 +737,37 @@ pub(super) async fn build<'a>(
                 let scip_places = ScipPlaces::from_scip(&loaded.scip);
                 // `outline`: the index's table first, the server's own outline
                 // for what it lacks (everything under `scip.mode = "off"`).
-                // `auto` (the default): the index's table when the graph read
-                // for this workspace has a node (then the walk is the `scip`
-                // walk), else the outline (no index is read under `scip.mode =
-                // off`, or under `cache` with no file: nothing else would
-                // place a symbol).
-                let outline = match profile.lsp.places {
-                    LspPlaces::Scip => false,
-                    LspPlaces::Outline => true,
-                    LspPlaces::Auto => loaded.scip.graph().nodes.is_empty(),
+                // `auto` (the default), per language: a file of a language the
+                // graph read for this workspace covers (by the file of its
+                // nodes) keeps the index's table alone (the `scip` walk), a
+                // file of any other language takes the outline; with no node
+                // at all, the outline throughout (no index is read under
+                // `scip.mode = off`, or under `cache` with no file: nothing
+                // else would place a symbol).
+                let arm = match profile.lsp.places {
+                    LspPlaces::Scip => PlacesArm::Scip,
+                    LspPlaces::Outline => PlacesArm::Outline,
+                    LspPlaces::Auto => {
+                        let indexed = scip_places.languages();
+                        if indexed.is_empty() {
+                            PlacesArm::Outline
+                        } else {
+                            PlacesArm::Auto { indexed }
+                        }
+                    }
                 };
-                lsp_live_outline = outline;
-                let places: Arc<dyn SymbolPlaces> = if outline {
-                    Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
-                } else {
-                    Arc::new(scip_places)
+                let places: Arc<dyn SymbolPlaces> = match &arm {
+                    PlacesArm::Scip => Arc::new(scip_places),
+                    PlacesArm::Outline => {
+                        Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
+                    }
+                    PlacesArm::Auto { indexed } => Arc::new(
+                        OutlinePlaces::over(scip_places)
+                            .with_tree(root)
+                            .index_only_for(indexed.clone()),
+                    ),
                 };
+                lsp_live_places = arm;
                 let map = Arc::new(
                     LspLive::new(Box::new(backend), places)
                         .implementations(profile.lsp.implementations)
@@ -753,7 +797,7 @@ pub(super) async fn build<'a>(
             Some(map) if wants(GREP_LIVE_MAP_ID) && call.scip_root.is_some() => {
                 confirmer = Some(Arc::new(PlacesConfirmer {
                     inner: map.confirmer(),
-                    places: if lsp_live_outline { "outline" } else { "scip" },
+                    places: lsp_live_places.label(),
                 }));
             }
             _ => {
@@ -977,7 +1021,7 @@ pub(super) async fn build<'a>(
         lsp_live,
         lsp_live_sessions,
         lsp_live_walk,
-        outline: lsp_live_outline,
+        places: lsp_live_places,
         confirmer,
         setup,
         early,

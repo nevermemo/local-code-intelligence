@@ -163,7 +163,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   and keeps the other edges, which is also how a server without `callHierarchyProvider` (it answers -32601) is found:
   the capabilities are not read.
   The symbol-to-place table behind the map (`lsp_live::SymbolPlaces`) is `ScipPlaces`, built from the SCIP graph's
-  nodes, under `[run_profile.lsp] places = "scip"`. With `places = "outline"` it is `OutlinePlaces` over it; `places = "auto"` (default) picks per walk: `ScipPlaces` when the SCIP graph read for the workspace has a node, else `OutlinePlaces` (`app::traverse::run`), so a tree with no index read (`scip.mode = "off"`, or `"cache"` with no file) still gets `lsp.live` cards. `OutlinePlaces`:
+  nodes, under `[run_profile.lsp] places = "scip"`. With `places = "outline"` it is `OutlinePlaces` over it; `places = "auto"` (default) picks per language (`app::traverse::maps`, `PlacesArm`): with no node read, `OutlinePlaces` (so a tree with no index read, `scip.mode = "off"`, or `"cache"` with no file, still gets `lsp.live` cards); else `OutlinePlaces` gated by `index_only_for(ScipPlaces::languages())`, where a file of a language one of the graph's node files is in (by `language::for_path`, not the key's language), or of no known language, is never outlined or learned (the index's table alone, as under `"scip"`) and any other file takes the outline. `OutlinePlaces`:
   `ask` outlines a symbol's file once per map instance (`Manager::document_symbols`, one counted external call;
   `SymbolPlaces::outline_wanted`), as it already does for a file or chunk node, and `SymbolPlaces::learn` takes the
   outline in. A member whose kind this build has a node for (`SymbolKind`: functions, methods, types, enums,

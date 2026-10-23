@@ -66,7 +66,10 @@
 //! function, method, type, enum, module and constant of an outlined file has
 //! an id. Under `places = "scip"` no outline is asked for a
 //! symbol and a symbol the index lacks has no place. The default, `places =
-//! "auto"`, is `scip` where the graph has a node and `outline` where it has none.
+//! "auto"`, is per language: a file of a language the graph covers (by the
+//! file of its nodes) is `scip`, a file of any other language is `outline`
+//! ([`OutlinePlaces::index_only_for`]), and a graph with no node is `outline`
+//! throughout.
 //! A server column is UTF-16, the index's a byte column; they differ only after
 //! non-ASCII text on the line.
 //!
@@ -289,6 +292,19 @@ impl ScipPlaces {
             places.by_node.insert(id, place);
         }
         places
+    }
+
+    /// The languages the index covers: the identifiers of the languages of
+    /// the files its nodes lie in (by file, through [`language::for_path`],
+    /// not by the language a node's key names, so a file the index names under
+    /// another language still counts as covered). A file of no known language
+    /// counts for none.
+    pub fn languages(&self) -> BTreeSet<&'static str> {
+        self.by_file
+            .keys()
+            .filter_map(|path| language::for_path(Path::new(path)))
+            .map(|adapter| adapter.identifier())
+            .collect()
     }
 }
 

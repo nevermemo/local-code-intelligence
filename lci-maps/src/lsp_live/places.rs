@@ -21,6 +21,12 @@
 //! index reads it) for a member the index has no node for, so a walk seeded
 //! by `sym.defs` and this map name one node. A member with no declaration
 //! (or a file that does not read or parse) is minted as above.
+//!
+//! The layer can be gated by language ([`OutlinePlaces::index_only_for`], what
+//! `places = "auto"` builds when an index is read): a file of a language the
+//! index covers, or of no known language, is never outlined or learned and
+//! the index's table alone answers for it, as under `scip`; the files of every
+//! other language take the outline.
 
 use super::{Member, Place, SymbolPlaces};
 use crate::crates::CrateNames;
@@ -29,7 +35,7 @@ use lci_core::{
     node::{NodeId, SymbolKey, SymbolKind, rust_module_path},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
@@ -96,6 +102,10 @@ pub struct OutlinePlaces {
     scip: Box<dyn SymbolPlaces>,
     /// The tree's root: where a Rust file's declarations are read from.
     tree: Option<PathBuf>,
+    /// The languages the index covers, when the layer is gated
+    /// ([`Self::index_only_for`]): a file of one of them (or of no known
+    /// language) is never outlined or learned.
+    index_only: Option<BTreeSet<&'static str>>,
     state: Mutex<Learned>,
 }
 
@@ -104,8 +114,30 @@ impl OutlinePlaces {
         Self {
             scip: Box::new(scip),
             tree: None,
+            index_only: None,
             state: Mutex::default(),
         }
+    }
+
+    /// Gates the layer by language (`places = "auto"` with an index): a file
+    /// of one of `languages`, or of no known language (no server could outline
+    /// it), is answered by the index's table alone, as under `scip` (no
+    /// outline asked, nothing learned); every other file takes the outline as
+    /// without the gate.
+    #[must_use]
+    pub fn index_only_for(mut self, languages: BTreeSet<&'static str>) -> Self {
+        self.index_only = Some(languages);
+        self
+    }
+
+    /// Whether the index's table alone answers for `path` (see
+    /// [`Self::index_only_for`]); false without a gate.
+    fn index_only(&self, path: &str) -> bool {
+        let Some(languages) = &self.index_only else {
+            return false;
+        };
+        language::for_path(Path::new(path))
+            .is_none_or(|adapter| languages.contains(adapter.identifier()))
     }
 
     /// Reads the declarations of the Rust files it learns from `root` (the
@@ -273,6 +305,9 @@ impl SymbolPlaces for OutlinePlaces {
     }
 
     fn learn(&self, path: &str, members: &[Member]) {
+        if self.index_only(path) {
+            return;
+        }
         // A file with no adapter gets no minted id (`id_for` declines), as before.
         let language = language::for_path(Path::new(path)).map(|adapter| adapter.identifier());
         let mut ordered: Vec<(&Member, SymbolKind)> = members
@@ -328,6 +363,6 @@ impl SymbolPlaces for OutlinePlaces {
     }
 
     fn outline_wanted(&self, path: &str) -> bool {
-        !self.state().files.contains(path)
+        !self.index_only(path) && !self.state().files.contains(path)
     }
 }

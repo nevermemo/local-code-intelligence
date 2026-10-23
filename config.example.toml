@@ -724,10 +724,14 @@ arbitration = false
 # lsp.live walk restarts a kept server after an edit whatever the sync did (the
 # tree barrier above), so for lsp.live the sync is what makes a server worth
 # keeping, not what avoids a restart. The recipes are the same under both values.
-# places = "auto" (default): per walk, "scip" when the SCIP graph read for the
-# workspace has at least one node (that walk is the "scip" walk), else "outline",
-# so a tree with no index read (scip.mode = "off", or "cache" with no file) still
-# gets lsp.live cards. "scip": lsp.live places a symbol only where the SCIP index
+# places = "auto" (default): per language, by file. A file of a language the SCIP
+# graph read for the workspace covers (a language one of its nodes' files is in)
+# is placed by the index alone, as under "scip"; a file of any other language
+# takes the server's outline, as under "outline" (a rust index in a tree with
+# python files: rust as "scip", python as "outline"). With no node read the walk
+# is "outline" throughout, so a tree with no index (scip.mode = "off", or
+# "cache" with no file) still gets lsp.live cards. A language an index covers
+# only in part (a crate added since) stays "scip" for that language. "scip": lsp.live places a symbol only where the SCIP index
 # has a node for it, so it asks nothing about a symbol the index lacks and,
 # under [run_profile.scip] mode = "off", nothing at all. "outline": the index's
 # table first, then the language server's own outline of a file
@@ -775,9 +779,9 @@ arbitration = false
 # are not changed by it: a server that dies with the call cannot amortise its
 # start, so there the map runs only when --maps or a policy names it. A call
 # that names its maps is never changed. With a SCIP index that has nodes the
-# walk places symbols by it (places = "auto"); with none read the map places
-# them by the server's own outline. For a language an index that has nodes
-# lacks, set places = "outline": under "scip" the map then asks nothing.
+# walk places the symbols of the languages it covers by it (places = "auto"),
+# and those of any other language by the server's own outline; with no node read
+# the map places everything by the server's own outline.
 # false: the map runs only when a call or a policy names it. The recipes never
 # run lsp.live and are the same under both values.
 # All eight keys are part of the run-profile hash.

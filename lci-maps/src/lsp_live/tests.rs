@@ -969,6 +969,62 @@ fn the_outline_layer_resolves_what_the_index_lacks_and_keeps_the_indexs_ids() {
 }
 
 #[test]
+fn an_indexed_language_is_never_outlined_or_learned_under_the_gate() {
+    // The index covers a language by the files its nodes lie in, whatever
+    // language the node ids name; a file of no known language covers none.
+    let mut scip = ScipPlaces::default();
+    for path in ["src/m.rs", "src/n.rs", "src/Q.cs", "notes/readme.unknown"] {
+        scip.by_file.insert(path.to_owned(), vec![(1, sym("q"))]);
+    }
+    assert_eq!(scip.languages(), BTreeSet::from(["csharp", "rust"]));
+    assert!(ScipPlaces::default().languages().is_empty());
+
+    let places = OutlinePlaces::over(table_rows()).index_only_for(BTreeSet::from(["rust"]));
+    // An indexed language: never asked, and an outline handed in is not taken
+    // (the index's id and place stay, no minted member appears).
+    assert!(!places.outline_wanted("src/x.rs"));
+    places.learn(
+        "src/x.rs",
+        &[
+            outline_member("src/x.rs", "x", 4, 9, 12),
+            outline_member("src/x.rs", "S", 7, 9, 23),
+        ],
+    );
+    assert!(!places.outline_wanted("src/x.rs"));
+    assert_eq!(places.place_of(&sym("x")), Some(place("src/x.rs", 0, 3)));
+    assert_eq!(places.defined_at(&place("src/x.rs", 4, 3)), None);
+    assert_eq!(places.defined_at(&place("src/x.rs", 7, 3)), None);
+    assert_eq!(places.enclosing("src/x.rs", 8), None);
+    // Another language takes the outline: asked once, learned, minted.
+    assert!(places.outline_wanted("src/z.py"));
+    places.learn("src/z.py", &[outline_member("src/z.py", "Z", 1, 3, 5)]);
+    assert!(!places.outline_wanted("src/z.py"));
+    let learned = places
+        .defined_at(&place("src/z.py", 1, 3))
+        .expect("the python outline is learned");
+    assert!(
+        matches!(&learned, NodeId::Symbol(key) if key.language == "python" && key.name == "Z"),
+        "{learned}"
+    );
+    assert_eq!(places.place_of(&learned), Some(place("src/z.py", 1, 3)));
+    // Without the gate the same rust file is outlined, so the test measures it.
+    let open = OutlinePlaces::over(table_rows());
+    assert!(open.outline_wanted("src/x.rs"));
+    open.learn("src/x.rs", &[outline_member("src/x.rs", "S", 7, 9, 23)]);
+    assert!(open.defined_at(&place("src/x.rs", 7, 3)).is_some());
+}
+
+#[test]
+fn a_file_of_no_known_language_is_index_only_under_the_gate() {
+    // No server could outline it: the gate leaves it to the index's table.
+    let gated = OutlinePlaces::over(table_rows()).index_only_for(BTreeSet::from(["rust"]));
+    assert!(!gated.outline_wanted("data/blob.unknown"));
+    assert!(!gated.outline_wanted("Makefile.zzz"));
+    // The ungated layer asks for any file, as before.
+    assert!(OutlinePlaces::over(table_rows()).outline_wanted("data/blob.unknown"));
+}
+
+#[test]
 fn the_index_table_takes_the_name_line_before_a_wider_range() {
     // An item's range now runs to its end and covers a same-named symbol
     // inside it; the member's own name line still picks its own node.
