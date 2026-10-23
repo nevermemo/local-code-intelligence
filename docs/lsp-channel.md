@@ -1,6 +1,6 @@
 # Language-server channel
 
-Home of how the language servers run inside LCI: the `lci-core` `lsp` module (`Manager`, sessions, breakers, readiness, sync, outline cache) and how the search channel, the navigation tools and the `lsp.live` traversal map use it. Crate layout and the other channels: [architecture.md](architecture.md); settings and defaults: [README.md](../README.md); `lsp.live` as a map: [engine.md](spike/multimap/engine.md).
+Code-level picture of how the language servers run inside LCI: the `lci-core` `lsp` module (`Manager`, sessions, breakers, readiness, sync, outline cache) and how the search channel, the navigation tools and the `lsp.live` traversal map use it. Crate layout and the other channels: [architecture.md](architecture.md); settings and defaults: [README.md](../README.md); behaviour and defaults of the `lsp.live` switches: [CLI reference](reference/cli.md); `lsp.live` as a map: [engine.md](spike/multimap/engine.md).
 
 - **LSP channel** (`lci-core` `lsp`): answers are merged query by query across providers and first-seen order decides the LSP rank (`lsp_channel` in `src/app/search.rs`). `LspAdapter` is a trait-object registry; `Manager` holds 8 adapters (rust-analyzer,
   csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, marksman), sessions keyed by `(provider, workspace_id)`,

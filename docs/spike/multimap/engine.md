@@ -54,7 +54,7 @@ Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`O
 | `exact.pickaxe` | first stage only | commits found by `git log -G/-S/--grep` for a history question (20 s timeout per call) | n/a | `exact_history.rs`, `first_stage.rs` |
 
 Other maps: `sym.defs` (RankList, PerFile; declarations from the bundle store, `symdefs.rs`) and the channel maps `vec.chunk.code`, `lexical`, `lsp.symbols` that wrap today's three search channels
-(`src/app/search/channel_maps.rs`, with `record_through_maps`/`fuse_through_maps` behind Cargo feature `map-equivalence`; `CHANNEL_ORDER` in `lci-maps` keeps the f32 fusion order bit-exact). Support modules: `walk.rs`
+(`src/app/search/channel_maps.rs`, the module and its `record_through_maps`/`fuse_through_maps` behind Cargo feature `map-equivalence`; `CHANNEL_ORDER` in `lci-maps` keeps the f32 fusion order bit-exact). Support modules: `walk.rs`
 (M0.4, hop scorer constants `W_BASE` 0.1, `W_INDEGREE_IDF` 0.3, `W_OVERLAP` 0.6), `crates.rs`, `fresh.rs`, `audit.rs`, `labels.rs`, `kit.rs`, `kit_c3.rs`, `run_record.rs`.
 
 What persists between index passes (chunk store): per chunk the trimmed `code`, line range, `content_hash`, language and path (manifest and LanceDB columns with the vector); per file `language`, `adapter_version`,

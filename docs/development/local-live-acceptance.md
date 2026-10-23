@@ -24,7 +24,7 @@ Each step has its own timeout, so a stuck fast step fails in minutes instead of 
 | Acceptance `core` (index, search, reindex smoke test; cold-embeds this repository) | 20 min |
 | Acceptance `multilingual` (fixture indexing, search, decoy ranking) | 15 min |
 | Acceptance `lsp` (rust-analyzer) | 30 min |
-| 23 small-fixture LSP steps: `<lang>-lsp`, `<lang>-missing`, `<lang>-recovery` for python, typescript, go, java, csharp, c, cpp, and `markdown-lsp`, `markdown-missing` for markdown | 10 min each |
+| 23 small-fixture LSP steps: `<lang>-lsp`, `<lang>-missing`, `<lang>-recovery` for python, typescript, go, java, markdown (`-lsp` and `-missing` only), csharp, c, cpp | 10 min each |
 | `lci config --json` (records the configuration layers the evaluation will use) | 1 min |
 | `evaluate ./evaluations/core.toml --workspace self=<repo> --output test-results/evaluation.json` | 15 min |
 

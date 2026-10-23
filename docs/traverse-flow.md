@@ -1,6 +1,6 @@
 # Traverse call flow
 
-Home of the code-level flow of one `search_code mode="traverse"` / `lci traverse` call (`app::traverse::run`) and of the answer keys that the `[run_profile]` switches add (`answer_labels`, `card_paths`, `map_freshness`, `verify_on_read`). Crate layout: [architecture.md](architecture.md); the engine, maps and steering ladder: [engine.md](spike/multimap/engine.md); settings: [README.md](../README.md).
+Code-level picture of the flow of one `search_code mode="traverse"` / `lci traverse` call (`app::traverse::run`) and of the answer keys that the `[run_profile]` switches add (`answer_labels`, `card_paths`, `map_freshness`, `verify_on_read`); behaviour and defaults of those keys: [CLI reference](reference/cli.md). Crate layout: [architecture.md](architecture.md); the engine, maps and steering ladder: [engine.md](spike/multimap/engine.md); settings: [README.md](../README.md).
 
 `search_code` with `mode = "traverse"` (needs `[traverse] enabled`) and `lci traverse` run one function,
 `app::traverse::run`. It loads the SCIP index (map `graph.scip`, cached by file stamp; `[run_profile.scip] mode` `cache` (the default) reads it when it is there and parses an unreadable file once per file stamp, `authoritative` requires it, `off` never touches it and leaves the graph and the maps built from the index file empty, each saying so in a note), finds the start nodes

@@ -118,7 +118,7 @@ compile_error_at, near, defined_in. Edges are sorted by confidence, then destina
 
 `fuse` replaces `fuse_hits` with a loop that keeps today's arithmetic exactly:
 
-1. Order: `vec.chunk.code`, `lexical`, `lsp.symbols` first, in that order (`LEGACY_ORDER`); then every other `RankList` or `Expansion` map in registry order (sorted
+1. Order: `vec.chunk.code`, `lexical`, `lsp.symbols` first, in that order (`CHANNEL_ORDER` in `lci-maps`); then every other `RankList` or `Expansion` map in registry order (sorted
    by `MapId`); then `Prior` maps.
 2. For each map's hits in its own order: `score[node] += weight(map) / (rrf_k + rank as f32)`, in `f32`, starting from `0.0`. A node's first contribution inserts it.
 3. `Prior` maps add their value unweighted (the source-role prior, `src/store.rs`). After the rank lists are fused, every `Prior` map gets the fused nodes as seeds
