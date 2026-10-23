@@ -874,7 +874,7 @@ async fn seeds<'p>(
         // The deadline is the walk's own: a slow hybrid search (a loaded
         // embedder) must not spend it before the first pop. The search is
         // bounded by the embedding and reranker timeouts instead, and the
-        // first stage's git calls below see the moved deadline.
+        // first stage's git calls (`run_first_stage`) see the moved deadline.
         ledger.budget.deadline += found.search_time;
     }
 
@@ -906,7 +906,8 @@ async fn seeds<'p>(
             .map_err(|e| anyhow!("{e}"))?;
     }
     // The trait and trait-method paths of the question join the start nodes
-    // (K39a: this ran inside the `scip.implements` registration).
+    // (added here, after the registration: they used to be added inside the
+    // `scip.implements` registration).
     if setup.snapshot.is_none()
         && let Some(map) = &built.implements
         && let Some(note) = add_trait_seeds(&mut found, map, call.question, trait_seed_mode)
@@ -978,7 +979,8 @@ async fn run_first_stage(
                     k => k as usize,
                 };
                 // The git calls share what is left of the call's deadline
-                // (the walk's deadline is not extended by them, see below).
+                // (the walk's deadline is not extended by them, see the credit
+                // in `run_with_trait_seeds`).
                 let git = BudgetedGit {
                     git: PathBuf::from("git"),
                     tree,
@@ -1262,7 +1264,8 @@ pub async fn run_with_trait_seeds(
     {
         let barrier_started = Instant::now();
         walk_restarts = walk_tree_barrier(call).await;
-        // Setup, like the version probe below: credited back to the deadline.
+        // Setup, like the version probe in `maps::build`: credited back to the
+        // deadline.
         ledger.budget.deadline += barrier_started.elapsed();
     }
 
