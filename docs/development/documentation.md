@@ -28,7 +28,8 @@ Agents read these files without chat context and pay for every token, so the fil
    `*-prereg*.md` and `*-results.md` records under `docs/spike/multimap/v2`) and runs in `--suite Full`; none may be
    missing.
 10. Short over complete: a table over prose for facts with the same shape; one example instead of three; a pointer
-    instead of a copy. Target sizes: README <= 260 lines, any guide <= 250, the roadmap <= 350, the log <= 300.
+    instead of a copy. Target sizes: README <= 260 lines, any guide <= 250, the roadmap <= 350. The append-only log
+    `docs/decisions.md` is exempt from the line target.
 11. Vendored third-party files (`.agents/skills/rust-skills/**`) are not edited.
 12. Every change to these files is checked against the code it describes (names, defaults, ports, commands) in the
     same change.
