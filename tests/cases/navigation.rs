@@ -3484,6 +3484,14 @@ async fn status_reports_the_sync_of_a_workspace_with_a_session_only() {
             "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; public int Mul(int a, int b) => a * b; }\n",
         )
         .unwrap();
+        // The poll fallback compares mtimes in whole seconds: push the mtime
+        // past the opening scan's so either backend sees the edit.
+        std::fs::File::options()
+            .write(true)
+            .open(workspace.join("src/Calculator.cs"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
         wait_until(
             "the sync to report the edit",
             Duration::from_secs(30),

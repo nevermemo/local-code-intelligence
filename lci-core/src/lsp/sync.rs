@@ -111,8 +111,9 @@ pub enum Backend {
 pub struct SyncStatus {
     /// `None` while the watcher is still being opened.
     pub backend: Option<Backend>,
-    /// Neither the platform watcher nor the polling one could be started:
-    /// nothing reports edits, and only the walk at start has run. A watcher
+    /// Neither the platform watcher nor the polling one could be started (or
+    /// the opening task died): nothing reports edits, and only the walk at
+    /// start has run, unless the opening task died, which leaves no walk. A watcher
     /// that stops later (roadmap N102) is not seen here; its `events` stop
     /// growing.
     pub failed: bool,
@@ -191,7 +192,7 @@ struct Shared {
     root: PathBuf,
     sink: Sink,
     backend: OnceLock<Backend>,
-    /// Set when neither watcher started.
+    /// Set when neither watcher started or the opening task died.
     failed: AtomicBool,
     /// The running watcher; dropped when the sync stops.
     watcher: Mutex<Option<Box<dyn Watcher + Send>>>,
@@ -412,11 +413,23 @@ async fn open_blocking(
         .ok()
 }
 
+/// Marks the sync failed when the opener never returned (it panicked on the
+/// blocking thread or the runtime is shutting down), so the status does not
+/// read as "still opening" forever.
+fn fail_without_watcher(shared: &Shared) {
+    shared.failed.store(true, Ordering::Relaxed);
+    tracing::warn!(
+        root = %shared.root.display(),
+        "the file watcher opener did not finish; language servers will not be told about edits"
+    );
+}
+
 /// The forwarding task: opens the platform watcher (the polling one when
 /// that fails), walks once, then drains whenever events are queued, walking
 /// again first when a rescan was asked for.
 async fn run(shared: Arc<Shared>, open: Open, fallback: Open, poll_interval: Duration) {
     let Some(opened) = open_blocking(&shared, open, poll_interval).await else {
+        fail_without_watcher(&shared);
         return;
     };
     let opened = match opened {
@@ -433,6 +446,7 @@ async fn run(shared: Arc<Shared>, open: Open, fallback: Open, poll_interval: Dur
             );
             let _ = shared.backend.set(Backend::Poll);
             let Some(polled) = open_blocking(&shared, fallback, poll_interval).await else {
+                fail_without_watcher(&shared);
                 return;
             };
             polled

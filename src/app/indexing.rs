@@ -166,7 +166,8 @@ pub struct Status {
     /// its sync runs, so absent with `sync = "off"` or without a session. The
     /// watcher in use (`backend`: `notify`, `poll` after the platform watcher
     /// failed to start, `null` while it is still opening), `failed` when
-    /// neither watcher could start (the servers are told nothing), and the
+    /// neither watcher could start or the opening task died (the servers are
+    /// told nothing), and the
     /// counters `events`, `batches`, `forwarded`, `walks` and `rescans`. A
     /// watcher that stops silently (roadmap N102) shows as `events` that stop
     /// growing after edits. A report only: it changes no answer.
