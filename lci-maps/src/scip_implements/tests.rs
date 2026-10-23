@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    SnapshotRef,
+    MapStatus, SnapshotRef,
     kit_c3::check_expand,
     scip_graph::{DirSource, Range, RawDocument, RawOccurrence, SourceText},
 };

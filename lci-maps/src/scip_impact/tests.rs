@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::{
-    Registry, SnapshotRef,
+    MapStatus, Registry, SnapshotRef,
     audit::audit_edge_sources,
     kit_c3::check_expand,
     scip_graph::{Range, RawDocument, RawOccurrence},

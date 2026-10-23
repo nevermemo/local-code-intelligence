@@ -87,9 +87,11 @@
 //! `graph.scip`.
 
 use crate::{
-    Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
-    MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
-    edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
+    Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, FreshnessModel, Map, MapDescriptor, MapId,
+    MapRequest, MapResponse, SnapshotView, SourceLabel,
+    edge::{
+        CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges, ranked_hits,
+    },
     impact::chain_of,
     live_grep::CostLog,
     scip_graph::{GraphEdgeKind, ScipGraph, Witness},
@@ -447,51 +449,15 @@ impl Map for ImplementsMap {
     }
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
-        let started = Instant::now();
-        let mut edges = Vec::new();
-        let mut dropped = 0;
-        for (seed, _) in request.seeds {
-            let (found, total) = self.edges_of(seed);
-            dropped += total - found.edges.len();
-            edges.extend(found.edges);
-        }
-        cap_edges(&mut edges, usize::MAX);
-        let mut seen = HashSet::new();
-        edges.retain(|edge| seen.insert(edge.dst.clone()));
-        edges.truncate(request.limit);
-        let mut response = MapResponse::empty(&self.descriptor, view, MapStatus::Ok);
-        if dropped > 0 {
-            response.status = MapStatus::Partial {
-                note: Some(format!(
-                    "{dropped} more implementations than the cap of {} were not offered",
-                    self.options.cap
-                )),
-                warning: None,
-            };
-        }
-        response.cost = Cost {
-            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            nodes_touched: edges.len() as u64,
-            ..Cost::default()
-        };
-        response.hits = edges
-            .into_iter()
-            .zip(1..)
-            .map(|(edge, rank)| MapHit {
-                node: edge.dst,
-                rank,
-                score: Some(f32::from(edge.conf) / f32::from(CONF_MAX)),
-                evidence: vec![Evidence {
-                    via: Some(edge.src),
-                    edge: edge.kind,
-                    label: SourceLabel::Scip,
-                    detail: edge
-                        .site
-                        .map(|s| format!("implements at {}:{}", s.path, s.line + 1)),
-                }],
-            })
-            .collect();
-        response
+        ranked_hits(
+            &self.descriptor,
+            request,
+            view,
+            self.options.cap,
+            "implementations",
+            |seed| self.edges_of(seed),
+            |s| format!("implements at {}:{}", s.path, s.line + 1),
+        )
     }
 
     async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
