@@ -29,7 +29,7 @@ Ask the human and wait for a clear yes before you:
 
 Allowed without asking:
 
-- local branches; commits on a non-`main` branch; pushing that branch to `origin`. `ci.yml` and `live-acceptance.yml` in `.github/workflows` trigger only on pushes to `main`, pull requests, or a manual dispatch, so a feature-branch push runs no tests; the third workflow, `close-landed-copilot-prs.yml`, runs only on pushes to `main` and closes Copilot PRs whose change landed there;
+- local branches; commits on a non-`main` branch; pushing that branch to `origin`. `ci.yml` and `codeql.yml` in `.github/workflows` trigger only on pushes to `main` and pull requests (CodeQL also runs weekly), and `live-acceptance.yml` only by manual dispatch, so a feature-branch push runs no tests;
 - building, running tests, and running live evaluation/acceptance against already-running 8766/8767 services;
 - scratch fixtures, configs, data directories, and reports under `test-results/` or outside the repository.
 
