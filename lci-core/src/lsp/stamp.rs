@@ -143,7 +143,7 @@ fn metadata_of(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
 /// Whether the file name `name` is one of the configuration file patterns
 /// (`pattern` is a name, or has one `*`), ignoring ASCII case (Windows and
 /// macOS volumes are case-insensitive).
-fn matches(pattern: &str, name: &str) -> bool {
+pub(super) fn matches(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
         Some((prefix, suffix)) => {
             name.len() >= prefix.len() + suffix.len()

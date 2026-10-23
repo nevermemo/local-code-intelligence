@@ -3,7 +3,8 @@
 use super::{App, WorkspaceCoordination, ms};
 use crate::{
     chunk,
-    config::fill_template,
+    config::{LspRoots, fill_template},
+    lsp::roots::{Root, RootReason},
     manifest::{self, Manifest},
     models::{self, Models},
     store::{Store, vector_key},
@@ -207,8 +208,19 @@ pub struct ServerRoster {
     /// `[run_profile.lsp] breaker = true` (a failed probe or start opened it);
     /// `null` without the breaker or when the window is closed.
     pub breaker_open_ms: Option<u64>,
-    /// The directory the server is started at, relative to the workspace.
+    /// The directory the server is started at, relative to the workspace
+    /// (`.` for the workspace itself). Of a live session, the directory it was
+    /// started at; without one, the directory a start would choose now under
+    /// `[run_profile.lsp] roots`, worked out only for an enabled, configured
+    /// server whose languages the index holds (else `.`).
     pub root: String,
+    /// Why `root` is what it is: `roots_workspace` (the key says so),
+    /// `manifest:<file>` (the directory of the topmost manifest),
+    /// `no_manifest`, `several_roots:<n>` (sibling manifests),
+    /// `files_outside_root:<n>`, `no_file_list`, `unreadable` or `not_served`
+    /// (a disabled, unconfigured or unserving server; the last six start at
+    /// the workspace).
+    pub root_reason: String,
     /// The session's report, as in `analyzers`; `null` without a session.
     pub session: Option<crate::lsp::ServerReadiness>,
 }
@@ -840,6 +852,21 @@ impl App {
                 .collect();
             languages_in_index.sort_unstable();
             let command = adapter.configured_command();
+            // A live session reports the root it started at. Without one, the
+            // root a start would choose now; under `manifest` that reads the
+            // directories of the server's files, so it is worked out only for
+            // a server a start could serve here.
+            let root = match self.analyzer.session_root(provider, &workspace.id).await {
+                Some(root) => root,
+                None if self.config.run_profile.lsp.roots == LspRoots::Workspace
+                    || (adapter.enabled()
+                        && command.is_some()
+                        && !languages_in_index.is_empty()) =>
+                {
+                    self.analyzer.server_root(adapter, &workspace).await
+                }
+                None => Root::workspace(&workspace.path, RootReason::NotServed),
+            };
             servers.push(ServerRoster {
                 provider: provider.to_owned(),
                 languages: adapter.languages().to_vec(),
@@ -852,7 +879,8 @@ impl App {
                     .analyzer
                     .breaker_remaining(provider)
                     .map(|left| u64::try_from(left.as_millis()).unwrap_or(u64::MAX)),
-                root: ".".to_owned(),
+                root: root.relative,
+                root_reason: root.reason.to_string(),
                 session,
             });
         }

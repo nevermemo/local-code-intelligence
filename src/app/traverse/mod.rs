@@ -294,7 +294,9 @@ pub struct Call<'a> {
     /// its own, the recipes) starts all the call's servers as under `per_call`.
     /// Under `per_call` it is never read, except for its `[run_profile.lsp]
     /// breaker` windows, which the call's own manager reads and opens under both
-    /// values (see [`per_call_manager`]).
+    /// values, and its index file list, which `[run_profile.lsp] roots =
+    /// "manifest"` reads to start a server at its project's directory (see
+    /// [`per_call_manager`]).
     pub lsp_sessions: Option<Arc<lci_core::lsp::Manager>>,
 }
 
@@ -305,13 +307,21 @@ pub struct Call<'a> {
 /// and stop with the walk. Under `[run_profile.lsp] breaker = true` it reads
 /// and opens the skip windows of the call's shared manager (`Call.lsp_sessions`),
 /// so a provider found dead by one call is left alone by the next; a call with no
-/// shared manager has no windows.
+/// shared manager has no windows. It also reads the index's file list of that
+/// shared manager (for `roots = "manifest"`); a call with no shared manager, or
+/// one with no file list, has none, and every server starts at the workspace.
 pub fn per_call_manager(call: &Call<'_>) -> Arc<lci_core::lsp::Manager> {
     let defaults = lci_core::config::Config::default();
+    let manager = lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults))
+        .without_sync()
+        .with_breakers(call.lsp_sessions.as_ref().and_then(|m| m.breakers()));
+    // The index's file list of the call's shared manager, which `[run_profile.lsp]
+    // roots = "manifest"` reads to start a server at its project's directory.
     Arc::new(
-        lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults))
-            .without_sync()
-            .with_breakers(call.lsp_sessions.as_ref().and_then(|m| m.breakers())),
+        match call.lsp_sessions.as_ref().and_then(|m| m.indexed_source()) {
+            Some(source) => manager.with_indexed_files(source),
+            None => manager,
+        },
     )
 }
 

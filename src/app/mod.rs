@@ -127,12 +127,10 @@ impl App {
         config.data_dir = dunce::canonicalize(&config.data_dir)?;
         let store = Store::open(&config.data_dir.join("lancedb")).await?;
         let models = Models::new(&config)?;
-        let analyzer = Arc::new(lsp::Manager::new(&config).with_indexed_files(Arc::new(
-            ManifestFiles {
-                data_dir: config.data_dir.clone(),
-                kept: std::sync::Mutex::new(HashMap::new()),
-            },
-        )));
+        let analyzer = Arc::new(
+            lsp::Manager::new(&config)
+                .with_indexed_files(Arc::new(ManifestFiles::new(config.data_dir.clone()))),
+        );
         let profile_hash = config.run_profile().hash;
         let warm_on_touch = config.run_profile.lsp.sessions == crate::config::LspSessions::Shared
             && config.traverse.enabled
@@ -502,9 +500,19 @@ async fn lock_file_exclusive(
 /// list is read once per change of the manifest file (its modification time
 /// and length) and kept, so a call with an unchanged index pays one stat. A
 /// workspace with no manifest, or an empty one, has no list.
-struct ManifestFiles {
+pub struct ManifestFiles {
     data_dir: PathBuf,
     kept: std::sync::Mutex<HashMap<String, KeptFiles>>,
+}
+
+impl ManifestFiles {
+    /// The file list of the manifests under `data_dir`.
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            kept: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 /// One workspace's kept list and the manifest stat it was read under.
