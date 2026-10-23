@@ -39,9 +39,8 @@ port = 8768
 embedding_batch_size = 8
 # Prompt formats for the embedding model. Models differ in what they expect (an
 # instruction prefix, a task label), so the text embedded for a query and for an
-# indexed chunk are both templates. The defaults below are the formats LCI used
-# before they were configurable (Qwen3-Embedding's query instruction, the bare
-# code for documents).
+# indexed chunk are both templates. The defaults below are Qwen3-Embedding's
+# query instruction and the bare code for documents.
 #
 # embedding_query_template is the text embedded for a search query. {query} is
 # required. It shapes the query only, so changing it never re-embeds an index.
@@ -75,12 +74,11 @@ reranker_timeout_seconds = 120
 # the fusion order with one warning; the reranker is not the fallback.
 rescorer = "reranker"
 # Bounded timeout for /ready and service_status dependency probes, and for the
-# readiness probe of the lsp.live traversal map (1-30 seconds). 15 by default (it
-# was 5): a language-server binary can take several seconds to answer its probe
+# readiness probe of the lsp.live traversal map (1-30 seconds). 15 by default: a
+# language-server binary can take several seconds to answer its probe
 # (`<server> --version`, `gopls version`, a start for pyright) while the machine
-# is busy. A hanging dependency is now waited for up to 15 s,
-# and one that answers in 5 to 15 s is reported ready; a refused port or a
-# missing binary still fails at once.
+# is busy. A hanging dependency is waited for up to this long, one that answers
+# within it is reported ready; a refused port or a missing binary fails at once.
 readiness_timeout_seconds = 15
 ripgrep_path = "rg"
 semantic_candidate_count = 40

@@ -16,7 +16,7 @@ from GitHub's UI) when a runner is up (see [live-acceptance-ci.md](live-acceptan
 ## Steps and timeouts
 
 Each step has its own timeout, so a stuck fast step fails in minutes instead of waiting out one job-wide bound
-(`live-acceptance.yml` has a single `timeout-minutes: 150`). The run has 27 steps in this order:
+(`live-acceptance.yml` has a single `timeout-minutes: 150`). The run has 29 steps in this order (28 with `--skip-build`):
 
 | Step | Timeout |
 | --- | --- |
@@ -24,7 +24,7 @@ Each step has its own timeout, so a stuck fast step fails in minutes instead of 
 | Acceptance `core` (index, search, reindex smoke test; cold-embeds this repository) | 20 min |
 | Acceptance `multilingual` (fixture indexing, search, decoy ranking) | 15 min |
 | Acceptance `lsp` (rust-analyzer) | 30 min |
-| 21 small-fixture LSP steps: `<lang>-lsp`, `<lang>-missing`, `<lang>-recovery` for python, typescript, go, java, csharp, c, cpp | 10 min each |
+| 23 small-fixture LSP steps: `<lang>-lsp`, `<lang>-missing`, `<lang>-recovery` for python, typescript, go, java, csharp, c, cpp, and `markdown-lsp`, `markdown-missing` for markdown | 10 min each |
 | `lci config --json` (records the configuration layers the evaluation will use) | 1 min |
 | `evaluate ./evaluations/core.toml --workspace self=<repo> --output test-results/evaluation.json` | 15 min |
 

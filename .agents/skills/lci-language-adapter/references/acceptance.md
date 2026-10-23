@@ -14,7 +14,7 @@ A language-support claim requires evidence for the affected language:
 10. Compatible reuse after application restart.
 11. Semantic and lexical retrieval plus reranking and reranker fail-open behavior.
 12. A production implementation ranked against a realistic test, example, or documentation decoy.
-13. README, MCP, CLI, filter, and evaluation-definition updates.
+13. README, docs/reference guides, MCP, CLI, filter, and evaluation-definition updates.
 14. LSP navigation available via the language-server adapter contract, passing `lci-lsp-adapter`'s own acceptance bar (real workspace symbol/definition/reference evidence, provider isolation, and recovery).
 
 ## Where each class of evidence comes from
@@ -24,7 +24,7 @@ A language-support claim requires evidence for the affected language:
 | 1-4, 6-10 (mocked) | `lci-core` unit tests plus `tests/cases/indexing.rs` with the fake model service | `cargo test -p lci-core --lib chunk::`, `cargo xtask test --suite Indexing` |
 | 5-11 (live) | mixed-language fixture indexing, update, delete, restart, failed-update retention, live reranking | `cargo xtask acceptance multilingual` (8766/8767 up; reports `test-results/multilingual-*.json`) |
 | 12 | a scratch decoy evaluation TOML kept outside the repo, run with and without the reranker | `lci-retrieval-evaluation/references/evaluation-workflow.md` |
-| 13 | README language table and chunk description, `config.example.toml` (if an LSP section exists), `evaluations/core.toml` chunking query, MCP tool descriptions | review the diff against `.github/instructions/documentation.instructions.md` |
+| 13 | README language table and chunk description, `docs/reference` guides, `config.example.toml` (if an LSP section exists), `evaluations/core.toml` chunking query, MCP tool descriptions | review the diff against `.github/instructions/documentation.instructions.md` |
 | 14 | real server symbol/definition/reference, provider isolation, recovery | `cargo xtask acceptance <lang>-lsp`, `<lang>-missing`, `<lang>-recovery` |
 
 Use mocks for deterministic automated coverage and the configured 8766/8767 services for one bounded live acceptance. Report those evidence classes separately.

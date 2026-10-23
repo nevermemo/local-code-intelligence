@@ -2,9 +2,9 @@
 
 `local-code-intelligence` (LCI) is a standalone local service: an MCP server and a plain REST mirror, plus a command
 line, over one process. It owns its indexes and keeps persistent data in `data_dir`, outside every indexed repository.
-Clients (Kilo, Copilot, Codex, any MCP-capable agent) are not special: client-specific behaviour does not belong in
+Clients (Kilo, Codex, any MCP-capable agent) are not special: client-specific behaviour does not belong in
 the service. Behaviour and surfaces are described in [README.md](../README.md); this file describes the structure.
-Facts here were checked against the code of the `spike/v2` branch on 2026-10-17; names are symbols, not line numbers.
+Facts here describe `main`; names are symbols and files, not line numbers.
 
 ## Crates
 
@@ -15,7 +15,7 @@ The Cargo workspace has four members: the root package `local-code-intelligence`
 | `local-code-intelligence` (root) | `src/` | `app`, `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server` (MCP), `rest`, `init` (`lci init`), `main` (CLI). Re-exports the `lci-core` modules from `src/lib.rs` so `crate::chunk`-style paths resolve. Cargo feature `map-equivalence` compiles test-only entry points (`App::fuse_through_maps`, `App::record_through_maps`) and the retrieval channels wrapped as maps (`src/app/search/channel_maps`). | `lci-core`, `lci-maps` |
 | `lci-core` | `lci-core/src/` | Pure logic: `bundle`, `chunk`, `config` (with `config::layers` and `config::profile`), `endpoint`, `evaluation` (portable evaluation definitions and validation), `filter`, `language`, `lexical`, `lsp`, `manifest`, `models`, `node` (stable `NodeId`), `path`, `provider` (completion providers for System One), `workspace`, plus the Tree-sitter grammars | none of LanceDB, Arrow, axum, rmcp |
 | `lci-maps` | `lci-maps/src/` | The maps, the registry and the traversal engine behind `search_code mode="traverse"`, `lci traverse` and the recipes: the `Map` trait, `Registry` (fail-open, fusion in today's arithmetic and order), the traversal engine (`traverse`, `walk`), the maps (SCIP graph and impact, config key, git history, live grep, LSP, search, symbol definitions, probe), the contract kit, the RunRecord writer | `lci-core` |
-| `xtask` | `xtask/src/` | `cargo xtask` subcommands setup, build, test, acceptance, live-acceptance, env, lint-machine-paths, docs, gold, maps, mine-queries | `lci-core`, `lci-maps` |
+| `xtask` | `xtask/src/` | the 14 `cargo xtask` commands (listed in [README.md](../README.md), "Build and run") | `lci-core`, `lci-maps` |
 
 The split exists for build time (commit `0729d9a`): the LanceDB/Arrow tree takes minutes to compile, so a change that stays inside
 `lci-core` is checked in seconds with `cargo check -p lci-core` and `cargo test -p lci-core --lib <module>::` (see
@@ -110,85 +110,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   term; at most 12 terms score, rarest first (`MAX_SCORING_TERMS`). Capped at `lexical_candidate_count` (40). `rg` is
   not given `--hidden` or `.lciignore`, so it skips hidden files the scanner indexes (those drop out because only lines
   inside indexed chunks count), and it reads the live tree while chunks come from the snapshot, so line ranges can drift under `manual` or `watch` freshness.
-- **LSP channel** (`lci-core` `lsp`): answers are merged query by query across providers and first-seen order decides the LSP rank (`lsp_channel` in `src/app/search.rs`). `LspAdapter` is a trait-object registry; `Manager` holds 8 adapters (rust-analyzer,
-  csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, marksman), sessions keyed by `(provider, workspace_id)`,
-  started on a detached task shared by concurrent callers (its `initialize` is bounded by `lsp_start_timeout_seconds`,
-  default 0 = `lsp_timeout_seconds`, like every later request) and primed with one background `workspace/symbol`. Idle
-  sessions are released after `lsp_idle_timeout_seconds` (1800) and a session that answers only transient errors for
-  `lsp_stuck_seconds` (900) is replaced. Requests: `symbols` (`workspace/symbol`), `definition`, `references`, all
-  returning `Location` (path, range, name, kind, language, provider). Search use: up to 8 symbol queries (a term plus
-  `#`, plus a singular form for plurals), providers in parallel, each under `lsp_search_budget_ms` (1500); a provider
-  over budget adds a note, a provider that fails adds a warning; locations map onto chunks of the same language that
-  contain `start_line`; capped at `lsp_candidate_count` (40). Navigation tools (`symbols`, `definition`, `references`)
-  are not fused, return raw `Location`s and need an index containing the file's language. A server whose symbols are not code names (marksman: headings) opts out of the search channel (`LspAdapter::joins_search_channel`, default true) and is reached by navigation only. The `lsp.live` map of a
-  traversal (`lci-maps` `lsp_live`) asks the `Manager`s it is given: `ManagerBackend::open(workspace, Arc<Manager>)` (one for every server) or `ManagerBackend::open_split(workspace, shared, own, probe)`, which probes through `shared` and routes each server to `shared` when `LspAdapter::watches_workspace()` (rust-analyzer alone: it runs its own file watcher) or `shared` syncs (`sync = "watch"`, the default since K11b-4), and in both cases only when the adapter lists its tree stamp's configuration files (`keeps_session`; not jdtls or marksman), else to `own`; a server routed to `shared` first passes `Manager::tree_barrier` (a walk passes two, see below), which stats the server's indexed files, their directories and ancestors and its manifests (`lsp::stamp`, from the index's file list that `App` supplies through `stamp::IndexedFiles` over the workspace manifest) and stops the session when the stamp changed, so the walk starts one that reads the disk. Navigation and the search channel pass the same barrier, once per call, and carry the same notes (`lsp:` for `lsp.live:`; `NavigationReport.notes`, `SearchReport.notes`); the search channel alone (`Manager::search_barrier`) keeps a running session of a server that watches its workspace through a changed stamp, records no stamp for it and labels the answer `kept session; <reason> (kept: it watches its workspace)`, so the next navigation call or walk restarts it (N108). `lsp.live` is in the default map set of a call that names no maps, has a tree, runs under `sessions = "shared"` and was given a manager (the service's; the CLI one-shot has none unless `--maps` or a policy names the map) while `[run_profile.lsp] live` is `true` (the default; `app::traverse::run_with_trait_seeds`). A walk that runs the map on the shared manager passes the strict tree barrier once, before its seed search (`walk_tree_barrier`): the seed search is the search channel and would otherwise keep a watching server through an edit that the backend's own barrier then restarts inside the walk's deadline, so the server is restarted once, up front, and the seed search and the map find the same session. The backend then passes its own strict barrier after the seed search, as before (a continuation skips the pre-seed one and has only the backend's), so a walk has one restart: the pre-seed barrier restarts a stale server, and the backend's restarts it again only if the stamp changed between the two (a refresh that adds a file in between). Under
-  `[run_profile.lsp] sessions = "per_call"` `app::traverse::run` builds one per call, so the map owns it and its
-  server dies with the map; under `"shared"` (default) it uses `Call.lsp_sessions` as `shared` and a per-call manager as `own`, so a server that lists no configuration files for the tree stamp (jdtls, marksman), or that neither sees an edit on its own nor is told by the sync (`sync = "off"`; the default is `"watch"`), starts per call, and a reused server is never staler than `per_call` for any change inside the tree stamp's coverage (its residuals are in the README; the walk labels a reused server's answer with a `kept session` note); `Call.lsp_sessions` is the `Arc<Manager>` that `App::language_servers()`
-  hands out (the service's own, so a server started by navigation, search or a kept traverse server serves the others; the CLI
-  `traverse` builds one per process and shuts it down after the walk), and a kept server's lifetime is the manager's (idle
-  sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful readiness probe per provider for
-  the manager's life (the probe is per adapter, `adapter::probe_subprocess`: `<server> --version` that exits 0 by default, `gopls version`,
-  and for pyright a start whose exit status is ignored, since `pyright-langserver` has no version flag and exits 1; so a dead pyright
-  shows first at the session start, not at the probe). Under `[run_profile.lsp] breaker = true` (the default) a manager also holds `lsp::LspBreakers`, one 30 s
-  window per provider (`LSP_DOWN_WINDOW`, the `ConnectBreaker` of the model clients): a failed probe in `probe_once`
-  (`adapter::ProbeFailure::Failed`, or an adapter's own readiness error; a missing binary or a probe that timed out opens
-  no window, since it is no evidence of a dead server: the miss costs under a millisecond and its note is the same on every
-  walk, and a slow probe may be a loaded machine),
-  or a start in `Session::begin` that failed for a reason other than the transport's inactivity timeout
-  (`transport::InactivityTimeout`: a slow `initialize` is not a dead server), opens it, and `probe_once` and
-  `Manager::session` (a new start only; a usable session is returned whatever the window says) then refuse the
-  provider with a `lsp breaker` error until it has passed or a probe or start succeeds. `per_call_manager` gives
-  a call's own manager the windows of `Call.lsp_sessions` (under both `sessions` values), so a dead server found by
-  one call is skipped by the next; `/ready` probes the adapters directly and never reads them. `Status.servers` and
-  `Status.languages_without_server` (`index_status`, `lci status`) are the per-language roster: per adapter its
-  languages, the ones the index holds, `configured`/`enabled`/`command`, `Manager::probe_state` (the `probe_once` memo
-  read as `probed`/`not_probed`; it runs no probe), `Manager::breaker_remaining` (an open skip window as `breaker_open_ms`, `null` when none) and the session's `ServerReadiness`, and the indexed languages no
-  enabled, configured adapter lists; built from the manager's memory, it starts no server. The roster's `root` and `root_reason` are the directory a server starts at: `[run_profile.lsp] roots` (`Manager::new`; `"workspace"` default) makes `Session::begin` choose it, in its start task, through `lsp::roots` (`Manager::server_root`; under `"manifest"`, `roots::for_server`: the topmost manifest the adapter names in the directories of the index's files of its languages and their ancestors, one directory read each, the workspace for none, for sibling manifests or when files would fall outside), pass it to `GenericClient::spawn` and the adapter's `transport_config`/`initialize_params`, and keep it for `Manager::session_root`; one session per server per workspace, the session key, the tree stamp and the barrier are unchanged. The recipes walk no `lsp.live` and pass no manager. What `"manifest"` was measured to gain (a premise check on small fixtures): pyright resolves a name that depends on a nested project's own settings (`extraPaths`) only from the project directory; typescript-language-server already finds the nearest `tsconfig.json` from the workspace root and gains nothing; one indexed file of the server's languages outside the project directory returns the root to the workspace. `[run_profile.lsp] outline_cache` (read by
-  `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the
-  manager an outline cache, used only for adapters whose `LspAdapter::opens_documents()` is true (pyright, gopls,
-  jdtls, clangd, typescript-language-server, marksman: the hook sends a changed disk text, as a `didChange` with the whole
-  text when the session read change sync (`ChangeSync`, from `textDocumentSync` in the `initialize` result) from the server and as a second `didOpen` otherwise, and the server takes it; the wait for the `publishDiagnostics` of the send is kept in `SentTexts` until a hook has finished it, so a cancelled hook leaves it to the next caller of the file; `SentTexts` holds at most `MAX_OPEN_DOCUMENTS` = 64 files per session and closes the least recently used one that has no open in flight before a new file is opened): `Manager::document_symbols` keys each
-  non-empty answer by (provider, workspace id, path),
-  `lsp::content_hash` of the file (`workspace::hash`, as the manifest) and the id of the server session that gave it,
-  at most `MAX_CACHED_OUTLINES` (4096) entries. With `[run_profile.lsp] implementations = true`
-  (default `false`) the map also asks `Manager::implementation` (`textDocument/implementation`) at each symbol node
-  and offers `Implements` edges from an interface or trait member to its implementing members (the direction of
-  `scip.implements`); it is the third request of a node, behind the same `max_external_calls` gate, and a failure of
-  it is recorded without dropping the edges of the first two. With `[run_profile.lsp] call_hierarchy = true`
-  (default `false`) it asks up to three more requests per symbol node, each behind the same gate and counted:
-  `Manager::prepare_call_hierarchy` (`textDocument/prepareCallHierarchy`), then `Manager::incoming_calls` and
-  `Manager::outgoing_calls` with the item the server gave, sent back verbatim (`HierarchyItem::raw`; the place of an
-  item is its `selectionRange`, the name). The callers and callees are `CallsOrRefs` edges (witness `Exact`, no new
-  edge kind), one per destination per expansion, seen at the call (`fromRanges`). Every error reply is recorded
-  and keeps the other edges, which is also how a server without `callHierarchyProvider` (it answers -32601) is found:
-  the capabilities are not read.
-  The symbol-to-place table behind the map (`lsp_live::SymbolPlaces`) is `ScipPlaces`, built from the SCIP graph's
-  nodes, under `[run_profile.lsp] places = "scip"`. With `places = "outline"` it is `OutlinePlaces` over it; `places = "auto"` (default) picks per walk: `ScipPlaces` when the SCIP graph read for the workspace has a node, else `OutlinePlaces` (`app::traverse::run`), so a tree with no index read (`scip.mode = "off"`, or `"cache"` with no file) still gets `lsp.live` cards. `OutlinePlaces`:
-  `ask` outlines a symbol's file once per map instance (`Manager::document_symbols`, one counted external call;
-  `SymbolPlaces::outline_wanted`), as it already does for a file or chunk node, and `SymbolPlaces::learn` takes the
-  outline in. A member whose kind this build has a node for (`SymbolKind`: functions, methods, types, enums,
-  modules, constants, classes, interfaces, fields, variables; LSP kinds 12, 6, 9, 5, 23, 11, 10, 2-4, 14, 7 and 8, 13; 5 is `Class`, 11 is `Trait` in a Rust file and `Interface` elsewhere; enum members 22, impl blocks 19 and type parameters 26 have no node) takes the SCIP node's id for the same file, name and
-  nearest line, else (a Rust file, `OutlinePlaces::with_tree`) the canonical id of the `chunk::extract_for_path` declaration around the member, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
-  numbered in document order; where a file is learned its places win over the index's, which may be older than the
-  tree. `flatten_document_symbols` gives a nested `DocumentSymbol` the range from its name to its item's end, so
-  `Member::end_line` is the last line of the item.
-  it is recorded without dropping the edges of the first two.
-  Readiness is reported, not acted on: the transport keeps the `is_ready` latch (the adapter's `ready_predicate`
-  matched once, never cleared) and, beside it, a `watch` of `ServerState` (`busy`, `changes`, `changed_at`) fed by the
-  adapter's `busy_predicate` (default: never; rust-analyzer `quiescent: false`, jdtls `Starting`). `Manager::readiness`
-  turns a session into a `ServerReadiness` (`starting`, `ready`, `busy`, `failed` or `stuck`, primed, counters, ages)
-  without touching `last_used`; `Status.analyzers`, the search over-budget note and the `lsp.live` notes of a traverse
-  call read it. No request, repeat or answer depends on it.
-  `[run_profile.lsp] sync = "watch"` (the default since K11b-4; read by `Manager::new`; a per-call
-  manager is built `without_sync`) gives each workspace with a session an `lsp::sync::WorkspaceSync`: a `notify`
-  watcher of the root (polling at `watch_poll_milliseconds` when the platform watcher fails) whose events a task
-  drains into batches, typed by the disk (created, changed, deleted) against a `(mtime, length)` table from one
-  `chunk::source_files` walk (walked again only after an overflow). The manager's sink drops the files' kept outlines
-  and sends each batch to the workspace's sessions as `workspace/didChangeWatchedFiles`; `Manager::client` drains
-  before every request. The sync starts with the workspace's first session and stops with its last (`release`,
-  `shutdown_all`, the idle sweeper). Lock order: drain lock, then the session registry, then `syncs`.
-  `Status.sync` (N118) reports `Manager::sync_status` for the workspace (backend, `failed` when neither watcher started or the opening task died,
-  the counters) only while a sync runs, so a failed or silent watcher is visible; it is a report and changes no answer.
+- **LSP channel** (`lci-core` `lsp`): language-server symbols mapped onto chunks, merged query by query across providers; sessions, breakers, readiness, sync and the `lsp.live` map's use of them are in [lsp-channel.md](lsp-channel.md).
 - **Model clients** (`lci-core` `models`): `embed` POSTs to `<embedding_url>/embeddings` and validates count, index,
   finiteness, non-zero vectors and one dimension; indexing retries up to 3 attempts (`MAX_ATTEMPTS`) with doubling
   backoff, `query` makes one attempt. Any refused connection trips a breaker for 30 s (`EMBEDDER_DOWN_WINDOW`): `query` and `embed_once` then skip at once
@@ -196,8 +118,8 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   backoff (a failed probe re-arms the window, an answer closes the breaker). An HTTP 5xx does not trip it.
   `rerank` makes one attempt and returns `(index, score)` best first; after a
   refused connection a breaker skips the reranker for 30 s (`RERANKER_DOWN_WINDOW`). The language servers have the same
-  window under `[run_profile.lsp] breaker = true` (`lsp::LspBreakers`, on by default since K11b-3; see the language-server item
-  above). Batches the service rejects as
+  window under `[run_profile.lsp] breaker = true` (`lsp::LspBreakers`, on by default since K11b-3; see [lsp-channel.md](lsp-channel.md)).
+  Batches the service rejects as
   oversized are retried one input at a time with prefixes halved down to 512 bytes.
 
 ## Indexing flow and freshness
@@ -257,51 +179,7 @@ view (`compact_view`, a profile with `response = "compact"`) is applied to a fin
 
 ## Data flow: traverse
 
-`search_code` with `mode = "traverse"` (needs `[traverse] enabled`) and `lci traverse` run one function,
-`app::traverse::run`. It loads the SCIP index (map `graph.scip`, cached by file stamp; `[run_profile.scip] mode` `cache` (the default) reads it when it is there and parses an unreadable file once per file stamp, `authoritative` requires it, `off` never touches it and leaves the graph and the maps built from the index file empty, each saying so in a note), finds the start nodes
-(`given`; `hybrid`: the top `seed_k` hits of the normal hybrid search mapped to SCIP symbols; `hybrid+bm25` or `bm25` with `[run_profile.seeds] bm25 = true`: the opt-in map `seeds.bm25`,
-BM25 over the SCIP graph's node names, qualified paths and documentation, whose top `seed_k` nodes go after the hybrid hits or stand alone
-when the search gave none; `...+literal` or `literal` with `[run_profile.seeds] literal = true`: the opt-in map `seeds.literal`, a whole-word ripgrep search (`lexical::search_literals`) for the names the question puts in code spans, each line placed in the SCIP graph (the symbol defined there, the one around it, else the file of a declaration line), appended after those sources; `...+repo_map` or `repo_map` with `[run_profile.seeds] repo_map = true`: the opt-in map `seeds.repo_map`, a personalized PageRank over the SCIP graph's call and containment edges from the entities `seeds.bm25` finds for the question, whose new top nodes go after the earlier sources' (each source form also exists with `+literal` after it); or `name_tokens`, the visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
-`[traverse]` caps (a request can only lower them), writes a trace under `data_dir`, and answers with the reached nodes,
-totals and, only when work is left, a `handle` and `checkpoint`. The first stage (exact operators `exact.closure` and
-`exact.pickaxe`, then seeds), named policies per question type (the router, chosen by the caller's `steer.policy`) and the steering ladder are described in
-[engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
-list, schemas and REST routes are exactly those of a server without them.
-
-With `[run_profile.traverse] answer_labels = true` (default `false`) the answer also has `completeness` (`{complete, why, estimate}`: `complete` is `status == "complete"` with no map lost (`degraded`: a map the call asked for that could not be set up, or had `MapStat.failures`; `why` is then `degraded` unless the walk was cut), `why` the `stop_reason`, `estimate` `TraversalResult.estimate`, the `likely_complete` fraction) and every card of `results` and the checkpoint lists has `freshness` (`fresh`, `changed`, `stale` or `unverified`, read from `file_changed` and `maps`; a card that cites `lsp.live` is `unverified`, not `fresh`, when the walk found a language server running, `add_answer_labels`' `kept` argument from the walk's `WalkSessions`; a continuation also demotes the `lsp.live` cards of the nodes it restores from the checkpoint, its `restored` argument). `app::traverse::response::add_answer_labels` adds both to the response JSON after the trace and the checkpoint hash are made, so the trace, the checkpoint, the handle and `Card`/`card_json` are unchanged, nothing is withheld, and with the key off the answer is as before.
-
-With `[run_profile.traverse] card_paths = true` (default `false`) every walked card of `results` and of `checkpoint.answer` also has `kind` and `path`, the
-route from its start node with each hop's map, edge kind and witness (`app::traverse::response::add_paths`, read from the walk's state table; the engine keeps
-`State::kind`, and a handle keeps it only under the key). With the key off the answer, the trace, the checkpoint and the handle are unchanged.
-
-With `[run_profile.traverse] map_freshness = true` (default `false`) the answer also has `maps`: for each map of the call that
-states a freshness, `{id, observed, stale, lag}` (`app::traverse::freshness`). The SCIP-built maps report `snapshot`;
-`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (`live` names the channel: `grep.live`,
-`git.history`, `exact.pickaxe` and `probe.compile` read current bytes or git, placed by the index's positions for `grep.live`;
-`lsp.live` asks a running server, which is fresh when this call started it and, when kept across calls under
-`sessions = "shared"`, bounded by its tree stamp's coverage and labelled by a `kept session` note, with the same fields). `lag` is the number of source files (language-adapter
-files, prose left out) newer than the index file plus those changed (content hash), added or removed since the process
-first saw the index's current stamp (modified time and length), each counted once; `stale` means `lag` above 0 and `null`
-means not compared (no tree, unreadable tree, or an index file without a modified time). The tree is read and hashed
-once per call with `chunk::source_hashes` (the index scan's walk and its read, skip and hash function, no chunk made);
-`[run_profile.freshness] stat_gate = true` (default `false`, in the profile hash) puts a process-wide `chunk::StatGate` per
-root in front of the read, which keeps `(modified time, length, hash)` per file and reads only files whose stamp is new or
-changed. A file modified within 3 seconds of the read is not trusted (racy stamp; FAT, exFAT and SMB stamps are coarse) and is read again next call. Its gap, asserted by a test: a same-length edit that keeps a modified time older than 3 seconds before the previous read is not seen until the next edit.
-Search's `verify_on_read` reads through the same function. `Expanded` carries an optional
-`edge::Freshness` that a wrapper around each stating map records; the walk itself does not read it. Key off: no
-wrapper, no tree read, no `maps` key.
-
-`[run_profile.freshness] verify_on_read = true` (default `false`, in the profile hash) adds, on top of `map_freshness`, a check of
-what the answer cites against the tree by content hash. It reuses the one read of the tree (`freshness::tree_view` returns the
-lag with the file sets it came from; no second scan), reads and labels, and never refreshes the index or touches
-`[index].freshness`. `SeedSearch::snapshot_hashes` (`AppSeeds` reads the manifest of the index snapshot) is read after the walk,
-because the walk's first search may refresh the snapshot; the snapshot lag is the source files (the `tree_lag` set; manifest prose
-entries are left out) that differ between the manifest and the tree. `seeds.hybrid`, `search.lexical` and `search.vector` are
-then labelled with it (`Observer` does not wrap them; the label is filled at report time), `grep.live` and `lsp.live` say
-`observed: live` with `places: "index"` and the SCIP lag (their places are the index's), and `response::add_file_changed` gives
-every card `file_changed` from the baseline of its maps (the SCIP baseline for the maps built from the index and the placed
-maps and the symbol cards, the manifest for the snapshot maps and the chunk cards; `null` where none applies). Key off: none of this, and no change to any answer.
-`search::App::verify_on_read` does the same for a search report the caller asked for: `SearchReport.freshness` (`snapshot`, `channels` for the channels that ran, `hits` with `file_changed` per result) from the manifest of the snapshot the search ran on and one read of the tree's content hashes (`chunk::source_hashes`, gated by `stat_gate` when on), read after the search (a refresh in between is not seen) and timed in `timings.verify_ms`. The searches inside the crate that discard the block (`AppSeeds::search`, the evaluation runner) call the `_unverified` entry points, so a traversal reads the tree once.
+The call flow of `search_code mode="traverse"` and `lci traverse` (`app::traverse::run`: SCIP index load, seeds, the `lci-maps` walk under the `[traverse]` caps, trace, answer) and the answer keys of `answer_labels`, `card_paths`, `map_freshness`, `verify_on_read` are in [traverse-flow.md](traverse-flow.md).
 
 ## MCP, REST and CLI surfaces
 
@@ -315,7 +193,7 @@ maps and the symbol cards, the manifest for the snapshot maps and the chunk card
   `service_status`), 5 with `[recipes] enabled` (`config_readers`, `impact_rings`, `flow_path`, `flow_from`,
   `config_neighbours`) and `lci_compose` with `[compose] enabled`. `search_code` takes `workspace_path`, `query`,
   `top_k`, `languages`, `include_paths`, `exclude_paths`, `source_roles` and, with `[traverse] enabled`, `mode`,
-  `budget`, `steer`, `handle`. An argument a tool does not have is refused with a tool error naming it (REST JSON bodies: HTTP 422); `service_status` uses a strict empty argument object. The REST search query string uses a separate strict `SearchQuery` (HTTP 400 for unknown keys). Parameter semantics: README.
+  `budget`, `steer`, `handle`. An argument a tool does not have is refused with a tool error naming it (REST JSON bodies: HTTP 422); `service_status` uses a strict empty argument object. The REST search query string uses a separate strict `SearchQuery` (HTTP 400 for unknown keys). Parameter semantics: [mcp-and-rest.md](reference/mcp-and-rest.md).
 - **REST** (`src/rest.rs`) exposes each tool as `POST /v1/<tool>` (`GET /v1/service_status`), `search_code` takes
   `?search_profile=`, plus `POST /v1/release_workspace` (no MCP tool: releases the workspace's language servers),
   `GET /openapi.json` (hand-assembled), `/health`, `/ready`. REST, `/openapi.json`, `/health` and `/ready` check Host and
