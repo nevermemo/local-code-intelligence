@@ -748,6 +748,25 @@ mod tests {
         }
     }
 
+    /// d538: with no self-hosted runner registered, a push trigger only queues
+    /// runs that never start, so the workflow runs by hand alone; never on
+    /// `pull_request` either (a self-hosted runner must not run fork code).
+    #[test]
+    fn live_acceptance_workflow_runs_by_hand_only() {
+        let path = workspace_root().join(".github/workflows/live-acceptance.yml");
+        let workflow = std::fs::read_to_string(&path).unwrap();
+        let triggers: Vec<&str> = workflow
+            .lines()
+            .skip_while(|line| line.trim_end() != "on:")
+            .skip(1)
+            .take_while(|line| line.is_empty() || line.starts_with(' '))
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter(|line| !line.starts_with(' ') && !line.starts_with('#'))
+            .filter_map(|line| line.split(':').next())
+            .collect();
+        assert_eq!(triggers, ["workflow_dispatch"], "{triggers:?}");
+    }
+
     /// N87: the workflow must run the orchestrator with `--require-all`;
     /// run step by step, a missing tool's skip exits zero and reads green.
     #[test]

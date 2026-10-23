@@ -2950,6 +2950,44 @@ async fn idle_timeout_zero_never_releases() {
     assert_eq!(state_count(&state, "spawn_count.txt"), 1);
 }
 
+/// A session whose server failed to start is released by the idle sweeper
+/// like any other, and takes its workspace's sync with it. Under
+/// `sync = "watch"` the sync starts with the session, before the start
+/// outcome is known: left in the registry, a failed session would keep a
+/// watcher and a file table running for a workspace that serves nothing.
+#[tokio::test]
+async fn a_failed_start_does_not_leave_its_workspace_watched() {
+    use local_code_intelligence::config::LspSync;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state) = fake_csharp_release_fixture(&temp);
+    config.run_profile.lsp.sync = LspSync::Watch;
+    config.lsp_idle_timeout_seconds = 1;
+    config.csharp.args.extend(fake_args(&["--exit-at-start"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    assert!(
+        manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .is_err(),
+        "the server exits at the initialize request"
+    );
+    assert!(
+        manager.sync_status(&workspace.id).is_some(),
+        "the failed session is still registered, with its sync"
+    );
+
+    wait_until(
+        "the idle sweeper to release the failed session and its sync",
+        Duration::from_secs(30),
+        async || manager.sync_status(&workspace.id).is_none(),
+    )
+    .await;
+    assert!(!manager.running("csharp-ls", &workspace.id).await);
+    manager.shutdown_all().await;
+}
+
 /// An explicit release stops the servers of one workspace, reports them, and
 /// leaves every other workspace's server serving.
 #[tokio::test]
@@ -3366,6 +3404,123 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
             .is_empty()
     );
     models_task.abort();
+}
+
+/// `Status.sync` (N118): under `[run_profile.lsp] sync = "watch"` the status
+/// of a workspace with a session carries the sync's backend, `failed` flag and
+/// counters, and an edit to a source file moves them; it is absent before the
+/// session and after the release. With `sync = "off"` the status has no `sync`
+/// key at all, so the wire form is what it was before. Unit coverage of
+/// `failed` (both watchers refusing a root) is in `lsp::sync`: a live manager
+/// has no hook to make its watcher fail.
+#[tokio::test]
+async fn status_reports_the_sync_of_a_workspace_with_a_session_only() {
+    use local_code_intelligence::config::LspSync;
+    for (sync, expect_report) in [(LspSync::Watch, true), (LspSync::Off, false)] {
+        let (temp, mut config, _fake, models_task) = fixture().await;
+        config.run_profile.lsp.sync = sync;
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("workspace");
+        write_csharp_workspace(&workspace);
+        let app = App::open(with_fake_csharp_server(
+            config,
+            &state,
+            &[],
+            LOADED_BUDGET_SECONDS,
+        ))
+        .await
+        .unwrap();
+        app.index(&workspace).await.unwrap();
+
+        let before = app.status(&workspace).await.unwrap();
+        assert!(before.sync.is_none(), "no session yet: {before:?}");
+        assert!(serde_json::to_value(&before).unwrap()["sync"].is_null());
+
+        app.symbols(&workspace, "Calculator").await.unwrap();
+        let during = app.status(&workspace).await.unwrap();
+        let wire = serde_json::to_value(&during).unwrap();
+        if !expect_report {
+            assert!(during.sync.is_none(), "{wire}");
+            assert!(
+                !wire.as_object().unwrap().contains_key("sync"),
+                "sync off adds no key: {wire}"
+            );
+            models_task.abort();
+            continue;
+        }
+
+        // The first walk (and with it the backend) is reported once the sync
+        // task has run.
+        wait_until(
+            "the sync's first walk",
+            Duration::from_secs(30),
+            async || {
+                app.status(&workspace)
+                    .await
+                    .unwrap()
+                    .sync
+                    .is_some_and(|sync| sync.walks >= 1)
+            },
+        )
+        .await;
+        let started = app.status(&workspace).await.unwrap().sync.unwrap();
+        assert!(!started.failed, "{started:?}");
+        assert!(started.backend.is_some(), "{started:?}");
+        assert_eq!(started.rescans, 0, "{started:?}");
+        let wire = serde_json::to_value(app.status(&workspace).await.unwrap()).unwrap();
+        assert_eq!(wire["sync"]["failed"], false, "{wire}");
+        assert!(
+            matches!(wire["sync"]["backend"].as_str(), Some("notify" | "poll")),
+            "{wire}"
+        );
+        for key in ["events", "batches", "forwarded", "walks", "rescans"] {
+            assert!(wire["sync"][key].is_u64(), "{key}: {wire}");
+        }
+
+        // An edit to a source file moves the counters.
+        let events = started.events;
+        std::fs::write(
+            workspace.join("src/Calculator.cs"),
+            "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; public int Mul(int a, int b) => a * b; }\n",
+        )
+        .unwrap();
+        // The poll fallback compares mtimes in whole seconds: push the mtime
+        // past the opening scan's so either backend sees the edit.
+        std::fs::File::options()
+            .write(true)
+            .open(workspace.join("src/Calculator.cs"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
+        wait_until(
+            "the sync to report the edit",
+            Duration::from_secs(30),
+            async || {
+                app.status(&workspace)
+                    .await
+                    .unwrap()
+                    .sync
+                    .is_some_and(|sync| sync.events > events && sync.forwarded >= 1)
+            },
+        )
+        .await;
+
+        // Per workspace, and gone with the session.
+        let other = temp.path().join("other-workspace");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(app.status(&other).await.unwrap().sync.is_none());
+        app.release_language_servers(&workspace).await.unwrap();
+        let after = app.status(&workspace).await.unwrap();
+        assert!(after.sync.is_none(), "{after:?}");
+        assert!(
+            !serde_json::to_value(&after)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("sync")
+        );
+        models_task.abort();
+    }
 }
 
 /// A workspace that mixes C# and TypeScript, so `App::symbols` asks both
@@ -5075,7 +5230,7 @@ async fn documents_fake_serves_manager_navigation_and_outline() {
     std::fs::create_dir_all(&data_path).unwrap();
     write_csharp_workspace(&workspace_path);
     let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
-    let config = with_fake_documents_server(
+    let mut config = with_fake_documents_server(
         Config {
             data_dir: data_path,
             ..Config::default()
@@ -5084,6 +5239,8 @@ async fn documents_fake_serves_manager_navigation_and_outline() {
         &[],
         10,
     );
+    // The test means a server that is told nothing about the edit below.
+    config.run_profile.lsp.sync = local_code_intelligence::config::LspSync::Off;
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
     let add = position_of(CALCULATOR_CS, "Add");
@@ -5531,11 +5688,25 @@ pub(super) fn csharp_scip_index(
 
 /// A SCIP index at `index` that defines each `(file, zero-based line, name)`
 /// as a function whose body is that whole line, as the tree is now.
-#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
 fn csharp_scip_index_of(
     index: &std::path::Path,
     workspace: &Workspace,
     functions: &[(&str, usize, &str)],
+) -> std::path::PathBuf {
+    csharp_scip_index_with_references(index, workspace, functions, &[])
+}
+
+/// [`csharp_scip_index_of`] plus one reference occurrence (role 0) of a defined
+/// function per `(file, zero-based line, callee name)`: the unit whose body is
+/// that line then uses the callee, as far as `scip.impact` can tell. The
+/// occurrence sits where the callee's name is in the line, else at its first
+/// character (an index older than the text: the line no longer mentions it).
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn csharp_scip_index_with_references(
+    index: &std::path::Path,
+    workspace: &Workspace,
+    functions: &[(&str, usize, &str)],
+    references: &[(&str, usize, &str)],
 ) -> std::path::PathBuf {
     use scip::types::{Document, Index, Occurrence, SymbolInformation, symbol_information::Kind};
     let symbol = |name: &str| format!("rust-analyzer cargo demo 0.1.0 acceptance/{name}().");
@@ -5564,6 +5735,24 @@ fn csharp_scip_index_of(
         document.occurrences.push(definition);
         document.symbols.push(info);
     }
+    for (file, line_number, callee) in references {
+        let text = std::fs::read_to_string(workspace.path.join(file)).unwrap();
+        let line = text.lines().nth(*line_number).unwrap();
+        let col = line
+            .find(callee)
+            .or_else(|| line.find(|c: char| !c.is_whitespace()))
+            .unwrap_or(0) as i32;
+        let mut reference = Occurrence::default();
+        reference.range = vec![*line_number as i32, col, col + callee.len() as i32];
+        reference.symbol = symbol(callee);
+        reference.symbol_roles = 0;
+        documents
+            .iter_mut()
+            .find(|d| d.relative_path == *file)
+            .expect("a reference sits in a file that defines a function")
+            .occurrences
+            .push(reference);
+    }
     let mut message = Index::default();
     message.documents = documents;
     scip::write_message_to_file(index, message).unwrap();
@@ -5572,23 +5761,29 @@ fn csharp_scip_index_of(
 
 /// The C# fixture with the `documents`-mode fake and a request timeout that a
 /// slow start under load does not exceed; rust-analyzer is pointed at a binary
-/// that does not exist, so no test depends on one being installed.
+/// that does not exist, so no test depends on one being installed. It sets
+/// `[run_profile.lsp] sync = "off"`, the default before K11b-4: a
+/// non-watching server such as csharp-ls is then not kept, and a walk starts
+/// its own, as under `per_call`. The tests written for that contract (the
+/// breaker's, the spawn counts) keep it.
 pub(super) fn shared_sessions_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
     config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    config.run_profile.lsp.sync = local_code_intelligence::config::LspSync::Off;
     let index = csharp_scip_index(temp, &workspace);
     (config, workspace, state, index)
 }
 
-/// [`shared_sessions_fixture`] with `[run_profile.lsp] sync = "watch"`. The
-/// default `sessions = "shared"` keeps a server across walks only when it sees
-/// an edit on its own (`LspAdapter::watches_workspace`: rust-analyzer) or when
-/// the sync tells it. csharp-ls is a non-watching adapter, so without `watch`
-/// a walk starts its own csharp-ls, as under `per_call`; the tests that mean a
-/// server shared across calls use this fixture.
+/// [`shared_sessions_fixture`] with `[run_profile.lsp] sync = "watch"`, which
+/// is the stock profile since K11b-4. A server is kept across walks under
+/// `sessions = "shared"` when it sees an edit on its own
+/// (`LspAdapter::watches_workspace`: rust-analyzer) or when the sync tells it.
+/// csharp-ls is a non-watching adapter, so without `watch` a walk starts its
+/// own csharp-ls, as under `per_call`; the tests that mean a server shared
+/// across calls use this fixture.
 pub(super) fn watching_sessions_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
@@ -5942,9 +6137,10 @@ pub(super) fn reached_run_through_lsp_live(answer: &Value) -> bool {
 
 /// `config` as a service that warms the language servers at the first touch of
 /// a workspace: shared sessions and a traverse policy that adds `lsp.live`.
-/// `sync = "watch"` because csharp-ls is a non-watching adapter: under
-/// `shared` alone a walk starts its own csharp-ls and the warm start primes
-/// nothing for it (see [`watching_sessions_fixture`]); `watch` keeps it shared.
+/// `sync = "watch"` (the stock default since K11b-4, spelled out here) because
+/// csharp-ls is a non-watching adapter: under `sync = "off"` a walk starts its
+/// own csharp-ls and the warm start primes nothing for it (see
+/// [`watching_sessions_fixture`]); `watch` keeps it shared.
 fn with_lsp_live_warm_start(mut config: Config) -> Config {
     config.run_profile.lsp.sessions = local_code_intelligence::config::LspSessions::Shared;
     config.run_profile.lsp.sync = local_code_intelligence::config::LspSync::Watch;
@@ -7780,20 +7976,21 @@ async fn traverse_add_by_default_until(
     }
 }
 
-/// The rule behind the default `sessions = "shared"`: no answer is staler than
-/// under `per_call`. csharp-ls is a server that is told nothing about an edit
-/// (a non-watching adapter), so under the default profile with `sync = "off"`
+/// The rule behind `sessions = "shared"`: no answer is staler than under
+/// `per_call`. csharp-ls is a server that is told nothing about an edit (a
+/// non-watching adapter), so with `sync = "off"` (the default before K11b-4)
 /// every walk starts its own server on the tree as it is, and the same edit
 /// that `a_shared_server_is_restarted_after_an_edit_between_two_walks` needs
 /// `sync = "watch"` and a restart for is seen without either. Nothing stays in
 /// the service's manager.
 #[tokio::test]
-async fn the_default_profile_sees_an_edit_on_a_server_that_does_not_watch() {
+async fn with_sync_off_a_server_that_does_not_watch_starts_per_walk() {
     use local_code_intelligence::config::{LspSessions, LspSync};
     const TWICE: &str = "sym:rust:CallSite.cs::Twice/fn";
     let temp = tempfile::tempdir().unwrap();
-    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
-    // The default: no `sessions` line, no sync.
+    let (mut config, workspace, state, index) = shared_sessions_fixture(&temp);
+    // No `sessions` line (the default `shared`), and the sync spelled out.
+    config.run_profile.lsp.sync = LspSync::Off;
     assert_eq!(config.run_profile.lsp.sessions, LspSessions::default());
     assert_eq!(config.run_profile.lsp.sync, LspSync::Off);
     let manager = Arc::new(Manager::new(&config));
@@ -7836,31 +8033,36 @@ async fn the_default_profile_sees_an_edit_on_a_server_that_does_not_watch() {
     manager.shutdown_all().await;
 }
 
-/// Under the default profile a service primes no csharp-ls (a walk would not
-/// share it), and a walk through the service's manager leaves no csharp-ls in
-/// it: the server is the call's own and ends with the walk.
+/// Under the default profile (`sync = "watch"` since K11b-4) a service primes
+/// csharp-ls at the first touch and a walk through the service's manager
+/// reuses and leaves that server in the manager: the warm start and the walks
+/// are one server, one start.
 #[tokio::test]
-async fn the_default_profile_keeps_nothing_in_the_service_manager_for_a_non_watching_server() {
-    use local_code_intelligence::config::{LspProfile, LspSessions};
+async fn the_default_profile_primes_and_keeps_a_non_watching_server_in_the_service_manager() {
+    use local_code_intelligence::config::{LspProfile, LspSessions, LspSync};
     let service = indexed_warm_service(&[], |config| {
-        // The default profile: no `sessions` line, `sync = "off"`.
+        // The default profile: no `sessions` line, no `sync` line.
         config.run_profile.lsp = LspProfile::default();
     })
     .await;
     let (app, workspace) = (&service.app, &service.workspace);
     assert_eq!(service.config.run_profile.lsp.sessions, LspSessions::Shared);
+    assert_eq!(service.config.run_profile.lsp.sync, LspSync::Watch);
     let index = csharp_scip_index(&service.temp, workspace);
     let id = app.status(&workspace.path).await.unwrap().workspace.id;
     let outcome = finished_warm_start(app, &id).await;
-    assert!(outcome.is_empty(), "csharp-ls was primed: {outcome:?}");
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
     let status = app.status(&workspace.path).await.unwrap();
     assert!(
-        status.analyzers["csharp-ls"].is_none(),
+        status.analyzers["csharp-ls"]
+            .as_ref()
+            .is_some_and(|readiness| readiness.primed),
         "{:?}",
         status.analyzers
     );
+    assert_eq!(state_count(&service.state, "spawn_count.txt"), 1);
 
-    let (answer, walks) = traverse_add_by_default_until(
+    let (answer, _walks) = traverse_add_by_default_until(
         &service.config,
         workspace,
         &index,
@@ -7871,18 +8073,159 @@ async fn the_default_profile_keeps_nothing_in_the_service_manager_for_a_non_watc
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     let status = app.status(&workspace.path).await.unwrap();
     assert!(
-        status.analyzers["csharp-ls"].is_none(),
+        status.analyzers["csharp-ls"].is_some(),
         "{:?}",
         status.analyzers
     );
-    assert!(!status.analyzers_running["csharp-ls"]);
+    assert!(status.analyzers_running["csharp-ls"]);
     assert_eq!(
         state_count(&service.state, "spawn_count.txt"),
-        walks,
-        "one server per walk, none from the warm start"
+        1,
+        "the warm start's server served the walks"
     );
     app.shutdown_language_servers().await;
     service.models_task.abort();
+}
+
+/// The required test of the K11b-4 default: under the stock profile (no
+/// `sessions` line, no `sync` line) a non-watching server (csharp-ls) is kept
+/// across walks of the service's manager, and an edit is seen only because the
+/// tree barrier restarts the server. The fake ignores the sync's
+/// `didChangeWatchedFiles` (`--ignore-watched-files`), so the barrier is the
+/// only way the edit reaches the server.
+#[tokio::test]
+async fn the_default_profile_keeps_a_non_watching_server_and_restarts_it_after_an_edit() {
+    use local_code_intelligence::config::{LspProfile, LspSessions, LspSync};
+    const TWICE: &str = "sym:rust:CallSite.cs::Twice/fn";
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state, index) = shared_sessions_fixture(&temp);
+    config.run_profile.lsp = LspProfile::default();
+    config.csharp.args.push("--ignore-watched-files".to_owned());
+    assert_eq!(config.run_profile.lsp.sessions, LspSessions::Shared);
+    assert_eq!(config.run_profile.lsp.sync, LspSync::Watch);
+    let manager = indexed_manager(&config, &workspace);
+
+    // Walk 1 reaches `Run` through the one server the manager started.
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert!(!reached_through_lsp_live(&answer, TWICE), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    // Walk 2, tree unchanged: the same server, labelled kept.
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(kept_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "a non-watching server is kept under the default profile"
+    );
+
+    // An edit (a new length for `CallSite.cs`) and a SCIP index for it.
+    write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
+    let index = csharp_scip_index_of(
+        &temp.path().join("index-twice.scip"),
+        &workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+            ("src/CallSite.cs", 2, "Twice"),
+        ],
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(!kept_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(reached_through_lsp_live(&answer, TWICE), "{answer}");
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        2,
+        "the barrier stopped the first server and started a second from the disk"
+    );
+    assert_eq!(
+        manager.release(&workspace.id).await,
+        ["csharp-ls"],
+        "the server lived in the offered manager"
+    );
+    manager.shutdown_all().await;
+}
+
+/// The sync doing real work under the default profile: a file created two
+/// levels below a directory the tree stamp lists (the stamp covers one level of
+/// child directories, README "Sessions") does not move the stamp, so the
+/// barrier would keep the server on the old tree. The default `sync = "watch"`
+/// tells the running server, which lists the new declaration on the same
+/// session, with no restart. (The fake applies `didChangeWatchedFiles` by
+/// reading the disk when it arrives.)
+#[tokio::test]
+async fn the_default_profile_tells_a_kept_server_about_an_edit_the_stamp_does_not_cover() {
+    use local_code_intelligence::config::{LspProfile, LspSync};
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state, _index) = shared_sessions_fixture(&temp);
+    config.run_profile.lsp = LspProfile::default();
+    assert_eq!(config.run_profile.lsp.sync, LspSync::Watch);
+    // The directory exists before the server starts and is empty.
+    std::fs::create_dir_all(workspace.path.join("src/x/y")).unwrap();
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+    let csharp = csharp_adapter(&manager);
+    manager.tree_barrier(&workspace, &[&csharp]).await;
+    assert!(
+        !manager
+            .symbols(&csharp, &workspace, "Calculator")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The sync started with the session and has walked the tree.
+    assert!(manager.synced(&workspace.id, &[], LOADED_BUDGET).await);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    let before = manager
+        .symbols(&csharp, &workspace, "DeepThing")
+        .await
+        .unwrap();
+    assert!(before.is_empty(), "{before:?}");
+
+    write(
+        &workspace.path,
+        "src/x/y/Deep.cs",
+        "namespace Acceptance;\npublic sealed class DeepThing { }\n",
+    );
+    // The stamp does not see the edit, so the barrier keeps the session.
+    let restarted = manager.tree_barrier(&workspace, &[&csharp]).await;
+    assert!(
+        restarted.is_empty(),
+        "the stamp must not cover the deep file: {restarted:?}"
+    );
+    assert!(
+        manager
+            .synced(&workspace.id, &["src/x/y/Deep.cs"], LOADED_BUDGET)
+            .await
+    );
+    let found = manager
+        .symbols(&csharp, &workspace, "DeepThing")
+        .await
+        .unwrap();
+    assert!(
+        found
+            .iter()
+            .any(|symbol| symbol.name.as_deref() == Some("DeepThing")),
+        "the running session does not list the new class: {found:?}"
+    );
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "the same session answered: no restart"
+    );
+    manager.shutdown_all().await;
 }
 
 /// The real-server edit check of `[run_profile.lsp] sync` (live, skipped when
@@ -8130,7 +8473,10 @@ fn outline_profile(
 ) -> local_code_intelligence::config::RunProfileConfig {
     use local_code_intelligence::config::{LspProfile, RunProfileConfig, profile::ScipProfile};
     RunProfileConfig {
-        scip: ScipProfile { mode },
+        scip: ScipProfile {
+            mode,
+            ..ScipProfile::default()
+        },
         lsp: LspProfile {
             places,
             implementations: true,
@@ -9606,4 +9952,866 @@ async fn an_lsp_live_walk_starts_its_server_at_the_manifest_root_under_roots_man
         started.push(roots_started);
     }
     assert_ne!(started[0], started[1]);
+}
+
+// ---- `[run_profile.scip] arbitration` (K20c-2) --------------------------------
+
+/// `src/Old.cs`: a function the stale index below says uses `Add` and whose
+/// text no longer does.
+const OLD_CS: &str =
+    "namespace Acceptance;\npublic static class Legacy { public static int Old() => 3; }\n";
+const OLD_SEED: &str = "sym:rust:Old.cs::Old/fn";
+
+/// The Calculator/CallSite workspace plus `src/Old.cs`, and an index (beside
+/// the workspace) that says both `Run` and `Old` use `Add`: the server, which
+/// reads the text, names `Run` only.
+fn arbitration_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (config, workspace, state, _) = shared_sessions_fixture(temp);
+    write(&workspace.path, "src/Old.cs", OLD_CS);
+    let index = csharp_scip_index_with_references(
+        &temp.path().join("arbitration.scip"),
+        &workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+            ("src/Old.cs", 1, "Old"),
+        ],
+        &[("src/CallSite.cs", 1, "Add"), ("src/Old.cs", 1, "Add")],
+    );
+    (config, workspace, state, index)
+}
+
+/// One walk of `ADD_SEED` over `maps` to depth 2 (so that a pause at one pop
+/// leaves work), under the default profile adjusted by `tweak`, with the
+/// loaded-machine budget; the walk's own server (no shared manager). The error
+/// is the call's, as text.
+async fn traverse_arbitrated(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    maps: &[&str],
+    (pops, handle): (Option<u32>, Option<&str>),
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Result<local_code_intelligence::app::traverse::Report, String> {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: LOADED_BUDGET_SECONDS * 1000,
+        ..TraverseConfig::default()
+    };
+    let mut profile = RunProfileConfig::default();
+    tweak(&mut profile);
+    let (budget, steer) = (
+        BudgetArgs {
+            pops,
+            max_depth: Some(2),
+            deadline_ms: Some(LOADED_BUDGET_SECONDS * 1000),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let seeds = [ADD_SEED.to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "who uses Add",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle,
+        lsp: Some(config),
+        lsp_sessions: None,
+    };
+    run(&limits, &profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a card of the answer is at `node`.
+fn reached_node(answer: &Value, node: &str) -> bool {
+    answer["results"]
+        .as_array()
+        .is_some_and(|cards| cards.iter().any(|card| card["node"].as_str() == Some(node)))
+}
+
+/// The `maps[]` entry of the freshness report for `id`.
+fn freshness_entry<'a>(answer: &'a Value, id: &str) -> &'a Value {
+    answer["maps"]
+        .as_array()
+        .and_then(|maps| maps.iter().find(|entry| entry["id"] == id))
+        .unwrap_or_else(|| panic!("no maps[] entry for {id}: {answer}"))
+}
+
+const SCIP_IMPACT: &str = lci_maps::scip_impact::SCIP_IMPACT_ID;
+const LSP_LIVE: &str = lci_maps::lsp_live::LSP_LIVE_ID;
+
+/// The row's ceiling check (K20c): a caller the index names and the server's
+/// answer does not (its text no longer calls `Add`) is overruled, a live one is
+/// confirmed, and the counts are in the trace, `per_map`, `totals` and one
+/// note. Off (the default) and under `scip.mode = "authoritative"` the same
+/// walk reaches the stale caller and prints no count anywhere.
+#[tokio::test]
+async fn a_stale_scip_caller_the_server_does_not_see_is_overruled_and_a_live_one_confirmed() {
+    use local_code_intelligence::config::{RunProfileConfig, profile::ScipMode};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let maps = [LSP_LIVE, SCIP_IMPACT];
+    let walk = |tweak: fn(&mut RunProfileConfig)| {
+        traverse_arbitrated(&config, &workspace, &index, &maps, (None, None), tweak)
+    };
+
+    let report = walk(|profile| profile.scip.arbitration = true)
+        .await
+        .unwrap();
+    let on = &report.response;
+    assert!(reached_run_through_lsp_live(on), "{on}");
+    assert!(reached_node(on, RUN_SEED), "{on}");
+    assert!(!reached_node(on, OLD_SEED), "the stale caller stands: {on}");
+    let counts = json!({"confirmed": 1, "overruled": 1});
+    assert_eq!(on["totals"]["arbitration"], counts, "{on}");
+    assert_eq!(
+        on["totals"]["per_map"][SCIP_IMPACT]["arbitration"], counts,
+        "{on}"
+    );
+    assert!(
+        on["totals"]["per_map"][LSP_LIVE]
+            .get("arbitration")
+            .is_none(),
+        "{on}"
+    );
+    let notes = notes_of(on);
+    assert!(
+        notes.contains(
+            "scip.arbitration: lsp.live judged scip.impact (function and method destinations, places scip) in this call: 1 edges confirmed, 1 overruled"
+        ),
+        "{notes}"
+    );
+    // The seed's expand event: the `scip.impact` call carries the counts, the
+    // server's call none.
+    let events = lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap();
+    let start = events.iter().find(|e| e["ev"] == "start").unwrap();
+    assert_eq!(start["arbitration"]["authority"], LSP_LIVE);
+    assert_eq!(
+        start["arbitration"]["subordinate"],
+        json!([[SCIP_IMPACT, "refers"]])
+    );
+    assert_eq!(start["arbitration"]["kinds"], json!(["fn", "method"]));
+    let expand = events
+        .iter()
+        .find(|e| e["ev"] == "expand" && e["node"] == ADD_SEED)
+        .expect("the seed is expanded");
+    let call_of = |map: &str| {
+        expand["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["map"] == map)
+            .unwrap_or_else(|| panic!("no call of {map}: {expand}"))
+    };
+    assert_eq!(call_of(SCIP_IMPACT)["arbitration"], counts, "{expand}");
+    assert!(call_of(LSP_LIVE).get("arbitration").is_none(), "{expand}");
+
+    // Off (the default): nothing is arbitrated, nothing is printed.
+    let off = walk(|_| {}).await.unwrap().response;
+    assert!(reached_node(&off, RUN_SEED), "{off}");
+    assert!(reached_node(&off, OLD_SEED), "{off}");
+    assert!(!off.to_string().contains("arbitration"), "{off}");
+
+    // `authoritative` with the key on: the same as off.
+    let authoritative = walk(|profile| {
+        profile.scip.arbitration = true;
+        profile.scip.mode = ScipMode::Authoritative;
+    })
+    .await
+    .unwrap()
+    .response;
+    assert!(reached_node(&authoritative, OLD_SEED), "{authoritative}");
+    assert!(
+        !authoritative.to_string().contains("arbitration"),
+        "{authoritative}"
+    );
+}
+
+/// `role` is in the `maps[]` of the freshness report only while an arbitration
+/// ran: the authority and the judged index map, never a map the arbitration
+/// does not judge (`graph.scip`).
+#[tokio::test]
+async fn the_freshness_maps_carry_roles_only_under_an_arbitration() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let maps = ["graph.scip", SCIP_IMPACT, LSP_LIVE];
+    let on = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| {
+            profile.traverse.map_freshness = true;
+            profile.scip.arbitration = true;
+        },
+    )
+    .await
+    .unwrap()
+    .response;
+    assert_eq!(freshness_entry(&on, LSP_LIVE)["role"], "authority", "{on}");
+    assert_eq!(freshness_entry(&on, SCIP_IMPACT)["role"], "cache", "{on}");
+    assert!(
+        freshness_entry(&on, "graph.scip").get("role").is_none(),
+        "{on}"
+    );
+
+    // Key off: no entry has a role.
+    let off = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| {
+            profile.traverse.map_freshness = true;
+        },
+    )
+    .await
+    .unwrap()
+    .response;
+    assert_eq!(off["maps"].as_array().map(Vec::len), Some(3), "{off}");
+    assert!(!off.to_string().contains("\"role\""), "{off}");
+
+    // Key on without the server: no arbitration, no role.
+    let alone = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &["graph.scip"],
+        (None, None),
+        |profile| {
+            profile.traverse.map_freshness = true;
+            profile.scip.arbitration = true;
+        },
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(!freshness_entry(&alone, "graph.scip").is_null(), "{alone}");
+    assert!(!alone.to_string().contains("\"role\""), "{alone}");
+}
+
+/// Fail-open: a server that starts and exits (N106) answers nothing, so the
+/// index's edges stand. The arbitration is attached (the map is registered)
+/// and judged nothing: counts 0 and 0, and the stale caller is reached.
+#[tokio::test]
+async fn a_server_that_answers_nothing_leaves_the_index_edges_standing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state, index) = arbitration_fixture(&temp);
+    config.csharp.args.push("--exit-at-start".to_owned());
+    let answer = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &[LSP_LIVE, SCIP_IMPACT],
+        (None, None),
+        |profile| profile.scip.arbitration = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(reached_node(&answer, OLD_SEED), "{answer}");
+    assert!(reached_node(&answer, RUN_SEED), "{answer}");
+    assert!(!reached_run_through_lsp_live(&answer), "{answer}");
+    let counts = json!({"confirmed": 0, "overruled": 0});
+    assert_eq!(answer["totals"]["arbitration"], counts, "{answer}");
+    assert_eq!(
+        answer["totals"]["per_map"][SCIP_IMPACT]["arbitration"], counts,
+        "{answer}"
+    );
+    assert!(
+        notes_of(&answer).contains("in this call: 0 edges confirmed, 0 overruled"),
+        "{answer}"
+    );
+    assert!(
+        notes_of(&answer).contains("lsp.live reported an error"),
+        "{answer}"
+    );
+}
+
+/// A handle records the arbitration it was made under: a resume under another
+/// (here: none) is refused with the handle's text, one under the same goes on.
+#[tokio::test]
+async fn a_handle_made_with_the_arbitration_is_refused_without_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let maps = [LSP_LIVE, SCIP_IMPACT];
+    let first = traverse_arbitrated(&config, &workspace, &index, &maps, (Some(1), None), |p| {
+        p.scip.arbitration = true
+    })
+    .await
+    .unwrap()
+    .response;
+    let handle = first["handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("one pop leaves work: {first}"))
+        .to_owned();
+
+    let refused = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |_| {},
+    )
+    .await
+    .err()
+    .expect("the key is off in the resume");
+    assert!(
+        refused.contains(&format!(
+            "handle {handle} was made with the arbitration lsp.live over scip.impact:refers for fn,method, this call has none"
+        )),
+        "{refused}"
+    );
+
+    let resumed = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |p| p.scip.arbitration = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(reached_node(&resumed, RUN_SEED), "{resumed}");
+    assert!(!reached_node(&resumed, OLD_SEED), "{resumed}");
+
+    // The other way: a handle made with the key off refuses the key on.
+    let plain = traverse_arbitrated(&config, &workspace, &index, &maps, (Some(1), None), |_| {})
+        .await
+        .unwrap()
+        .response;
+    let plain_handle = plain["handle"].as_str().unwrap().to_owned();
+    let refused = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&plain_handle)),
+        |p| p.scip.arbitration = true,
+    )
+    .await
+    .err()
+    .expect("the key is on in the resume");
+    assert!(
+        refused.contains("was made with the arbitration none, this call has lsp.live over"),
+        "{refused}"
+    );
+}
+
+/// Only registered, wanted and built maps are judged (S4): the judged pairs
+/// are in the `start` event of the trace, and an arbitration with nothing to
+/// judge is not attached at all.
+#[tokio::test]
+async fn only_the_registered_and_built_maps_are_arbitrated() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let subordinate = |report: &local_code_intelligence::app::traverse::Report| {
+        let events = lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap();
+        let start = events.iter().find(|e| e["ev"] == "start").unwrap().clone();
+        start["arbitration"]["subordinate"].clone()
+    };
+
+    // `scip.implements` is judged only with `implementations = true`, and
+    // `structure.contains` only when the call names it.
+    let walk = |maps: &'static [&'static str], implementations: bool| {
+        let (config, workspace, index) = (&config, &workspace, &index);
+        async move {
+            traverse_arbitrated(config, workspace, index, maps, (None, None), |profile| {
+                profile.scip.arbitration = true;
+                profile.lsp.implementations = implementations;
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let without = walk(&[LSP_LIVE, "scip.implements"], false).await;
+    assert!(!without.response.to_string().contains("arbitration"));
+    let with = walk(&[LSP_LIVE, "scip.implements"], true).await;
+    assert_eq!(
+        subordinate(&with),
+        json!([["scip.implements", "implements"]])
+    );
+    let both = walk(&[LSP_LIVE, SCIP_IMPACT, "structure.contains"], false).await;
+    assert_eq!(
+        subordinate(&both),
+        json!([
+            ["scip.impact", "refers"],
+            ["structure.contains", "structure"]
+        ])
+    );
+    // Both judged maps have counts (what `structure.contains` confirms is the
+    // server's file outline, which the fake answers).
+    for map in [SCIP_IMPACT, "structure.contains"] {
+        assert!(
+            both.response["totals"]["per_map"][map]["arbitration"].is_object(),
+            "{map}: {}",
+            both.response
+        );
+    }
+
+    // A map the call could not build is not judged: with no index to read,
+    // `scip.impact` is unavailable and nothing is left to arbitrate.
+    let missing = temp.path().join("missing.scip");
+    let unbuilt = traverse_arbitrated(
+        &config,
+        &workspace,
+        &missing,
+        &[LSP_LIVE, SCIP_IMPACT],
+        (None, None),
+        |profile| profile.scip.arbitration = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(
+        notes_of(&unbuilt).contains("scip.impact has no edges"),
+        "{unbuilt}"
+    );
+    assert!(!unbuilt.to_string().contains("arbitration"), "{unbuilt}");
+}
+
+// ---- `[run_profile.walk] confirm` (K26-2) -------------------------------------
+
+const GREP_LIVE: &str = lci_maps::live_grep::GREP_LIVE_MAP_ID;
+const GRAPH_SCIP: &str = "graph.scip";
+/// `src/Mult.cs`: `Multiply`, a function whose name is long enough for
+/// `grep.live` (names under four bytes make no edges, so `Add` makes none).
+const MULT_SEED: &str = "sym:rust:Mult.cs::Multiply/fn";
+const APPLY_SEED: &str = "sym:rust:Use.cs::Apply/fn";
+
+/// The trace of a walk, as events.
+fn events_of(report: &local_code_intelligence::app::traverse::Report) -> Vec<Value> {
+    lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap()
+}
+
+/// Whether any event of the walk's trace mentions the confirm frontier (the
+/// `start` field, an `expand` field or the `end` totals).
+fn trace_mentions_confirm(report: &local_code_intelligence::app::traverse::Report) -> bool {
+    events_of(report)
+        .iter()
+        .any(|event| event.to_string().contains("confirm"))
+}
+
+/// The Calculator/CallSite workspace plus `src/Mult.cs` (defines `Multiply`)
+/// and `src/Use.cs` (`Apply` calls it), and an index (beside the workspace)
+/// that defines both functions and says `Apply` uses `Multiply`. A walk of
+/// `Multiply` over `grep.live` and `lsp.live` reaches `Apply` through both
+/// (the server names the function, the text names it too) and the file
+/// `Use.cs` through the text alone: that file hop is a text proposal.
+fn confirm_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (config, workspace, state, _) = shared_sessions_fixture(temp);
+    write(
+        &workspace.path,
+        "src/Mult.cs",
+        "namespace Acceptance;\npublic sealed class Mult { public int Multiply(int a, int b) => a * b; }\n",
+    );
+    write(
+        &workspace.path,
+        "src/Use.cs",
+        "namespace Acceptance;\npublic static class Use { public static int Apply(Mult value) => value.Multiply(2, 3); }\n",
+    );
+    let index = csharp_scip_index_with_references(
+        &temp.path().join("confirm.scip"),
+        &workspace,
+        &[("src/Mult.cs", 1, "Multiply"), ("src/Use.cs", 1, "Apply")],
+        &[("src/Use.cs", 1, "Multiply")],
+    );
+    (config, workspace, state, index)
+}
+
+/// One walk of `Multiply` over `maps` to depth 2 (so that a pause at one pop
+/// leaves work), under the default profile adjusted by `tweak`, with the
+/// loaded-machine budget; the walk's own server (no shared manager), like
+/// [`traverse_arbitrated`]. The error is the call's, as text.
+async fn traverse_confirmed(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    maps: &[&str],
+    (pops, handle): (Option<u32>, Option<&str>),
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Result<local_code_intelligence::app::traverse::Report, String> {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: LOADED_BUDGET_SECONDS * 1000,
+        ..TraverseConfig::default()
+    };
+    let mut profile = RunProfileConfig::default();
+    tweak(&mut profile);
+    let (budget, steer) = (
+        BudgetArgs {
+            pops,
+            max_depth: Some(2),
+            deadline_ms: Some(LOADED_BUDGET_SECONDS * 1000),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let seeds = [MULT_SEED.to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "who uses Multiply",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle,
+        lsp: Some(config),
+        lsp_sessions: None,
+    };
+    run(&limits, &profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a card of the answer names `grep.live` among its maps.
+fn has_grep_live_card(answer: &Value) -> bool {
+    answer["results"].as_array().is_some_and(|cards| {
+        cards
+            .iter()
+            .any(|card| card["maps"].to_string().contains("grep.live"))
+    })
+}
+
+/// The confirm frontier on the walk of `Multiply`: `grep.live` proposes the
+/// file `Use.cs` on text alone (`lsp.live` names the function `Apply` there,
+/// not the file), the key on asks the fake server where the name at the site
+/// is defined, the fake defines `Multiply` at `Mult.cs`, which is the expanded
+/// node, so the hop is confirmed. The server and the walk are the walk's own
+/// (no shared manager), as in the arbitration tests above: the fixture sets
+/// `sync = "off"`, the contract these tests need, not main's `watch` default.
+///
+/// `Refuted` is not reachable with this fake: it answers `definition` with
+/// every declaration of the identifier's name, so the seed's own declaration is
+/// always among the answers (the engine's unit tests cover it:
+/// `lci-maps/src/traverse/tests/confirm.rs`). Fails if the confirmer is never
+/// attached (`confirm_calls` absent).
+#[tokio::test]
+async fn walk_confirm_asks_the_fake_server_for_the_grep_sites() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE, LSP_LIVE];
+
+    // Key off first: the server's definition requests (if any) are the walk's
+    // own, so the count the key adds is the difference.
+    let off = traverse_confirmed(&config, &workspace, &index, &maps, (None, None), |_| {})
+        .await
+        .unwrap();
+    let before = requests_of(&state, "textDocument/definition");
+
+    let on = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| profile.walk.confirm = true,
+    )
+    .await
+    .unwrap();
+    let after = requests_of(&state, "textDocument/definition");
+    let response = &on.response;
+    assert!(
+        after > before,
+        "the key asks the server ({before} -> {after}): {response}"
+    );
+    // The counts are the trace's `end` totals (the answer's `totals` object
+    // does not carry them) and the note below.
+    let events = events_of(&on);
+    let totals = &events
+        .iter()
+        .find(|e| e["ev"] == "end")
+        .unwrap_or_else(|| panic!("an end event: {events:?}"))["totals"];
+    assert!(totals["confirm_calls"].as_u64() >= Some(1), "{totals}");
+    assert!(totals["confirm_confirmed"].as_u64() >= Some(1), "{totals}");
+    assert_eq!(totals["confirm_refuted"].as_u64(), Some(0), "{totals}");
+    assert_eq!(totals["confirm_failures"].as_u64(), Some(0), "{totals}");
+    // The server's calls are the walk's external calls.
+    assert!(
+        response["totals"]["external_calls"].as_u64()
+            > off.response["totals"]["external_calls"].as_u64(),
+        "{response}"
+    );
+    let notes = notes_of(response);
+    assert!(
+        notes
+            .contains("walk.confirm: 1 grep.live hops proposed, 1 confirmed, 0 refuted, 0 unknown"),
+        "{notes}"
+    );
+    assert!(notes.contains("confirmer calls (places scip)"), "{notes}");
+    assert!(!notes.contains("walk.confirm is off"), "{notes}");
+    // A confirmed text hop is a server answer: its card says so.
+    let card = response["results"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|c| c["node"] == "file:src/Use.cs"))
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(card["witness"], "lsp", "{card}");
+
+    let start = events.iter().find(|e| e["ev"] == "start").unwrap();
+    assert_eq!(start["confirm"]["top_k"], 8, "{start}");
+    let expand = events
+        .iter()
+        .find(|e| e["ev"] == "expand" && e["confirm"].is_object())
+        .unwrap_or_else(|| panic!("an expand event with a confirm object: {events:?}"));
+    assert!(
+        expand["confirm"]["proposals"].as_u64() >= Some(1),
+        "{expand}"
+    );
+    assert!(
+        expand["confirm"]["confirmed"].as_u64() >= Some(1),
+        "{expand}"
+    );
+    // The key off: no count, no event field.
+    assert!(
+        !off.response.to_string().contains("confirm"),
+        "{}",
+        off.response
+    );
+    assert!(
+        !trace_mentions_confirm(&off),
+        "no trace event mentions confirm"
+    );
+    // The text hop stays a whole-word text match without the key.
+    let text = off.response["results"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|c| c["node"] == "file:src/Use.cs"))
+        .unwrap_or_else(|| panic!("{}", off.response));
+    assert_eq!(text["witness"], "exact", "{text}");
+}
+
+/// Without `lsp.live` (or `grep.live`) in the call the key cannot confirm
+/// anything: the walk runs unconfirmed with one note that names the missing
+/// map, and its results are those of the key off. Fails if the confirmer is
+/// built without the map (`start.confirm` appears).
+#[tokio::test]
+async fn walk_confirm_without_lsp_live_runs_unconfirmed_with_a_note() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE];
+    let off = traverse_confirmed(&config, &workspace, &index, &maps, (None, None), |_| {})
+        .await
+        .unwrap();
+    let on = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| profile.walk.confirm = true,
+    )
+    .await
+    .unwrap();
+    let notes = notes_of(&on.response);
+    assert!(
+        notes.contains(
+            "walk.confirm is off for this call: it needs grep.live and lsp.live (lsp.live not named)"
+        ),
+        "{notes}"
+    );
+    assert!(
+        !notes_of(&off.response).contains("walk.confirm"),
+        "{}",
+        off.response
+    );
+    // The text hop is there to be proposed, and is left as it was.
+    assert!(has_grep_live_card(&on.response), "{}", on.response);
+    assert!(
+        !trace_mentions_confirm(&on),
+        "no trace event carries a confirm field or total"
+    );
+    assert_eq!(
+        on.response["results"].to_string(),
+        off.response["results"].to_string(),
+        "the results are those of the key off"
+    );
+
+    // The same for a call that names `lsp.live` but not `grep.live`.
+    let no_grep = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &[GRAPH_SCIP, LSP_LIVE],
+        (None, None),
+        |profile| profile.walk.confirm = true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        notes_of(&no_grep.response).contains("(grep.live not named)"),
+        "{}",
+        no_grep.response
+    );
+    assert!(
+        !trace_mentions_confirm(&no_grep),
+        "no trace event mentions confirm"
+    );
+}
+
+/// Key off (the default), all three maps, with a text hop in the walk: nothing
+/// about the confirm frontier is in the answer or the trace. Fails without the
+/// `profile.walk.confirm` guard around the confirmer (the note or the totals
+/// appear).
+#[tokio::test]
+async fn walk_confirm_off_changes_no_byte() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE, LSP_LIVE];
+    let report = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| assert!(!profile.walk.confirm, "the default"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !report.response.to_string().contains("confirm"),
+        "{}",
+        report.response
+    );
+    assert!(
+        events_of(&report)
+            .iter()
+            .all(|e| !e.to_string().contains("confirm")),
+        "no trace event mentions confirm"
+    );
+    // The walk reached `Apply` through the server and the text, and the text
+    // hop to the file is in the answer, as before.
+    let apply = report.response["results"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|c| c["node"] == APPLY_SEED))
+        .unwrap_or_else(|| panic!("{}", report.response));
+    assert!(apply["maps"].to_string().contains("lsp.live"), "{apply}");
+    assert!(has_grep_live_card(&report.response), "{}", report.response);
+}
+
+/// A handle records the confirm frontier it was made under, with the places
+/// arm: a resume without the key, or under another places arm, is refused with
+/// the handle's text; the same settings go on. Fails if the identity lacks the
+/// places kind (the second resume is accepted).
+#[tokio::test]
+async fn a_handle_made_with_the_confirm_frontier_is_refused_without_it_and_under_other_places() {
+    use local_code_intelligence::config::LspPlaces;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE, LSP_LIVE];
+    let first = traverse_confirmed(&config, &workspace, &index, &maps, (Some(1), None), |p| {
+        p.walk.confirm = true
+    })
+    .await
+    .unwrap()
+    .response;
+    let handle = first["handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("one pop leaves work: {first}"))
+        .to_owned();
+
+    let refused = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |_| {},
+    )
+    .await
+    .err()
+    .expect("the key is off in the resume");
+    assert!(
+        refused.contains(&format!(
+            "handle {handle} was made with the confirm frontier on at top_k 8 with \"lsp.live definition places scip\", this call has off"
+        )),
+        "{refused}"
+    );
+
+    let refused = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |p| {
+            p.walk.confirm = true;
+            p.lsp.places = LspPlaces::Outline;
+        },
+    )
+    .await
+    .err()
+    .expect("the places arm is another one in the resume");
+    assert!(
+        refused.contains("with \"lsp.live definition places scip\", this call has on at top_k 8 with \"lsp.live definition places outline\""),
+        "{refused}"
+    );
+
+    let resumed = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |p| p.walk.confirm = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(resumed.get("results").is_some(), "{resumed}");
+
+    // The other way: a handle made with the key off refuses the key on.
+    let plain = traverse_confirmed(&config, &workspace, &index, &maps, (Some(1), None), |_| {})
+        .await
+        .unwrap()
+        .response;
+    let plain_handle = plain["handle"].as_str().unwrap().to_owned();
+    let refused = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&plain_handle)),
+        |p| p.walk.confirm = true,
+    )
+    .await
+    .err()
+    .expect("the key is on in the resume");
+    assert!(
+        refused.contains("was made with the confirm frontier off, this call has on at top_k 8"),
+        "{refused}"
+    );
 }

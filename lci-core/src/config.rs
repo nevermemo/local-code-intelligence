@@ -504,8 +504,9 @@ pub struct Config {
     pub embedding_timeout_seconds: u64,
     pub reranker_timeout_seconds: u64,
     /// Bound in seconds (1..=30) of each dependency probe of /ready and
-    /// service_status, and of the --version probe lsp.live runs once per
-    /// language-server manager before a traversal. Default 15 (d450).
+    /// service_status, and of the readiness probe lsp.live runs once per
+    /// language-server manager before a traversal (`<server> --version`,
+    /// `gopls version`, a start for pyright). Default 15 (d450).
     pub readiness_timeout_seconds: u64,
     pub ripgrep_path: String,
     pub semantic_candidate_count: usize,
@@ -648,8 +649,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Rescorer::is_default")]
     pub rescorer: Rescorer,
     /// `[run_profile]`: the home of the switches that name a run's
-    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`,
-    /// `traverse.map_freshness`, `traverse.answer_labels`, `traverse.card_paths`, `scip.mode`, `lsp.sessions`,
+    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`, `walk.confirm`,
+    /// `traverse.map_freshness`, `traverse.answer_labels`, `traverse.card_paths`, `scip.mode`, `scip.arbitration`, `lsp.sessions`,
     /// `lsp.outline_cache`, `lsp.implementations`, `lsp.call_hierarchy`, `lsp.sync`,
     /// `lsp.places`, `lsp.roots`, `lsp.breaker`, `lsp.live`, `freshness.verify_on_read`, `freshness.stat_gate`, `seeds.bm25`, `seeds.literal`, `seeds.repo_map` and `grep.structural`). Always
     /// serialized; the hashed profile of the whole configuration is

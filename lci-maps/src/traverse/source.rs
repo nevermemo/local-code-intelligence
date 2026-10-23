@@ -222,6 +222,26 @@ impl Arbitration {
         self.subordinate.iter().any(|(id, _)| *id == map)
     }
 
+    /// What a handle records of this arbitration (and checks on a resume): the
+    /// authority, the `(map, family)` pairs sorted, and the kinds sorted, as
+    /// stable text (not a hash).
+    pub fn identity(&self) -> String {
+        let mut pairs: Vec<String> = self
+            .subordinate
+            .iter()
+            .map(|(map, family)| format!("{map}:{}", family.as_str()))
+            .collect();
+        pairs.sort();
+        let mut kinds: Vec<&str> = self.kinds.iter().map(|kind| kind.as_str()).collect();
+        kinds.sort_unstable();
+        format!(
+            "{} over {} for {}",
+            self.authority,
+            pairs.join(","),
+            kinds.join(",")
+        )
+    }
+
     /// Whether an edge to `dst` can be arbitrated: a symbol of a listed kind.
     fn arbitrates(&self, dst: &NodeId) -> bool {
         matches!(dst, NodeId::Symbol(key) if self.kinds.contains(&key.kind))

@@ -105,6 +105,16 @@ pub struct FakeLspConfig {
     /// after `n` ms, carrying no `version` (what pyright and clangd do when a
     /// document is closed). Off by default.
     pub close_diagnostics_delay_ms: Option<u64>,
+    /// `--close-diagnostics-on-reopen` (`--mode documents`): like
+    /// `--close-diagnostics-delay-ms`, a `didClose` is answered by an empty
+    /// `publishDiagnostics` without a `version`, but event-ordered instead of
+    /// timed: the publication is held until the next `didOpen` of the same
+    /// document arrives and is then sent at once, ahead of that open's own
+    /// publication (which still follows `--diagnostics-delay-ms`). So the
+    /// close's publication reaches the client after the re-open was written
+    /// and before the re-open's own, whatever the load. Wins over
+    /// `--close-diagnostics-delay-ms` when both are given.
+    pub close_diagnostics_on_reopen: bool,
     /// The first process exits on its first definition request
     /// (`--exit-on-definition-request`), leaving the replacement healthy.
     pub exit_on_definition_request: bool,
@@ -368,6 +378,7 @@ pub fn run_from_env() -> io::Result<()> {
         no_diagnostics: cli.iter().any(|arg| arg == "--no-diagnostics"),
         close_diagnostics_delay_ms: cli_arg(&cli, "--close-diagnostics-delay-ms")
             .and_then(|value| value.parse().ok()),
+        close_diagnostics_on_reopen: cli.iter().any(|arg| arg == "--close-diagnostics-on-reopen"),
         text_document_sync: cli_arg(&cli, "--text-document-sync")
             .and_then(|value| value.parse().ok())
             .unwrap_or(1),
@@ -575,6 +586,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     // a publication that falls due while the server waits is sent then and a
     // request that arrives first is read first.
     let mut pending_diagnostics: VecDeque<(Instant, String, Option<i64>)> = VecDeque::new();
+    // Closed documents whose empty publication waits for their next `didOpen`
+    // (`--close-diagnostics-on-reopen`).
+    let mut held_close_publications: Vec<String> = Vec::new();
     let threaded_input = ((config.diagnostics_delay_ms > 0
         || config.close_diagnostics_delay_ms.is_some())
         && !config.no_diagnostics)
@@ -727,6 +741,12 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     // version, after the delay.
                     if method == "textDocument/didClose"
                         && !config.no_diagnostics
+                        && config.close_diagnostics_on_reopen
+                        && let Some(uri) = request["params"]["textDocument"]["uri"].as_str()
+                    {
+                        held_close_publications.push(uri.to_owned());
+                    } else if method == "textDocument/didClose"
+                        && !config.no_diagnostics
                         && let Some(delay) = config.close_diagnostics_delay_ms
                         && let Some(uri) = request["params"]["textDocument"]["uri"].as_str()
                     {
@@ -870,6 +890,13 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             if !config.no_diagnostics
                 && let Some(uri) = request["params"]["textDocument"]["uri"].as_str()
             {
+                // `--close-diagnostics-on-reopen`: the held publication of an
+                // earlier close of this document goes out now, queued before
+                // this open's own so that it is written first.
+                if let Some(at) = held_close_publications.iter().position(|held| held == uri) {
+                    held_close_publications.remove(at);
+                    pending_diagnostics.push_back((Instant::now(), uri.to_owned(), None));
+                }
                 pending_diagnostics.push_back((
                     Instant::now() + Duration::from_millis(config.diagnostics_delay_ms),
                     uri.to_owned(),

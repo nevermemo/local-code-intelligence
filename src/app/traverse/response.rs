@@ -14,6 +14,7 @@ use lci_maps::{
         handler::{Action, Checkpoint, RAISE_MAX_POPS, RAISE_MAX_TOKENS, StopPolicy},
         lint::{LintContext, lint},
         rules::RuleList,
+        source::ArbitrationCounts,
         steer::Steer,
         stop::{Card, MapStat},
         trace::{self},
@@ -34,6 +35,11 @@ pub(super) fn add_policy(response: &mut Value, effective: Value, warnings: Vec<S
             object.insert("warnings".into(), json!(warnings));
         }
     }
+}
+
+/// What an arbitration did, as the answer prints it.
+fn arbitration_json(counts: ArbitrationCounts) -> Value {
+    json!({"confirmed": counts.confirmed, "overruled": counts.overruled})
 }
 
 /// `maps` (only with `[run_profile.traverse] map_freshness`; `None` otherwise leaves the
@@ -485,7 +491,13 @@ pub(super) fn response_json(
         .iter()
         .map(|(id, stat)| {
             let ms = result.map_ms.get(id).copied().unwrap_or(0.0);
-            ((*id).to_owned(), json!({"expands": stat.calls, "ms": ms}))
+            let mut entry = json!({"expands": stat.calls, "ms": ms});
+            // Only a map the attached arbitration judged has counts; a map
+            // without an entry was not arbitrated and prints nothing.
+            if let Some(counts) = result.arbitration_by_map.get(id) {
+                entry["arbitration"] = arbitration_json(*counts);
+            }
+            ((*id).to_owned(), entry)
         })
         .collect();
     let mut notes = notes;
@@ -552,6 +564,12 @@ pub(super) fn response_json(
             }
         }
         object.insert("stop_reason".into(), json!(result.stop_reason.as_str()));
+        if let (Some(counts), Some(totals)) = (
+            result.arbitration,
+            object.get_mut("totals").and_then(Value::as_object_mut),
+        ) {
+            totals.insert("arbitration".into(), arbitration_json(counts));
+        }
         if let (Some(counts), Some(totals)) = (
             first_stage_counts,
             object.get_mut("totals").and_then(Value::as_object_mut),

@@ -56,6 +56,11 @@
 //!   card; `true` when either differs), `null` when no reference applies (a
 //!   commit, a file that is not a source file) or no tree was read.
 //!
+//! While an arbitration ran in the call (`[run_profile.scip] arbitration`) the
+//! `maps` entries of the maps it judged carry `role`: `authority` for
+//! `lsp.live`, `cache` for each SCIP-built map it overruled or confirmed edges
+//! of. Without one no entry has a `role` key.
+//!
 //! It reads and labels. It never refreshes the index. Two limits: a card whose
 //! file was newer than the index file when its stamp was first seen has no
 //! baseline hash, so it counts as changed (`file_changed: true`) whatever its
@@ -465,8 +470,15 @@ impl Observer {
     /// `maps`: the freshness of each of the map `ids` (in this order) that states one,
     /// as the last expansion said it or, for a map that was not expanded, as
     /// the call knows it. `None` with the key off. With `verify_on_read` the
-    /// live maps that place by the index say `places: "index"`.
-    pub(super) fn report<'i>(&self, ids: impl IntoIterator<Item = &'i str>) -> Option<Value> {
+    /// live maps that place by the index say `places: "index"`. `role_of` names
+    /// the role a map plays in an arbitration that ran in this call
+    /// (`authority`, `cache`); a map it gives none for has no `role` key, and
+    /// without an arbitration no entry has one.
+    pub(super) fn report<'i>(
+        &self,
+        ids: impl IntoIterator<Item = &'i str>,
+        role_of: impl Fn(&str) -> Option<&'static str>,
+    ) -> Option<Value> {
         let lag = self.lag?;
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let entries: Vec<Value> = ids
@@ -484,6 +496,9 @@ impl Observer {
                 });
                 if self.verify.is_some() && PLACED_BY_INDEX.contains(&id) {
                     entry["places"] = json!("index");
+                }
+                if let Some(role) = role_of(id) {
+                    entry["role"] = json!(role);
                 }
                 Some(entry)
             })
@@ -734,7 +749,9 @@ mod tests {
             observer.file_changed(&card("file:a.rs", &["graph.scip"], Some("a.rs"))),
             None
         );
-        let report = observer.report(["seeds.hybrid", "grep.live"]).unwrap();
+        let report = observer
+            .report(["seeds.hybrid", "grep.live"], |_| None)
+            .unwrap();
         assert_eq!(
             report[0],
             json!({"id": "seeds.hybrid", "observed": "snapshot", "stale": false, "lag": null})
@@ -762,7 +779,10 @@ mod tests {
             .settle(Some(&Manifested(Some(manifest(&[("a.rs", "1")])))))
             .await;
         let report = observer
-            .report(["seeds.hybrid", "search.lexical", "grep.live", "graph.scip"])
+            .report(
+                ["seeds.hybrid", "search.lexical", "grep.live", "graph.scip"],
+                |_| None,
+            )
             .unwrap();
         // The snapshot maps state nothing; grep.live says live, with the four
         // fields and no `places`.
@@ -777,5 +797,30 @@ mod tests {
             observer.file_changed(&card("file:a.rs", &["graph.scip"], Some("a.rs"))),
             None
         );
+    }
+
+    #[test]
+    fn a_role_is_added_only_to_the_maps_role_of_names() {
+        let observer = Observer::on(Some(2));
+        let role = |id: &str| match id {
+            "grep.live" => Some("authority"),
+            "graph.scip" => Some("cache"),
+            _ => None,
+        };
+        let ids = ["grep.live", "graph.scip", "scip.impact"];
+        let report = observer.report(ids, role).unwrap();
+        assert_eq!(report[0]["role"], "authority");
+        assert_eq!(report[1]["role"], "cache");
+        assert!(report[2].get("role").is_none());
+        // With no role given, the entries are what they were.
+        let plain = observer.report(ids, |_| None).unwrap();
+        assert!(
+            plain
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e.get("role").is_none())
+        );
+        assert_eq!(plain[1]["id"], "graph.scip");
     }
 }

@@ -1230,7 +1230,7 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
                 lsp: lci_core::config::LspProfile {
                     sessions: lci_core::config::LspSessions::Shared,
                     outline_cache: true,
-                    sync: lci_core::config::LspSync::Watch,
+                    sync: lci_core::config::LspSync::Off,
                     ..lci_core::config::LspProfile::default()
                 },
                 ..RunProfileConfig::default()
@@ -1302,6 +1302,29 @@ async fn flow_from_runs_the_same_with_seeds_literal_on() {
         assert_eq!(on["counts"][count], off["counts"][count], "{count}");
     }
     assert!(!on.to_string().contains("literal"), "{on}");
+}
+
+/// `[run_profile.walk] confirm` reaches the recipes' walk (the profile is the
+/// one they run under) and changes nothing there: the walk names its maps
+/// ([`FLOW_WALK_MAPS`]), which hold neither `grep.live` nor `lsp.live`, so the
+/// confirm frontier is not built (one note, not shown in the recipe's answer)
+/// and nothing is proposed under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_walk_confirm_on() {
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::live_grep::GREP_LIVE_MAP_ID));
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.walk.confirm = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("confirm"), "{on}");
 }
 
 /// `[run_profile.grep] structural` reaches the recipes' walk (the profile is
@@ -1381,8 +1404,8 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
 /// `call_hierarchy`, `breaker`, `roots`) reach the recipes' walk (the profile is the one they run
 /// under) and change nothing there: the walk has no `lsp.live`, the only map
 /// that asks for implementations or the call hierarchy, so the stamped profile
-/// hash stays true for a recipe whichever way a key is set. `breaker` and
-/// `live` default to on, so their profiles here switch them off.
+/// hash stays true for a recipe whichever way a key is set. `breaker`, `live`
+/// and `sync` default to on, so their profiles here switch them off.
 #[tokio::test]
 async fn flow_from_runs_the_same_with_the_lsp_request_switches_on() {
     assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
@@ -1403,6 +1426,10 @@ async fn flow_from_runs_the_same_with_the_lsp_request_switches_on() {
         },
         lci_core::config::LspProfile {
             live: false,
+            ..lci_core::config::LspProfile::default()
+        },
+        lci_core::config::LspProfile {
+            sync: lci_core::config::LspSync::Off,
             ..lci_core::config::LspProfile::default()
         },
         lci_core::config::LspProfile {

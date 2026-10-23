@@ -673,19 +673,21 @@ impl Session {
     /// - the server has started and priming has settled: a session that is
     ///   still priming is busy building the index its `workspace/symbol`
     ///   callers wait for, and releasing it would fail them (the retry could
-    ///   fail the same way at a small idle timeout);
+    ///   fail the same way at a small idle timeout); or its start has
+    ///   failed, which leaves nothing to wait for. A start still in flight
+    ///   is neither, and is kept;
     /// - no call is using it: the registry holds one reference and every
     ///   call in progress holds another (a call gets its reference under the
     ///   same lock), so this cannot release a server between a caller
     ///   finding it and its request;
     /// - nobody has asked for it for `idle`.
     ///
-    /// So a session whose start failed (no ready client) is never released
-    /// here: it stays in the registry, and keeps its workspace's sync, until
-    /// the next caller replaces it, a release or a shutdown.
+    /// A session whose start failed is released like the others: otherwise it
+    /// would stay in the registry, and keep its workspace's sync (a watcher
+    /// and a file table) running, until the next caller replaced it, a
+    /// release or a shutdown. It has no server to stop.
     fn idle_and_unused(self: &Arc<Self>, idle: Duration) -> bool {
-        self.ready_client().is_some()
-            && *self.primed.borrow()
+        (self.failed() || (self.ready_client().is_some() && *self.primed.borrow()))
             && Arc::strong_count(self) == 1
             && self.idle_for() >= idle
     }
@@ -1150,10 +1152,10 @@ pub struct Manager {
     /// `lsp_stuck_seconds`: how long a session may answer nothing but transient
     /// errors before it is replaced. `None` never replaces it.
     stuck_after: Option<Duration>,
-    /// The providers whose binary has answered a version probe (see
+    /// The providers whose binary has passed its readiness probe (see
     /// [`Self::probe_once`]).
     probed: std::sync::Mutex<HashSet<&'static str>>,
-    /// `readiness_timeout_seconds`: the bound of one version probe in an
+    /// `readiness_timeout_seconds`: the bound of one readiness probe in an
     /// unbounded warm-up (see [`Self::prime_languages`]).
     probe_timeout: Duration,
     /// The tree stamp each kept session was last checked against (see
@@ -1416,7 +1418,7 @@ impl Manager {
     /// when its session fails). A failed probe is remembered nowhere and is
     /// run again by the next caller. Concurrent first callers each probe.
     /// The default probe also keeps a process-wide memo of its own (see
-    /// [`adapter::probe_subprocess_version`]), so a second manager in the same
+    /// [`adapter::probe_subprocess`]), so a second manager in the same
     /// process does not run a binary again that has answered.
     ///
     /// Under `[run_profile.lsp] breaker = true` a failed probe opens the
@@ -2438,8 +2440,8 @@ impl Manager {
     /// `timeout` `Some`: the whole call is bounded by it, as in [`Self::prime`].
     /// `None`: nothing but the caller's own cancellation (dropping or aborting
     /// the future) ends the wait for a server to start and prime, which is for
-    /// a background warm-up that has an abort. Each version probe is still
-    /// bounded by `readiness_timeout_seconds`, so a binary whose `--version`
+    /// a background warm-up that has an abort. Each readiness probe is still
+    /// bounded by `readiness_timeout_seconds`, so a binary whose probe
     /// never exits is reported and the next adapter goes on.
     pub async fn prime_languages(
         &self,
@@ -2492,7 +2494,7 @@ impl Manager {
                     outcomes.insert(
                         adapter.provider(),
                         Err(anyhow!(
-                            "the version probe did not answer within {:?}",
+                            "the readiness probe did not answer within {:?}",
                             timeout.unwrap_or(self.probe_timeout)
                         )),
                     );
@@ -2643,8 +2645,9 @@ async fn shut_down(removed: Vec<Arc<Session>>) -> Vec<&'static str> {
 
 /// Spawns the task that releases sessions idle for `idle` or longer. It
 /// wakes every quarter of `idle` (at least 1 s, at most 30 s apart), removes
-/// the sessions that [`Session::idle_and_unused`] accepts (started, primed,
-/// not in use, and nobody has asked for them for `idle`), and shuts them down
+/// the sessions that [`Session::idle_and_unused`] accepts (started and primed,
+/// or failed to start; not in use, and nobody has asked for them for `idle`),
+/// and shuts them down
 /// outside the registry lock. It holds only a [`Weak`] reference to the registry and
 /// ends at its next wake-up once the [`Manager`] is dropped. Without a Tokio
 /// runtime nothing is spawned.

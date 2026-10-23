@@ -8,10 +8,14 @@
 //! didChangeConfiguration` notification after `initialized`; this adapter
 //! always sends one, and this application's shared JSON-RPC transport
 //! answers pyright's `workspace/configuration` requests generically (pyright
-//! blocks further work until that reply arrives).
+//! blocks further work until that reply arrives). pyright-langserver has no
+//! version flag (any argument that is not a transport prints a connection error
+//! and exits 1), so its readiness probe is a start that may exit non-zero.
 
 use crate::config::PythonLspConfig;
-use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
+use crate::lsp::adapter::{
+    LspAdapter, MAX_DIAGNOSTICS_WAIT, ProbeExit, SentTexts, open_if_changed, probe_subprocess,
+};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -65,6 +69,19 @@ impl LspAdapter for PythonServer {
 
     fn readiness_component_name(&self) -> &'static str {
         "python_language_server_available"
+    }
+
+    /// A start probe: `pyright-langserver --version` must start and end inside
+    /// the timeout, and its status says nothing (it has no version flag and
+    /// exits 1 on any argument that is not a transport). A binary that hangs
+    /// is `TimedOut` and a missing one `Missing`. Because it cannot fail on
+    /// status, the first evidence of a dead pyright is the session start, which
+    /// trips the breaker.
+    async fn probe_readiness(&self, timeout: Duration) -> Result<()> {
+        if let Some(command) = self.configured_command() {
+            probe_subprocess(Path::new(&command), &["--version"], ProbeExit::Any, timeout).await?;
+        }
+        Ok(())
     }
 
     fn transport_config(&self, root: &Path) -> Option<TransportConfig> {
@@ -171,6 +188,32 @@ mod tests {
             disabled,
         };
         PythonServer::new(&config, Duration::from_secs(60))
+    }
+
+    /// pyright-langserver exits 1 on `--version`: the start probe passes it,
+    /// and a path that is not there is `Missing`, the typed cause that opens
+    /// no breaker window in `Manager::probe_once`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_python_probe_passes_a_start_that_exits_non_zero() {
+        use crate::lsp::adapter::{ProbeError, ProbeFailure, fresh_probes};
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("pyright-langserver.cmd");
+        std::fs::write(&shim, "@exit /b 1\r\n").unwrap();
+        let path = shim.to_string_lossy().into_owned();
+        fresh_probes(server(Some(&path), &[], false).probe_readiness(Duration::from_secs(30)))
+            .await
+            .unwrap();
+        let error = fresh_probes(
+            server(Some("definitely-missing-pyright-k11b5"), &[], false)
+                .probe_readiness(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProbeError>().map(|e| e.failure));
+        assert_eq!(failure, Some(ProbeFailure::Missing), "{error:#}");
     }
 
     #[test]

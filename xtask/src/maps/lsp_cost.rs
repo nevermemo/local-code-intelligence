@@ -139,10 +139,19 @@ impl Adapter {
         }
     }
 
-    /// Whether `<server> --version` is a real probe: pyright-langserver has no
-    /// such flag and jdtls is a directory.
-    pub fn has_version_flag(self) -> bool {
-        !matches!(self, Adapter::Python | Adapter::Java)
+    /// The arguments of the server's readiness probe, as the adapter's
+    /// `probe_readiness` runs them (gopls has no `--version`; `version` is its
+    /// probe). `None` where no timed probe exists: pyright-langserver has no
+    /// version flag (the service probes it with a start whose status is
+    /// ignored) and jdtls is a directory.
+    pub fn probe_args(self) -> Option<&'static [&'static str]> {
+        match self {
+            Adapter::Python | Adapter::Java => None,
+            Adapter::Go => Some(&["version"]),
+            Adapter::Rust | Adapter::Typescript | Adapter::C | Adapter::Cpp | Adapter::Csharp => {
+                Some(&["--version"])
+            }
+        }
     }
 }
 
@@ -197,11 +206,17 @@ pub struct LspCostArgs {
     /// JSON list of `{id, question}` (default: the committed list).
     #[arg(long)]
     pub questions: Option<PathBuf>,
-    /// Arms, comma separated (default: all):
-    /// base, shared, shared+cache, shared+impl, shared+sync, per_call+sync, lifecycle
+    /// Arms, comma separated (default: all but `shared+sync+arb`):
+    /// base, shared, shared+cache, shared+impl, shared+sync, per_call+sync, lifecycle,
+    /// shared+sync+arb (`shared+sync` plus `[run_profile.scip] arbitration = true`)
     /// (`base` and `per_call+sync` write `sessions = "per_call"`: the default is `shared`).
     #[arg(long, value_delimiter = ',')]
     pub arms: Vec<String>,
+    /// Maps the `explore` policy adds to the walk, comma separated (default
+    /// `lsp.live`). The arbitration arm needs a SCIP map beside it, e.g.
+    /// `lsp.live,scip.impact`.
+    #[arg(long, value_delimiter = ',')]
+    pub extra_maps: Vec<String>,
     /// Calls per question per arm, round-robin over the questions.
     #[arg(long, default_value_t = 5)]
     pub repeat: usize,
@@ -217,7 +232,7 @@ pub struct LspCostArgs {
     /// Request deadline of every call, ms (the config cap is the same).
     #[arg(long, default_value_t = 20_000)]
     pub deadline_ms: u64,
-    /// Timed `<server> --version` runs per condition (none for pyright and jdtls).
+    /// Timed readiness-probe runs per condition (`<server> --version`, `gopls version`; none for pyright and jdtls).
     #[arg(long, default_value_t = 20)]
     pub probe_runs: usize,
     /// Calls of the N8 window (the first calls of the `shared` arm).
@@ -272,15 +287,18 @@ pub struct Arm {
     pub outline_cache: bool,
     pub implementations: bool,
     pub sync_watch: bool,
+    /// `[run_profile.scip] arbitration = true` (the key's default is `false`).
+    pub arbitration: bool,
 }
 
-pub const ARMS: [Arm; 7] = [
+pub const ARMS: [Arm; 8] = [
     Arm {
         name: "base",
         shared: false,
         outline_cache: false,
         implementations: false,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared",
@@ -288,6 +306,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: false,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared+cache",
@@ -295,6 +314,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: true,
         implementations: false,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared+impl",
@@ -302,6 +322,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: true,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared+sync",
@@ -309,6 +330,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: false,
         sync_watch: true,
+        arbitration: false,
     },
     Arm {
         name: "per_call+sync",
@@ -316,6 +338,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: false,
         sync_watch: true,
+        arbitration: false,
     },
     Arm {
         name: "lifecycle",
@@ -323,13 +346,28 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: true,
         implementations: true,
         sync_watch: true,
+        arbitration: false,
+    },
+    Arm {
+        name: "shared+sync+arb",
+        shared: true,
+        outline_cache: false,
+        implementations: false,
+        sync_watch: true,
+        arbitration: true,
     },
 ];
 
 /// The arms named by `--arms` (all when none), in the order given.
 pub fn select_arms(names: &[String]) -> Result<Vec<Arm>> {
+    // The arbitration arm only runs when named: it measures a key that is off
+    // by default, and a default run is the seven arms it always was.
     if names.is_empty() {
-        return Ok(ARMS.to_vec());
+        return Ok(ARMS
+            .iter()
+            .filter(|arm| !arm.arbitration)
+            .copied()
+            .collect());
     }
     names
         .iter()
@@ -349,7 +387,10 @@ pub fn select_arms(names: &[String]) -> Result<Vec<Arm>> {
 
 /// The `[run_profile.lsp]` leaf lines of an arm: `sessions` always (the
 /// default is `shared`, so `base` and `per_call+sync` must say `per_call` to
-/// measure it), then exactly the other keys it turns on.
+/// measure it), then exactly the other keys it turns on, then `sync` always
+/// (the default is `watch` since K11b-4, so an arm without the sync must say
+/// `off` to keep meaning the old stock: `shared` is the pre-K11b-4 default and
+/// `shared+sync` is the stock now).
 pub fn arm_overlay_lines(arm: &Arm) -> Vec<String> {
     let mut lines = vec![format!(
         "sessions = \"{}\"",
@@ -361,9 +402,10 @@ pub fn arm_overlay_lines(arm: &Arm) -> Vec<String> {
     if arm.implementations {
         lines.push("implementations = true".to_owned());
     }
-    if arm.sync_watch {
-        lines.push("sync = \"watch\"".to_owned());
-    }
+    lines.push(format!(
+        "sync = \"{}\"",
+        if arm.sync_watch { "watch" } else { "off" }
+    ));
     lines
 }
 
@@ -379,6 +421,8 @@ pub struct ConfigCtx {
     pub server: String,
     /// `--places outline`: every arm writes `places = "outline"`.
     pub places_outline: bool,
+    /// `--extra-maps`: the `explore` policy's `extra_maps` (empty: `lsp.live`).
+    pub extra_maps: Vec<String>,
 }
 
 fn toml_path(path: &Path) -> String {
@@ -406,7 +450,19 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
         toml_path(&ctx.scip_index),
         ctx.deadline_ms
     );
-    text.push_str("\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n");
+    let extra_maps = if ctx.extra_maps.is_empty() {
+        "\"lsp.live\"".to_owned()
+    } else {
+        ctx.extra_maps
+            .iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = write!(
+        text,
+        "\n[traverse.policies.explore]\nextra_maps = [{extra_maps}]\n"
+    );
     if let Some(section) = ctx.adapter.section() {
         let _ = write!(
             text,
@@ -428,6 +484,9 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
         } else {
             "places = \"scip\"\n"
         });
+    }
+    if arm.arbitration {
+        text.push_str("\n[run_profile.scip]\narbitration = true\n");
     }
     text
 }
@@ -1202,13 +1261,30 @@ fn probe_program(server: &str) -> String {
     )
 }
 
-/// Times `<server> --version` `runs` times, ms.
-fn time_version_probe(binary: &str, runs: usize) -> Vec<f64> {
+/// The timed probe as the report prints it, `<server> <args>` of the adapter
+/// named by the report's "adapter" summary entry (rust when absent or unknown),
+/// from [`Adapter::probe_args`]; a generic name when the adapter has none.
+fn probe_label(summary: &[(String, String)]) -> String {
+    let key = summary
+        .iter()
+        .find(|(key, _)| key == "adapter")
+        .map_or("rust", |(_, value)| value.as_str());
+    let adapter = Adapter::from_str(key, false).unwrap_or(Adapter::Rust);
+    match adapter.probe_args() {
+        Some(args) => format!("<server> {}", args.join(" ")),
+        None => "<server> (readiness probe)".to_owned(),
+    }
+}
+
+/// Times `<server> <args>` (the adapter's [`Adapter::probe_args`]) `runs`
+/// times, ms; a run that does not exit 0 has no sample. The runs are not
+/// bounded by a timeout.
+fn time_version_probe(binary: &str, args: &[&str], runs: usize) -> Vec<f64> {
     (0..runs)
         .filter_map(|_| {
             let started = Instant::now();
             let status = std::process::Command::new(binary)
-                .arg("--version")
+                .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -1263,6 +1339,7 @@ struct RunContext {
     adapter: Adapter,
     server: String,
     places_outline: bool,
+    extra_maps: Vec<String>,
     calls_file: std::fs::File,
 }
 
@@ -1294,6 +1371,7 @@ async fn run_arm(ctx: &mut RunContext, arm: &Arm, condition: &str) -> Result<Vec
                 adapter: ctx.adapter,
                 server: ctx.server.clone(),
                 places_outline: ctx.places_outline,
+                extra_maps: ctx.extra_maps.clone(),
             },
         ),
     )?;
@@ -1437,9 +1515,9 @@ fn git_head(tree: &Path) -> String {
         )
 }
 
-fn command_text(program: &str, arg: &str) -> String {
+fn command_text(program: &str, args: &[&str]) -> String {
     std::process::Command::new(program)
-        .arg(arg)
+        .args(args)
         .output()
         .ok()
         .map_or_else(
@@ -1756,11 +1834,12 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
             ))
         );
         if result.version_probe.is_empty() {
-            out.push_str("`<server> --version`: no timing (the adapter has no `--version` flag, or the run did not time it).\n\n");
+            out.push_str("Readiness probe: no timing (the adapter has no timed probe, or the run did not time it).\n\n");
         } else {
             let _ = writeln!(
                 out,
-                "`<server> --version`, {} runs: p50 {} ms, p95 {} ms, max {} ms (limit 5000 ms).\n",
+                "`{}`, {} runs: p50 {} ms, p95 {} ms, max {} ms (no time limit is imposed on these runs).\n",
+                probe_label(&meta.summary),
                 result.version_probe.len(),
                 fmt_opt(percentile(&result.version_probe, 50.0)),
                 fmt_opt(percentile(&result.version_probe, 95.0)),
@@ -2113,8 +2192,8 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let server_version = if args.adapter.has_version_flag() {
-        command_text(&probe_program(&server), "--version")
+    let server_version = if let Some(probe_args) = args.adapter.probe_args() {
+        command_text(&probe_program(&server), probe_args)
     } else {
         format!(
             "{} has no `--version` (probe skipped)",
@@ -2183,6 +2262,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         adapter: args.adapter,
         server: server.clone(),
         places_outline: args.places == Places::Outline,
+        extra_maps: args.extra_maps.clone(),
         calls_file,
     };
     let conditions: Vec<(&str, bool)> = match args.load {
@@ -2210,8 +2290,8 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             println!("[{condition}] {thread_count} busy threads started");
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        let version_probe = if args.adapter.has_version_flag() {
-            time_version_probe(&probe_program(&server), args.probe_runs)
+        let version_probe = if let Some(probe_args) = args.adapter.probe_args() {
+            time_version_probe(&probe_program(&server), probe_args, args.probe_runs)
         } else {
             println!(
                 "[{condition}] the {} server has no --version: probe skipped",
@@ -2220,7 +2300,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             Vec::new()
         };
         println!(
-            "[{condition}] --version p50 {} ms p95 {} ms",
+            "[{condition}] readiness probe p50 {} ms p95 {} ms",
             fmt_opt(percentile(&version_probe, 50.0)),
             fmt_opt(percentile(&version_probe, 95.0))
         );
@@ -2359,15 +2439,23 @@ mod tests {
     #[test]
     fn arm_overlay_lines_are_exactly_the_keys_an_arm_turns_on() {
         let lines = |name: &str| arm_overlay_lines(ARMS.iter().find(|a| a.name == name).unwrap());
-        assert_eq!(lines("base"), ["sessions = \"per_call\""]);
-        assert_eq!(lines("shared"), ["sessions = \"shared\""]);
+        assert_eq!(lines("base"), ["sessions = \"per_call\"", "sync = \"off\""]);
+        assert_eq!(lines("shared"), ["sessions = \"shared\"", "sync = \"off\""]);
         assert_eq!(
             lines("shared+cache"),
-            ["sessions = \"shared\"", "outline_cache = true"]
+            [
+                "sessions = \"shared\"",
+                "outline_cache = true",
+                "sync = \"off\""
+            ]
         );
         assert_eq!(
             lines("shared+impl"),
-            ["sessions = \"shared\"", "implementations = true"]
+            [
+                "sessions = \"shared\"",
+                "implementations = true",
+                "sync = \"off\""
+            ]
         );
         assert_eq!(
             lines("shared+sync"),
@@ -2399,6 +2487,7 @@ mod tests {
                 adapter: Adapter::Rust,
                 server: "rust-analyzer".into(),
                 places_outline,
+                extra_maps: Vec::new(),
             };
             for arm in ARMS {
                 let text = arm_config(&arm, &ctx);
@@ -2697,13 +2786,15 @@ mod tests {
             adapter,
             server: server.into(),
             places_outline: false,
+            extra_maps: Vec::new(),
         }
     }
 
     #[test]
     fn arm_config_is_unchanged_for_rust() {
         // The text of the `base` arm as written before `--adapter` existed,
-        // plus the explicit `places = "scip"` since `auto` became the default.
+        // plus the explicit `places = "scip"` since `auto` became the default
+        // and the explicit `sync = "off"` since `watch` became the default.
         let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
         let expected = format!(
             "data_dir = '{}'\n{}",
@@ -2717,11 +2808,66 @@ mod tests {
                 "\n[index]\nfreshness = \"manual\"\n",
                 "\n[traverse]\nenabled = true\nscip_index = '@SCIP@'\ndeadline_ms = 20000\n",
                 "\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n",
-                "\n[run_profile.lsp]\nsessions = \"per_call\"\nplaces = \"scip\"\n",
+                "\n[run_profile.lsp]\nsessions = \"per_call\"\nsync = \"off\"\nplaces = \"scip\"\n",
             )
         )
         .replace("@SCIP@", &toml_path(&ctx.scip_index));
         assert_eq!(arm_config(&ARMS[0], &ctx), expected);
+    }
+
+    #[test]
+    fn the_arbitration_arm_adds_exactly_its_key_to_shared_sync() {
+        let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
+        let arm = |name: &str| *ARMS.iter().find(|a| a.name == name).unwrap();
+        let (base, arb) = (arm("shared+sync"), arm("shared+sync+arb"));
+        assert_eq!(arm_overlay_lines(&arb), arm_overlay_lines(&base));
+        assert_eq!(
+            arm_config(&arb, &ctx),
+            format!(
+                "{}\n[run_profile.scip]\narbitration = true\n",
+                arm_config(&base, &ctx)
+            )
+        );
+        // The only arm with the key, and it parses as the key on.
+        assert_eq!(ARMS.iter().filter(|a| a.arbitration).count(), 1);
+        let config: lci_core::config::Config =
+            toml::from_str(&arm_config(&arb, &ctx)).expect("a valid config");
+        assert!(config.run_profile.scip.arbitration);
+        let config: lci_core::config::Config =
+            toml::from_str(&arm_config(&base, &ctx)).expect("a valid config");
+        assert!(!config.run_profile.scip.arbitration);
+        // A default run leaves the arm out; naming it brings it in.
+        assert!(select_arms(&[]).unwrap().iter().all(|a| !a.arbitration));
+        assert_eq!(
+            select_arms(&["shared+sync+arb".to_owned()]).unwrap()[0].name,
+            "shared+sync+arb"
+        );
+    }
+
+    #[test]
+    fn extra_maps_change_the_extra_maps_line_only() {
+        let default = test_ctx(Adapter::Rust, "rust-analyzer");
+        let named = ConfigCtx {
+            extra_maps: vec!["lsp.live".into(), "scip.impact".into()],
+            ..default.clone()
+        };
+        for arm in ARMS {
+            let (plain, extra) = (arm_config(&arm, &default), arm_config(&arm, &named));
+            assert_eq!(
+                plain.replace(
+                    "extra_maps = [\"lsp.live\"]\n",
+                    "extra_maps = [\"lsp.live\", \"scip.impact\"]\n"
+                ),
+                extra,
+                "{}",
+                arm.name
+            );
+            let config: lci_core::config::Config = toml::from_str(&extra).unwrap();
+            assert_eq!(
+                config.traverse.policies["explore"].extra_maps.as_deref(),
+                Some(&["lsp.live".to_owned(), "scip.impact".to_owned()][..])
+            );
+        }
     }
 
     #[test]
@@ -2849,6 +2995,87 @@ mod tests {
         assert_eq!(adapter_key(&meta), "rust");
         meta.summary.push(("adapter".to_owned(), "go".to_owned()));
         assert_eq!(adapter_key(&meta), "go");
+    }
+
+    /// The report names the probe it timed: `gopls version` for go, not
+    /// `--version`, and no invented limit.
+    #[test]
+    fn the_report_labels_the_probe_the_adapter_runs() {
+        let label = |adapter: &str| {
+            let summary = vec![("adapter".to_owned(), adapter.to_owned())];
+            probe_label(&summary)
+        };
+        assert_eq!(label("go"), "<server> version");
+        assert_eq!(label("rust"), "<server> --version");
+        assert_eq!(probe_label(&[]), "<server> --version");
+        assert_eq!(label("python"), "<server> (readiness probe)");
+        for adapter in Adapter::ALL {
+            let expected = adapter
+                .probe_args()
+                .map_or_else(|| "(readiness probe)".to_owned(), |a| a.join(" "));
+            assert_eq!(label(adapter.name()), format!("<server> {expected}"));
+        }
+        let go = ReportMeta {
+            stamp: "s".into(),
+            summary: vec![("adapter".to_owned(), "go".to_owned())],
+            ..ReportMeta::default()
+        };
+        let result = ConditionResult {
+            condition: "quiet".into(),
+            version_probe: vec![10.0, 20.0],
+            ..ConditionResult::default()
+        };
+        let report = render_report(&go, &[result]);
+        assert!(
+            report.contains("`<server> version`, 2 runs: p50"),
+            "{report}"
+        );
+        assert!(!report.contains("`<server> --version`"), "{report}");
+        assert!(!report.contains("limit 5000"), "{report}");
+        assert!(
+            report.contains("no time limit is imposed on these runs"),
+            "{report}"
+        );
+    }
+
+    /// The harness times the probe the adapter runs: gopls answers `version`
+    /// (its `--version` exits 2), pyright and jdtls have no timed probe.
+    #[test]
+    fn each_adapter_times_the_probe_the_service_runs() {
+        const VERSION_FLAG: Option<&[&str]> = Some(&["--version"]);
+        assert_eq!(Adapter::Go.probe_args(), Some(&["version"][..]));
+        assert_eq!(Adapter::Python.probe_args(), None);
+        assert_eq!(Adapter::Java.probe_args(), None);
+        for adapter in [
+            Adapter::Rust,
+            Adapter::Typescript,
+            Adapter::C,
+            Adapter::Cpp,
+            Adapter::Csharp,
+        ] {
+            assert_eq!(adapter.probe_args(), VERSION_FLAG, "{adapter:?}");
+        }
+    }
+
+    /// A `version`-only shim (gopls) returns samples for `version` and none for
+    /// `--version`, which it rejects with exit 2.
+    #[cfg(windows)]
+    #[test]
+    fn the_version_probe_is_timed_with_the_given_arguments() {
+        let dir = std::env::temp_dir().join(format!("lci-k11b5-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("gopls.cmd");
+        std::fs::write(
+            &shim,
+            "@if \"%1\"==\"version\" (exit /b 0) else (exit /b 2)\r\n",
+        )
+        .unwrap();
+        let program = shim.to_string_lossy().into_owned();
+        let with_version = time_version_probe(&program, &["version"], 2);
+        let with_flag = time_version_probe(&program, &["--version"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(with_version.len(), 2, "{with_version:?}");
+        assert!(with_flag.is_empty(), "{with_flag:?}");
     }
 
     #[test]

@@ -111,6 +111,12 @@ pub enum Backend {
 pub struct SyncStatus {
     /// `None` while the watcher is still being opened.
     pub backend: Option<Backend>,
+    /// Neither the platform watcher nor the polling one could be started (or
+    /// the opening task died): nothing reports edits, and only the walk at
+    /// start has run, unless the opening task died, which leaves no walk. A watcher
+    /// that stops later (roadmap N102) is not seen here; its `events` stop
+    /// growing.
+    pub failed: bool,
     /// Events the watcher reported, kept or not.
     pub events: u64,
     /// Batches handed to the sink (the sync's generation).
@@ -186,6 +192,8 @@ struct Shared {
     root: PathBuf,
     sink: Sink,
     backend: OnceLock<Backend>,
+    /// Set when neither watcher started or the opening task died.
+    failed: AtomicBool,
     /// The running watcher; dropped when the sync stops.
     watcher: Mutex<Option<Box<dyn Watcher + Send>>>,
     queue: Mutex<Vec<notify::Result<Event>>>,
@@ -351,6 +359,7 @@ impl Shared {
     fn status(&self) -> SyncStatus {
         SyncStatus {
             backend: self.backend.get().copied(),
+            failed: self.failed.load(Ordering::Relaxed),
             events: self.events.load(Ordering::Relaxed),
             batches: self.batches.load(Ordering::Relaxed),
             forwarded: self.forwarded.load(Ordering::Relaxed),
@@ -404,11 +413,23 @@ async fn open_blocking(
         .ok()
 }
 
+/// Marks the sync failed when the opener never returned (it panicked on the
+/// blocking thread or the runtime is shutting down), so the status does not
+/// read as "still opening" forever.
+fn fail_without_watcher(shared: &Shared) {
+    shared.failed.store(true, Ordering::Relaxed);
+    tracing::warn!(
+        root = %shared.root.display(),
+        "the file watcher opener did not finish; language servers will not be told about edits"
+    );
+}
+
 /// The forwarding task: opens the platform watcher (the polling one when
 /// that fails), walks once, then drains whenever events are queued, walking
 /// again first when a rescan was asked for.
-async fn run(shared: Arc<Shared>, open: Open, poll_interval: Duration) {
+async fn run(shared: Arc<Shared>, open: Open, fallback: Open, poll_interval: Duration) {
     let Some(opened) = open_blocking(&shared, open, poll_interval).await else {
+        fail_without_watcher(&shared);
         return;
     };
     let opened = match opened {
@@ -424,7 +445,8 @@ async fn run(shared: Arc<Shared>, open: Open, poll_interval: Duration) {
                 "the file watcher did not start; polling for language-server sync instead"
             );
             let _ = shared.backend.set(Backend::Poll);
-            let Some(polled) = open_blocking(&shared, open_poll, poll_interval).await else {
+            let Some(polled) = open_blocking(&shared, fallback, poll_interval).await else {
+                fail_without_watcher(&shared);
                 return;
             };
             polled
@@ -432,11 +454,14 @@ async fn run(shared: Arc<Shared>, open: Open, poll_interval: Duration) {
     };
     match opened {
         Ok(watcher) => *shared.watcher.lock().unwrap() = Some(watcher),
-        Err(error) => tracing::warn!(
-            root = %shared.root.display(),
-            error = %error,
-            "the polling file watcher did not start either; language servers will not be told about edits"
-        ),
+        Err(error) => {
+            shared.failed.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                root = %shared.root.display(),
+                error = %error,
+                "the polling file watcher did not start either; language servers will not be told about edits"
+            );
+        }
     }
     if let Some(listing) = walk(&shared.root).await {
         let mut table = shared.table.lock().unwrap();
@@ -480,10 +505,22 @@ impl WorkspaceSync {
     }
 
     fn start_with(root: PathBuf, poll_interval: Duration, sink: Sink, open: Open) -> Self {
+        Self::start_with_fallback(root, poll_interval, sink, open, open_poll)
+    }
+
+    /// [`Self::start_with`] with the opener of the polling fallback too.
+    fn start_with_fallback(
+        root: PathBuf,
+        poll_interval: Duration,
+        sink: Sink,
+        open: Open,
+        fallback: Open,
+    ) -> Self {
         let shared = Arc::new(Shared {
             root,
             sink,
             backend: OnceLock::new(),
+            failed: AtomicBool::new(false),
             watcher: Mutex::new(None),
             queue: Mutex::new(Vec::new()),
             pending: Notify::new(),
@@ -497,7 +534,7 @@ impl WorkspaceSync {
             rescans: AtomicU64::new(0),
             progress: watch::channel(0).0,
         });
-        let task = tokio::spawn(run(Arc::clone(&shared), open, poll_interval));
+        let task = tokio::spawn(run(Arc::clone(&shared), open, fallback, poll_interval));
         Self { shared, task }
     }
 
@@ -756,6 +793,7 @@ mod tests {
             WorkspaceSync::start_with(root.clone(), Duration::from_millis(50), sink, open_failing);
         sync.wait_until(|status| status.walks == 1).await;
         assert_eq!(sync.status().backend, Some(Backend::Poll));
+        assert!(!sync.status().failed);
         // The polling watcher reports an edit by itself. It compares
         // modification times in whole seconds, so the edit gets one that is
         // certainly later than the one the watcher first saw.
@@ -778,6 +816,27 @@ mod tests {
         );
     }
 
+    /// The platform watcher fails, the polling fallback is tried and fails
+    /// too: the status says so instead of only logging it.
+    #[tokio::test]
+    async fn a_sync_whose_watchers_both_fail_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let (sink, _batches) = channel_sink();
+        let sync = WorkspaceSync::start_with_fallback(
+            root,
+            Duration::from_millis(50),
+            sink,
+            open_failing,
+            open_failing,
+        );
+        sync.wait_until(|status| status.walks == 1).await;
+        let status = sync.status();
+        assert_eq!(status.backend, Some(Backend::Poll), "{status:?}");
+        assert!(status.failed, "{status:?}");
+        assert!(sync.shared.watcher.lock().unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn the_platform_watcher_reports_an_edit() {
         let temp = tempfile::tempdir().unwrap();
@@ -787,6 +846,7 @@ mod tests {
         let sync = WorkspaceSync::start(root.clone(), WAIT, sink);
         sync.wait_until(|status| status.walks == 1).await;
         assert_eq!(sync.status().backend, Some(Backend::Notify));
+        assert!(!sync.status().failed);
         write(&root, "src/lib.rs", "fn f() {}\nfn g() {}\n");
         assert!(
             sync.synced(&["src/lib.rs"], WAIT).await,
