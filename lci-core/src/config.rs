@@ -10,8 +10,8 @@ pub mod layers;
 pub mod profile;
 
 pub use profile::{
-    LspPlaces, LspProfile, LspSessions, LspSync, RunProfile, RunProfileConfig, RunProfileSeeds,
-    RunProfileTraverse, WalkGroups, WalkPricing, WalkProfile,
+    LspPlaces, LspProfile, LspRoots, LspSessions, LspSync, RunProfile, RunProfileConfig,
+    RunProfileSeeds, RunProfileTraverse, WalkGroups, WalkPricing, WalkProfile,
 };
 
 /// Controls when a search request may trigger an automatic incremental
@@ -652,7 +652,7 @@ pub struct Config {
     /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`, `walk.confirm`,
     /// `traverse.map_freshness`, `traverse.answer_labels`, `traverse.card_paths`, `scip.mode`, `scip.arbitration`, `lsp.sessions`,
     /// `lsp.outline_cache`, `lsp.implementations`, `lsp.call_hierarchy`, `lsp.sync`,
-    /// `lsp.places`, `lsp.breaker`, `lsp.live`, `freshness.verify_on_read`, `freshness.stat_gate`, `seeds.bm25`, `seeds.literal`, `seeds.repo_map` and `grep.structural`). Always
+    /// `lsp.places`, `lsp.roots`, `lsp.breaker`, `lsp.live`, `freshness.verify_on_read`, `freshness.stat_gate`, `seeds.bm25`, `seeds.literal`, `seeds.repo_map` and `grep.structural`). Always
     /// serialized; the hashed profile of the whole configuration is
     /// [`Config::run_profile`].
     pub run_profile: RunProfileConfig,

@@ -498,6 +498,43 @@ impl std::str::FromStr for LspPlaces {
     }
 }
 
+/// The directory a language server starts at (`[run_profile.lsp] roots`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspRoots {
+    /// Every server starts at the workspace path. Today's behaviour.
+    #[default]
+    Workspace,
+    /// A server starts at the directory of the topmost manifest its adapter
+    /// names (`go.mod`, `pyproject.toml`, `tsconfig.json`, ...) among the
+    /// indexed files, when exactly one directory holds the topmost manifest;
+    /// with none or with several siblings it starts at the workspace.
+    Manifest,
+}
+
+impl LspRoots {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Manifest => "manifest",
+        }
+    }
+}
+
+impl std::str::FromStr for LspRoots {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "workspace" => Ok(Self::Workspace),
+            "manifest" => Ok(Self::Manifest),
+            other => Err(format!(
+                "roots must be \"workspace\" or \"manifest\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[run_profile.lsp]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -563,6 +600,24 @@ pub struct LspProfile {
     /// misplaces (see [`LspPlaces`]). The recipes walk no `lsp.live` and run
     /// the same under all three values.
     pub places: LspPlaces,
+    /// `"workspace"` (default): every language server starts at the workspace
+    /// path. `"manifest"`: a server starts at the directory of the topmost
+    /// manifest its adapter names (`go.mod`, `pyproject.toml`,
+    /// `tsconfig.json`, ...) found in the index's file list, when exactly one
+    /// directory holds the topmost manifest; with none, or with several
+    /// sibling directories, it starts at the workspace (see [`LspRoots`]).
+    /// There is one session per server per workspace either way. The recipes
+    /// walk no `lsp.live` and run the same under both values.
+    ///
+    /// What was measured (a premise check on small fixtures, not a general
+    /// bound): `"manifest"` helps pyright when a name resolves only through a
+    /// nested project's own settings (`extraPaths` in its `pyproject.toml`);
+    /// plain src-layout imports resolve from either root.
+    /// typescript-language-server already finds the nearest `tsconfig.json`
+    /// from the workspace root, so it gains nothing. Any indexed file of the
+    /// server's languages outside the project directory sends `"manifest"`
+    /// back to the workspace root (`files_outside_root:<n>` in the roster).
+    pub roots: LspRoots,
     /// `true` (default): a provider whose version probe failed, or whose server
     /// could not be started (it could not be spawned, exited, or broke the
     /// protocol), is left alone for 30 seconds: the next probe or start of that
@@ -601,6 +656,7 @@ impl Default for LspProfile {
             call_hierarchy: false,
             sync: LspSync::default(),
             places: LspPlaces::default(),
+            roots: LspRoots::default(),
             breaker: true,
             live: true,
         }
@@ -900,6 +956,7 @@ mod tests {
         config.run_profile.grep.structural = true;
         config.run_profile.lsp.sync = LspSync::Off;
         config.run_profile.lsp.places = LspPlaces::Outline;
+        config.run_profile.lsp.roots = LspRoots::Manifest;
         config.run_profile.lsp.breaker = false;
         config.run_profile.lsp.live = false;
         config
@@ -1486,6 +1543,7 @@ mode = \"sometimes\"
             "run_profile.grep.structural",
             "run_profile.lsp.sync",
             "run_profile.lsp.places",
+            "run_profile.lsp.roots",
             "run_profile.lsp.breaker",
             "run_profile.lsp.live",
         ] {
@@ -1894,6 +1952,57 @@ mode = \"sometimes\"
         assert_eq!("scip".parse::<LspPlaces>(), Ok(LspPlaces::Scip));
         assert!("index".parse::<LspPlaces>().is_err());
     }
+    #[test]
+    fn lsp_roots_is_workspace_by_default_and_manifest_changes_the_profile_hash() {
+        let workspace = Config::default();
+        assert_eq!(workspace.run_profile.lsp.roots, LspRoots::Workspace);
+        let manifest: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nroots = \"manifest\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.run_profile.lsp.roots, LspRoots::Manifest);
+        // Only the named leaf moves.
+        assert_eq!(manifest.run_profile.lsp.sessions, LspSessions::Shared);
+        assert_eq!(manifest.run_profile.lsp.places, LspPlaces::Auto);
+        assert_eq!(manifest.run_profile.lsp.sync, LspSync::Watch);
+        assert!(!manifest.run_profile.lsp.implementations);
+        assert_eq!(
+            serde_json::to_value(&manifest).unwrap()["run_profile"]["lsp"]["roots"],
+            "manifest"
+        );
+        let (workspace, manifest) = (workspace.run_profile(), manifest.run_profile());
+        assert_eq!(workspace.value["run_profile"]["lsp"]["roots"], "workspace");
+        assert_eq!(manifest.value["run_profile"]["lsp"]["roots"], "manifest");
+        assert!(
+            workspace
+                .keys
+                .iter()
+                .any(|key| key == "run_profile.lsp.roots")
+        );
+        assert_ne!(workspace.hash, manifest.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nroots = \"workspace\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, workspace.hash);
+        for bad in [
+            "[run_profile.lsp]\nroots = \"manifests\"\n",
+            "[run_profile.lsp]\nroots = \"Manifest\"\n",
+            "[run_profile.lsp]\nroots = true\n",
+            "[run_profile]\nroots = \"manifest\"\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        assert_eq!(LspRoots::Manifest.as_str(), "manifest");
+        assert_eq!("workspace".parse::<LspRoots>(), Ok(LspRoots::Workspace));
+        assert!("package".parse::<LspRoots>().is_err());
+    }
+
     #[test]
     fn lsp_breaker_is_on_by_default_and_off_changes_the_profile_hash() {
         let on = Config::default();

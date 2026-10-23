@@ -702,6 +702,16 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             && let Some(uri) = request["params"]["rootUri"].as_str()
         {
             root_uri = Some(uri.to_string());
+            // One line per start, for a test that asks where the client
+            // started the server (`[run_profile.lsp] roots`).
+            if let Some(path) = &config.state_dir
+                && let Ok(mut file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.join("root_uri.txt"))
+            {
+                let _ = file.write_all(format!("{uri}\n").as_bytes());
+            }
         }
 
         // `--mode documents`: the store answers navigation requests and keeps

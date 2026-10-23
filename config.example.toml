@@ -780,7 +780,31 @@ arbitration = false
 # lacks, set places = "outline": under "scip" the map then asks nothing.
 # false: the map runs only when a call or a policy names it. The recipes never
 # run lsp.live and are the same under both values.
-# All eight keys are part of the run-profile hash.
+# roots = "workspace" (default): every language server starts at the workspace
+# path. "manifest": a server starts at the directory of the topmost project file
+# its adapter names (go.mod, go.sum, go.work for gopls; pyrightconfig.json,
+# pyproject.toml, setup.cfg for pyright; tsconfig.json, package.json and so on
+# for typescript-language-server; *.sln, *.csproj for csharp-ls) found
+# in the directories of the index's files of its languages and their ancestors
+# (one directory read each, no recursive walk), so a module under services/api/
+# is served from services/api/. The workspace is kept when no such file is found,
+# when sibling directories at the same depth each hold one (one session per
+# module is not built), or when the chosen directory would leave an indexed file
+# of the server's languages outside it; `index_status` says which in
+# servers[].root and servers[].root_reason. A session fixes its root when it
+# starts. The one-shot `lci traverse` under sessions = "per_call" has no index
+# file list, so under "manifest" its servers start at the workspace
+# (no_file_list) and its output does not say so; the service always has it. There is one session per server per workspace either way, and the tree
+# stamp and barrier read the whole workspace as before. The recipes never run
+# lsp.live and are the same under both values. Measured on small fixtures (not a
+# general bound): "manifest" helps pyright when a name resolves only through a
+# nested project's own settings (extraPaths in its pyproject.toml);
+# typescript-language-server already finds the nearest tsconfig.json from the
+# workspace root, so it gains nothing; and any indexed file of the server's
+# languages outside the project directory sends "manifest" back to the workspace
+# root (reason files_outside_root:<n>), so the gain needs every such file under
+# the project.
+# All nine keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "shared"
 outline_cache = false
@@ -790,6 +814,7 @@ sync = "watch"
 places = "auto"
 breaker = true
 live = true
+roots = "workspace"
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against
