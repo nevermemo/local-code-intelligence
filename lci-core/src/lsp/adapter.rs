@@ -135,10 +135,11 @@ pub trait LspAdapter: Send + Sync {
     /// Whether the server learns of an edit to any file of its workspace on
     /// its own, without the client resending text or sending
     /// `workspace/didChangeWatchedFiles`: it runs its own file watcher. Only
-    /// such a server may keep one session across traverse calls under the
-    /// default `[run_profile.lsp] sessions = "shared"` without `sync =
-    /// "watch"`, and then only with a [`Self::stamp_manifests`] list
-    /// ([`Self::keeps_session`]); every other server is started per call. (A
+    /// such a server may keep one session across traverse calls under
+    /// `[run_profile.lsp] sessions = "shared"` with `sync = "off"`, and then
+    /// only with a [`Self::stamp_manifests`] list ([`Self::keeps_session`]);
+    /// under the default `sync = "watch"` the sync tells every other server
+    /// with a stamp list, so they are kept too. (A
     /// kept session also passes the tree barrier of each walk,
     /// `Manager::tree_barrier`, so a reused server is never staler than under
     /// `per_call` for a change the stamp covers, whatever the watcher does.) A
@@ -167,8 +168,9 @@ pub trait LspAdapter: Send + Sync {
     /// manager under `sessions = "shared"`: the server declares the
     /// configuration files its tree stamp covers
     /// ([`Self::stamp_manifests`], non-empty) and it sees an edit on its own
-    /// ([`Self::watches_workspace`]) or `synced` (`sync = "watch"` tells it).
-    /// Any other server starts per call.
+    /// ([`Self::watches_workspace`]) or `synced` (`sync = "watch"`, the
+    /// default, tells it). Any other server (all of them under `sync = "off"`
+    /// but rust-analyzer, and jdtls and marksman under either) starts per call.
     fn keeps_session(&self, synced: bool) -> bool {
         !self.stamp_manifests().is_empty() && (synced || self.watches_workspace())
     }

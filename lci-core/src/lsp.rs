@@ -617,19 +617,21 @@ impl Session {
     /// - the server has started and priming has settled: a session that is
     ///   still priming is busy building the index its `workspace/symbol`
     ///   callers wait for, and releasing it would fail them (the retry could
-    ///   fail the same way at a small idle timeout);
+    ///   fail the same way at a small idle timeout); or its start has
+    ///   failed, which leaves nothing to wait for. A start still in flight
+    ///   is neither, and is kept;
     /// - no call is using it: the registry holds one reference and every
     ///   call in progress holds another (a call gets its reference under the
     ///   same lock), so this cannot release a server between a caller
     ///   finding it and its request;
     /// - nobody has asked for it for `idle`.
     ///
-    /// So a session whose start failed (no ready client) is never released
-    /// here: it stays in the registry, and keeps its workspace's sync, until
-    /// the next caller replaces it, a release or a shutdown.
+    /// A session whose start failed is released like the others: otherwise it
+    /// would stay in the registry, and keep its workspace's sync (a watcher
+    /// and a file table) running, until the next caller replaced it, a
+    /// release or a shutdown. It has no server to stop.
     fn idle_and_unused(self: &Arc<Self>, idle: Duration) -> bool {
-        self.ready_client().is_some()
-            && *self.primed.borrow()
+        (self.failed() || (self.ready_client().is_some() && *self.primed.borrow()))
             && Arc::strong_count(self) == 1
             && self.idle_for() >= idle
     }
@@ -2547,8 +2549,9 @@ async fn shut_down(removed: Vec<Arc<Session>>) -> Vec<&'static str> {
 
 /// Spawns the task that releases sessions idle for `idle` or longer. It
 /// wakes every quarter of `idle` (at least 1 s, at most 30 s apart), removes
-/// the sessions that [`Session::idle_and_unused`] accepts (started, primed,
-/// not in use, and nobody has asked for them for `idle`), and shuts them down
+/// the sessions that [`Session::idle_and_unused`] accepts (started and primed,
+/// or failed to start; not in use, and nobody has asked for them for `idle`),
+/// and shuts them down
 /// outside the registry lock. It holds only a [`Weak`] reference to the registry and
 /// ends at its next wake-up once the [`Manager`] is dropped. Without a Tokio
 /// runtime nothing is spawned.

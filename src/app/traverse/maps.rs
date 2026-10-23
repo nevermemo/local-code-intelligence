@@ -608,7 +608,7 @@ pub(super) async fn build<'a>(
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
         // stops when the map drops. `shared`: a server that sees an edit on its
-        // own (or every server under `sync = "watch"`) runs on the caller's
+        // own (or every server under `sync = "watch"`, the default) runs on the caller's
         // manager, whose owner stops it (idle sweeper, release, shutdown); the
         // other servers run on the call's own manager, as under `per_call`.
         let workspace = dunce::canonicalize(root)
