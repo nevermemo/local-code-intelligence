@@ -2040,14 +2040,14 @@ fn events_of(state: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// With `[run_profile.lsp] sync` off (the default), the application's
-/// language-server session walks the tree when it starts and is told nothing
-/// after that, so an edit on disk is not pushed to it. Navigation passes the
-/// tree barrier (N104): the first call after the edit stops that session, the
-/// new one walks the disk and lists the edit (with a `restarted` note), and a
-/// call on the unchanged tree keeps it. The fake answers from its store (K7a):
-/// the store of the first server stays as it walked, the second one's holds
-/// the edit.
+/// With `[run_profile.lsp] sync` off (it is on by default; this test sets it
+/// off), the application's language-server session walks the tree when it
+/// starts and is told nothing after that, so an edit on disk is not pushed to
+/// it. Navigation passes the tree barrier (N104): the first call after the edit
+/// stops that session, the new one walks the disk and lists the edit (with a
+/// `restarted` note), and a call on the unchanged tree keeps it. The fake
+/// answers from its store (K7a): the store of the first server stays as it
+/// walked, the second one's holds the edit.
 #[tokio::test]
 async fn with_sync_off_the_barrier_restarts_the_session_and_the_new_one_walks_the_disk() {
     let mut world = World::start_with(IndexFreshness::OnSearch, true, true, false).await;

@@ -685,10 +685,14 @@ mode = "cache"
 # (macro arguments, for one): this complements graph.scip.
 # sync = "watch" (default): this process's language-server manager watches each
 # workspace that has a running session and sends every source-file change to its
-# servers (workspace/didChangeWatchedFiles), so a long-lived session
-# (search_symbols, the search channel, a "shared" lsp.live) answers the tree as it
-# is, and a server that lists its stamp's configuration files is kept by
-# "shared" (see above). It falls back to polling (a scan of the tree) every
+# servers (workspace/didChangeWatchedFiles). Before each request the manager
+# sends what the watcher has already reported; the notification goes out before
+# the request, but the manager does not wait for the server to apply it, and an
+# event that arrives after that send reaches the next request. So a long-lived
+# session (search_symbols, the search channel, a "shared" lsp.live) is told of
+# the edits the watcher has seen, which is what makes a server that lists its
+# stamp's configuration files worth keeping by "shared" (see above). The
+# one-shot `lci traverse` builds its manager without the sync. It falls back to polling (a scan of the tree) every
 # watch_poll_milliseconds when the platform watcher cannot start, and stops with
 # the workspace's last session. If both watchers fail, or the Windows watcher
 # silently stops, a kept server that does not watch on its own is told nothing

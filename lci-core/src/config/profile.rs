@@ -516,8 +516,8 @@ pub struct LspProfile {
     /// edges. A server that refuses a request costs the other edges nothing.
     /// The recipes walk no `lsp.live` and run the same under both values.
     pub call_hierarchy: bool,
-    /// `"watch"` (default): a long-lived manager (the MCP and REST server's,
-    /// the one `lci traverse` builds under `sessions = "shared"`) watches each
+    /// `"watch"` (default): a long-lived manager (the MCP and REST server's;
+    /// not the one-shot `lci traverse`'s, which ends with its walk) watches each
     /// workspace that has a live session and sends every source-file change
     /// to its servers (see [`LspSync`]); a server that lists the
     /// configuration files of its tree stamp then keeps its session across

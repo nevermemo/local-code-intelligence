@@ -2950,6 +2950,44 @@ async fn idle_timeout_zero_never_releases() {
     assert_eq!(state_count(&state, "spawn_count.txt"), 1);
 }
 
+/// A session whose server failed to start is released by the idle sweeper
+/// like any other, and takes its workspace's sync with it. Under
+/// `sync = "watch"` the sync starts with the session, before the start
+/// outcome is known: left in the registry, a failed session would keep a
+/// watcher and a file table running for a workspace that serves nothing.
+#[tokio::test]
+async fn a_failed_start_does_not_leave_its_workspace_watched() {
+    use local_code_intelligence::config::LspSync;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state) = fake_csharp_release_fixture(&temp);
+    config.run_profile.lsp.sync = LspSync::Watch;
+    config.lsp_idle_timeout_seconds = 1;
+    config.csharp.args.extend(fake_args(&["--exit-at-start"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    assert!(
+        manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .is_err(),
+        "the server exits at the initialize request"
+    );
+    assert!(
+        manager.sync_status(&workspace.id).is_some(),
+        "the failed session is still registered, with its sync"
+    );
+
+    wait_until(
+        "the idle sweeper to release the failed session and its sync",
+        Duration::from_secs(30),
+        async || manager.sync_status(&workspace.id).is_none(),
+    )
+    .await;
+    assert!(!manager.running("csharp-ls", &workspace.id).await);
+    manager.shutdown_all().await;
+}
+
 /// An explicit release stops the servers of one workspace, reports them, and
 /// leaves every other workspace's server serving.
 #[tokio::test]
@@ -7987,8 +8025,10 @@ async fn the_default_profile_tells_a_kept_server_about_an_edit_the_stamp_does_no
     assert_eq!(config.run_profile.lsp.sync, LspSync::Watch);
     // The directory exists before the server starts and is empty.
     std::fs::create_dir_all(workspace.path.join("src/x/y")).unwrap();
-    let manager = Manager::new(&config);
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
     let csharp = csharp_adapter(&manager);
+    manager.tree_barrier(&workspace, &[&csharp]).await;
     assert!(
         !manager
             .symbols(&csharp, &workspace, "Calculator")
@@ -8009,6 +8049,12 @@ async fn the_default_profile_tells_a_kept_server_about_an_edit_the_stamp_does_no
         &workspace.path,
         "src/x/y/Deep.cs",
         "namespace Acceptance;\npublic sealed class DeepThing { }\n",
+    );
+    // The stamp does not see the edit, so the barrier keeps the session.
+    let restarted = manager.tree_barrier(&workspace, &[&csharp]).await;
+    assert!(
+        restarted.is_empty(),
+        "the stamp must not cover the deep file: {restarted:?}"
     );
     assert!(
         manager
