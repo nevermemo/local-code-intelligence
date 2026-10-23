@@ -792,7 +792,9 @@ arbitration = false
 # module is not built), or when the chosen directory would leave an indexed file
 # of the server's languages outside it; `index_status` says which in
 # servers[].root and servers[].root_reason. A session fixes its root when it
-# starts. There is one session per server per workspace either way, and the tree
+# starts. The one-shot `lci traverse` under sessions = "per_call" has no index
+# file list, so under "manifest" its servers start at the workspace
+# (no_file_list) and its output does not say so; the service always has it. There is one session per server per workspace either way, and the tree
 # stamp and barrier read the whole workspace as before. The recipes never run
 # lsp.live and are the same under both values. Measured on small fixtures (not a
 # general bound): "manifest" helps pyright when a name resolves only through a
