@@ -53,8 +53,8 @@ Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`O
 | `exact.closure` | first stage only | declarations that reference the symbol the question names, most references first | n/a | `src/app/traverse/first_stage.rs` |
 | `exact.pickaxe` | first stage only | commits found by `git log -G/-S/--grep` for a history question (20 s timeout per call) | n/a | `exact_history.rs`, `first_stage.rs` |
 
-Other maps: `sym.defs` (RankList, PerFile; declarations from the bundle store, `symdefs.rs`) and the legacy maps `vec.chunk.code`, `lexical`, `lsp.symbols` that wrap today's three search channels
-(`src/app/search/legacy_maps.rs`, `legacy_maps` and `record_through_maps`/`fuse_through_maps` behind Cargo feature `spike-maps`; `LEGACY_ORDER` keeps the f32 fusion order bit-exact). Support modules: `walk.rs`
+Other maps: `sym.defs` (RankList, PerFile; declarations from the bundle store, `symdefs.rs`) and the channel maps `vec.chunk.code`, `lexical`, `lsp.symbols` that wrap today's three search channels
+(`src/app/search/channel_maps.rs`, the module and its `record_through_maps`/`fuse_through_maps` behind Cargo feature `map-equivalence`; `CHANNEL_ORDER` in `lci-maps` keeps the f32 fusion order bit-exact). Support modules: `walk.rs`
 (M0.4, hop scorer constants `W_BASE` 0.1, `W_INDEGREE_IDF` 0.3, `W_OVERLAP` 0.6), `crates.rs`, `fresh.rs`, `audit.rs`, `labels.rs`, `kit.rs`, `kit_c3.rs`, `run_record.rs`.
 
 What persists between index passes (chunk store): per chunk the trimmed `code`, line range, `content_hash`, language and path (manifest and LanceDB columns with the vector); per file `language`, `adapter_version`,
@@ -266,12 +266,12 @@ and never contact the reserved model ports (fakes under `tests/support`).
 | Evaluation changes (9.5) | partly built (bench in `xtask/src/maps`, scorers in `xtask/src/gold`) | Leakage risk: a co-change map built at HEAD includes the commits the miner turned into gold, so score it from history before each query's commit. Plan: multi-hop gold (ordered or set-valued per hop, for example config key, then reader, then test) with a scripted steering policy so runs are reproducible and pairable by `compare` (a free agent loop belongs to the agent A/B); per-map contribution (`CandidateTrace`/`CandidateArm` keyed by map, legacy columns kept) with per-map unique gold (gold reached only through map M) and leave-one-map-out replays; step metrics (frontier gold recall at each checkpoint, steps and rerank tokens spent); bit-exact replay of old dumps must keep working. |
 
 Merge conditions M1 to M7 are met on the integration branch (2026-10-13; log: d212, d213, d214, d204). Still true as constraints: one LSP orchestration (`App::applicable_lsp_adapters`, `lsp_symbol_queries`,
-`App::lsp_channel`, `lsp_over_budget_note`, `lsp_failure_warning`) and one chunker, with a golden record of 44 chunks; spike entry points sit behind Cargo feature `spike-maps` (`#[cfg(any(test, feature =
-"spike-maps"))]`, Full test run 812 = 811 + 1); stored maps run on `spawn_blocking` (300 ms budget, 250 ms slack, 512 blocking threads); C5 labels are checked inside `Registry::run`; the hand-written schema checker
+`App::lsp_channel`, `lsp_over_budget_note`, `lsp_failure_warning`) and one chunker, with a golden record of 44 chunks; spike entry points sit behind Cargo feature `map-equivalence` (`#[cfg(any(test, feature =
+"map-equivalence"))]`, Full test run 812 = 811 + 1); stored maps run on `spawn_blocking` (300 ms budget, 250 ms slack, 512 blocking threads); C5 labels are checked inside `Registry::run`; the hand-written schema checker
 is kept. `SnapshotView::new` timing (M4, partly met; example `lci-maps/examples/snapshot_view_timing.rs`; release, 50 runs, 4 cores, cloud machine): 4048 chunks p50 3.94 ms, p95 4.24 ms, max 5.60 ms; ten times
 (40480 chunks) p50 74.67 ms, p95 89.75 ms, max 91.88 ms; debug 22.18/26.03/28.49 ms and 246.67/293.69/339.35 ms (about 19x release, 11x debug for ten times the chunks). The 50 constructions run back to back on the same input, so caches are warm; one construction per search may cost more than these p50s. Not measured: per-query timing over
 `evaluations/mined/self.toml` and the A/B's largest repo, and the owner-set acceptable share. Before the registry replaces `fuse_hits`, one real candidate dump should replay with zero refusals (owner's machine); the
-C4 replay auditor is ignored in the Full run (CI has no history). Owner decisions: the record path stays in `legacy_maps.rs` until merge; full query text is kept in local RunRecords; no profile or reranker step.
+C4 replay auditor is ignored in the Full run (CI has no history). Owner decisions: the record path stays in `channel_maps/record.rs` until merge; full query text is kept in local RunRecords; no profile or reranker step.
 
 ## Known gaps
 

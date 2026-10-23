@@ -34,13 +34,13 @@ The legacy search path, named by symbol (checked on the spike tree). The product
 
 - Crate `lci-maps` depends on `lci-core` only: the `Map` trait, `MapCard`, the registry, the fusion loop and the maps that need no LanceDB.
 - The root crate implements the maps that touch LanceDB or `App` internals and owns the engine that `App` calls. The wrapped lexical and LSP maps live in the root
-  crate too (`src/app/search/legacy_maps.rs`), not in `lci-maps`: the code they call (`App::map_lexical_matches`, `App::provider_symbols`, `App::map_lsp_locations`,
+  crate too (`src/app/search/channel_maps.rs`), not in `lci-maps`: the code they call (`App::map_lexical_matches`, `App::provider_symbols`, `App::map_lsp_locations`,
   `Hit::source_role_prior`) is there, and moving it would change the production path. `LspMap` and `search_once` call the same shared functions in
   `src/app/search.rs` (`App::applicable_lsp_adapters`, `lsp_symbol_queries`, `App::lsp_channel`, `App::lsp_over_budget_note`, `lsp_failure_warning`); the integration
   test that compares the registry with a traced search guards the map path.
 - `lci-maps` adds `petgraph = "0.8"` only when a graph map needs it (M-5); no shipped map uses it.
-- Spike entry points on the `App` facade (`App::fuse_through_maps`, `App::record_through_maps`) and the module `legacy_maps` compile only with `#[cfg(any(test,
-  feature = "spike-maps"))]`, so the default build adds no public path.
+- Spike entry points on the `App` facade (`App::fuse_through_maps`, `App::record_through_maps`) and the module `channel_maps` compile only with `#[cfg(any(test,
+  feature = "map-equivalence"))]`, so the default build adds no public path.
 
 ### 3.2 The trait
 
@@ -118,7 +118,7 @@ compile_error_at, near, defined_in. Edges are sorted by confidence, then destina
 
 `fuse` replaces `fuse_hits` with a loop that keeps today's arithmetic exactly:
 
-1. Order: `vec.chunk.code`, `lexical`, `lsp.symbols` first, in that order (`LEGACY_ORDER`); then every other `RankList` or `Expansion` map in registry order (sorted
+1. Order: `vec.chunk.code`, `lexical`, `lsp.symbols` first, in that order (`CHANNEL_ORDER` in `lci-maps`); then every other `RankList` or `Expansion` map in registry order (sorted
    by `MapId`); then `Prior` maps.
 2. For each map's hits in its own order: `score[node] += weight(map) / (rrf_k + rank as f32)`, in `f32`, starting from `0.0`. A node's first contribution inserts it.
 3. `Prior` maps add their value unweighted (the source-role prior, `src/store.rs`). After the rank lists are fused, every `Prior` map gets the fused nodes as seeds

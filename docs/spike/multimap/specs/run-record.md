@@ -87,7 +87,7 @@ reference.
 
 #### Steps of a registry run (built)
 
-The registry path (`App::record_through_maps`, the recording twin of `fuse_through_maps`; feature `spike-maps`, `src/app/search/legacy_maps/record.rs`) writes, after
+The registry path (`App::record_through_maps`, the recording twin of `fuse_through_maps`; feature `map-equivalence`, `src/app/search/channel_maps/record.rs`) writes, after
 the `run` line:
 
 | seq | `kind` | `yield` | Content |
