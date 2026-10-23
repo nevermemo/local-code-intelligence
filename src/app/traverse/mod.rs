@@ -1036,60 +1036,22 @@ async fn run_first_stage(
     })
 }
 
-/// Runs one traversal call. Errors are the caller's mistakes (a bad rule, an
-/// unknown handle, a missing index) or the data directory not being writable
-/// for a handle; a failed trace write is a note, not an error.
-///
-/// `profile` is `[run_profile]`: its `walk` keys set how the walk groups
-/// evidence (see [`Grouping`]); its `scip.mode` says whether the SCIP index
-/// is required, a cache or never read.
-pub async fn run(
-    limits: &TraverseConfig,
-    profile: &RunProfileConfig,
-    dirs: &Dirs,
-    call: &Call<'_>,
-) -> Result<Report> {
-    run_with_trait_seeds(limits, profile, dirs, call, TraitSeedMode::Auto).await
+/// Phase D's result: the no-seeds answer, or the walk.
+enum WalkOutcome {
+    Answered(Report),
+    Walked(Box<Walked>),
 }
 
-/// [`run`] with the mode in which the traits and trait methods the question
-/// names join the start nodes (only with `scip.implements` on; see
-/// [`TraitSeedMode`]).
-pub async fn run_with_trait_seeds(
-    limits: &TraverseConfig,
-    profile: &RunProfileConfig,
-    dirs: &Dirs,
-    call: &Call<'_>,
-    trait_seed_mode: TraitSeedMode,
-) -> Result<Report> {
-    let (p, setup, mut ledger) = prepare(limits, profile, dirs, call).await?;
-    let limits = &*p.limits;
-
-    // `lsp.live` on a shared manager: its server passes the strict tree barrier
-    // once, here, before the seed search's channel can keep a watching server
-    // through the same edit (see `walk_tree_barrier`). A continuation has no
-    // seed search and its backend passes the barrier itself.
-    let mut walk_restarts: Vec<lci_core::lsp::Restart> = Vec::new();
-    if setup.snapshot.is_none()
-        && p.selection.wants(LSP_LIVE_ID)
-        && profile.lsp.sessions == LspSessions::Shared
-    {
-        let barrier_started = Instant::now();
-        walk_restarts = walk_tree_barrier(call).await;
-        // Setup, like the version probe below: credited back to the deadline.
-        ledger.budget.deadline += barrier_started.elapsed();
-    }
-
-    let mut seeded = seeds(&p, &setup, &mut ledger, &walk_restarts, trait_seed_mode).await?;
-    let staged = run_first_stage(&p, &setup, &mut seeded, &mut ledger).await?;
-    // Setup does not run the walk's deadline, but the first stage's git calls
-    // do: they were bounded by the deadline and count against it.
-    ledger.budget.deadline += seeded
-        .built
-        .setup
-        .elapsed()
-        .saturating_sub(staged.stage_time)
-        + seeded.built.early;
+/// Phase D: the walk (a continuation resumes its snapshot), or, on a first
+/// call with no start nodes, the answer without one.
+async fn walk(
+    p: &Prepared<'_>,
+    setup: WalkSetup,
+    seeded: &mut Seeded<'_>,
+    staged: &Staged,
+    mut ledger: Ledger,
+) -> Result<WalkOutcome> {
+    let (call, profile, dirs, limits) = (p.call, p.profile, p.dirs, &*p.limits);
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = setup.handler.as_ref().map(|(_, _, plan)| plan.clone());
@@ -1174,10 +1136,10 @@ pub async fn run_with_trait_seeds(
                         &HashSet::new(),
                     );
                 }
-                return Ok(Report {
+                return Ok(WalkOutcome::Answered(Report {
                     response,
                     trace: None,
-                });
+                }));
             }
             let plan = StartPlan {
                 maps: std::mem::take(&mut seeded.built.plan_maps),
@@ -1241,13 +1203,72 @@ pub async fn run_with_trait_seeds(
     };
     let result = traversal.run().await;
 
-    let walked = Walked {
+    Ok(WalkOutcome::Walked(Box::new(Walked {
         result,
         effective,
         enabled_maps,
         restored,
         notes: ledger.notes,
         warnings: ledger.warnings,
+    })))
+}
+
+/// Runs one traversal call. Errors are the caller's mistakes (a bad rule, an
+/// unknown handle, a missing index) or the data directory not being writable
+/// for a handle; a failed trace write is a note, not an error.
+///
+/// `profile` is `[run_profile]`: its `walk` keys set how the walk groups
+/// evidence (see [`Grouping`]); its `scip.mode` says whether the SCIP index
+/// is required, a cache or never read.
+pub async fn run(
+    limits: &TraverseConfig,
+    profile: &RunProfileConfig,
+    dirs: &Dirs,
+    call: &Call<'_>,
+) -> Result<Report> {
+    run_with_trait_seeds(limits, profile, dirs, call, TraitSeedMode::Auto).await
+}
+
+/// [`run`] with the mode in which the traits and trait methods the question
+/// names join the start nodes (only with `scip.implements` on; see
+/// [`TraitSeedMode`]).
+pub async fn run_with_trait_seeds(
+    limits: &TraverseConfig,
+    profile: &RunProfileConfig,
+    dirs: &Dirs,
+    call: &Call<'_>,
+    trait_seed_mode: TraitSeedMode,
+) -> Result<Report> {
+    let (p, setup, mut ledger) = prepare(limits, profile, dirs, call).await?;
+
+    // `lsp.live` on a shared manager: its server passes the strict tree barrier
+    // once, here, before the seed search's channel can keep a watching server
+    // through the same edit (see `walk_tree_barrier`). A continuation has no
+    // seed search and its backend passes the barrier itself.
+    let mut walk_restarts: Vec<lci_core::lsp::Restart> = Vec::new();
+    if setup.snapshot.is_none()
+        && p.selection.wants(LSP_LIVE_ID)
+        && profile.lsp.sessions == LspSessions::Shared
+    {
+        let barrier_started = Instant::now();
+        walk_restarts = walk_tree_barrier(call).await;
+        // Setup, like the version probe below: credited back to the deadline.
+        ledger.budget.deadline += barrier_started.elapsed();
+    }
+
+    let mut seeded = seeds(&p, &setup, &mut ledger, &walk_restarts, trait_seed_mode).await?;
+    let staged = run_first_stage(&p, &setup, &mut seeded, &mut ledger).await?;
+    // Setup does not run the walk's deadline, but the first stage's git calls
+    // do: they were bounded by the deadline and count against it.
+    ledger.budget.deadline += seeded
+        .built
+        .setup
+        .elapsed()
+        .saturating_sub(staged.stage_time)
+        + seeded.built.early;
+    let walked = match walk(&p, setup, &mut seeded, &staged, ledger).await? {
+        WalkOutcome::Answered(report) => return Ok(report),
+        WalkOutcome::Walked(walked) => *walked,
     };
     finish(&p, &seeded, &staged, walked).await
 }
