@@ -139,10 +139,19 @@ impl Adapter {
         }
     }
 
-    /// Whether `<server> --version` is a real probe: pyright-langserver has no
-    /// such flag and jdtls is a directory.
-    pub fn has_version_flag(self) -> bool {
-        !matches!(self, Adapter::Python | Adapter::Java)
+    /// The arguments of the server's readiness probe, as the adapter's
+    /// `probe_readiness` runs them (gopls has no `--version`; `version` is its
+    /// probe). `None` where no timed probe exists: pyright-langserver has no
+    /// version flag (the service probes it with a start whose status is
+    /// ignored) and jdtls is a directory.
+    pub fn probe_args(self) -> Option<&'static [&'static str]> {
+        match self {
+            Adapter::Python | Adapter::Java => None,
+            Adapter::Go => Some(&["version"]),
+            Adapter::Rust | Adapter::Typescript | Adapter::C | Adapter::Cpp | Adapter::Csharp => {
+                Some(&["--version"])
+            }
+        }
     }
 }
 
@@ -223,7 +232,7 @@ pub struct LspCostArgs {
     /// Request deadline of every call, ms (the config cap is the same).
     #[arg(long, default_value_t = 20_000)]
     pub deadline_ms: u64,
-    /// Timed `<server> --version` runs per condition (none for pyright and jdtls).
+    /// Timed readiness-probe runs per condition (`<server> --version`, `gopls version`; none for pyright and jdtls).
     #[arg(long, default_value_t = 20)]
     pub probe_runs: usize,
     /// Calls of the N8 window (the first calls of the `shared` arm).
@@ -1252,13 +1261,30 @@ fn probe_program(server: &str) -> String {
     )
 }
 
-/// Times `<server> --version` `runs` times, ms.
-fn time_version_probe(binary: &str, runs: usize) -> Vec<f64> {
+/// The timed probe as the report prints it, `<server> <args>` of the adapter
+/// named by the report's "adapter" summary entry (rust when absent or unknown),
+/// from [`Adapter::probe_args`]; a generic name when the adapter has none.
+fn probe_label(summary: &[(String, String)]) -> String {
+    let key = summary
+        .iter()
+        .find(|(key, _)| key == "adapter")
+        .map_or("rust", |(_, value)| value.as_str());
+    let adapter = Adapter::from_str(key, false).unwrap_or(Adapter::Rust);
+    match adapter.probe_args() {
+        Some(args) => format!("<server> {}", args.join(" ")),
+        None => "<server> (readiness probe)".to_owned(),
+    }
+}
+
+/// Times `<server> <args>` (the adapter's [`Adapter::probe_args`]) `runs`
+/// times, ms; a run that does not exit 0 has no sample. The runs are not
+/// bounded by a timeout.
+fn time_version_probe(binary: &str, args: &[&str], runs: usize) -> Vec<f64> {
     (0..runs)
         .filter_map(|_| {
             let started = Instant::now();
             let status = std::process::Command::new(binary)
-                .arg("--version")
+                .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -1489,9 +1515,9 @@ fn git_head(tree: &Path) -> String {
         )
 }
 
-fn command_text(program: &str, arg: &str) -> String {
+fn command_text(program: &str, args: &[&str]) -> String {
     std::process::Command::new(program)
-        .arg(arg)
+        .args(args)
         .output()
         .ok()
         .map_or_else(
@@ -1808,11 +1834,12 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
             ))
         );
         if result.version_probe.is_empty() {
-            out.push_str("`<server> --version`: no timing (the adapter has no `--version` flag, or the run did not time it).\n\n");
+            out.push_str("Readiness probe: no timing (the adapter has no timed probe, or the run did not time it).\n\n");
         } else {
             let _ = writeln!(
                 out,
-                "`<server> --version`, {} runs: p50 {} ms, p95 {} ms, max {} ms (limit 5000 ms).\n",
+                "`{}`, {} runs: p50 {} ms, p95 {} ms, max {} ms (no time limit is imposed on these runs).\n",
+                probe_label(&meta.summary),
                 result.version_probe.len(),
                 fmt_opt(percentile(&result.version_probe, 50.0)),
                 fmt_opt(percentile(&result.version_probe, 95.0)),
@@ -2165,8 +2192,8 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let server_version = if args.adapter.has_version_flag() {
-        command_text(&probe_program(&server), "--version")
+    let server_version = if let Some(probe_args) = args.adapter.probe_args() {
+        command_text(&probe_program(&server), probe_args)
     } else {
         format!(
             "{} has no `--version` (probe skipped)",
@@ -2263,8 +2290,8 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             println!("[{condition}] {thread_count} busy threads started");
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        let version_probe = if args.adapter.has_version_flag() {
-            time_version_probe(&probe_program(&server), args.probe_runs)
+        let version_probe = if let Some(probe_args) = args.adapter.probe_args() {
+            time_version_probe(&probe_program(&server), probe_args, args.probe_runs)
         } else {
             println!(
                 "[{condition}] the {} server has no --version: probe skipped",
@@ -2273,7 +2300,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             Vec::new()
         };
         println!(
-            "[{condition}] --version p50 {} ms p95 {} ms",
+            "[{condition}] readiness probe p50 {} ms p95 {} ms",
             fmt_opt(percentile(&version_probe, 50.0)),
             fmt_opt(percentile(&version_probe, 95.0))
         );
@@ -2968,6 +2995,87 @@ mod tests {
         assert_eq!(adapter_key(&meta), "rust");
         meta.summary.push(("adapter".to_owned(), "go".to_owned()));
         assert_eq!(adapter_key(&meta), "go");
+    }
+
+    /// The report names the probe it timed: `gopls version` for go, not
+    /// `--version`, and no invented limit.
+    #[test]
+    fn the_report_labels_the_probe_the_adapter_runs() {
+        let label = |adapter: &str| {
+            let summary = vec![("adapter".to_owned(), adapter.to_owned())];
+            probe_label(&summary)
+        };
+        assert_eq!(label("go"), "<server> version");
+        assert_eq!(label("rust"), "<server> --version");
+        assert_eq!(probe_label(&[]), "<server> --version");
+        assert_eq!(label("python"), "<server> (readiness probe)");
+        for adapter in Adapter::ALL {
+            let expected = adapter
+                .probe_args()
+                .map_or_else(|| "(readiness probe)".to_owned(), |a| a.join(" "));
+            assert_eq!(label(adapter.name()), format!("<server> {expected}"));
+        }
+        let go = ReportMeta {
+            stamp: "s".into(),
+            summary: vec![("adapter".to_owned(), "go".to_owned())],
+            ..ReportMeta::default()
+        };
+        let result = ConditionResult {
+            condition: "quiet".into(),
+            version_probe: vec![10.0, 20.0],
+            ..ConditionResult::default()
+        };
+        let report = render_report(&go, &[result]);
+        assert!(
+            report.contains("`<server> version`, 2 runs: p50"),
+            "{report}"
+        );
+        assert!(!report.contains("`<server> --version`"), "{report}");
+        assert!(!report.contains("limit 5000"), "{report}");
+        assert!(
+            report.contains("no time limit is imposed on these runs"),
+            "{report}"
+        );
+    }
+
+    /// The harness times the probe the adapter runs: gopls answers `version`
+    /// (its `--version` exits 2), pyright and jdtls have no timed probe.
+    #[test]
+    fn each_adapter_times_the_probe_the_service_runs() {
+        const VERSION_FLAG: Option<&[&str]> = Some(&["--version"]);
+        assert_eq!(Adapter::Go.probe_args(), Some(&["version"][..]));
+        assert_eq!(Adapter::Python.probe_args(), None);
+        assert_eq!(Adapter::Java.probe_args(), None);
+        for adapter in [
+            Adapter::Rust,
+            Adapter::Typescript,
+            Adapter::C,
+            Adapter::Cpp,
+            Adapter::Csharp,
+        ] {
+            assert_eq!(adapter.probe_args(), VERSION_FLAG, "{adapter:?}");
+        }
+    }
+
+    /// A `version`-only shim (gopls) returns samples for `version` and none for
+    /// `--version`, which it rejects with exit 2.
+    #[cfg(windows)]
+    #[test]
+    fn the_version_probe_is_timed_with_the_given_arguments() {
+        let dir = std::env::temp_dir().join(format!("lci-k11b5-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("gopls.cmd");
+        std::fs::write(
+            &shim,
+            "@if \"%1\"==\"version\" (exit /b 0) else (exit /b 2)\r\n",
+        )
+        .unwrap();
+        let program = shim.to_string_lossy().into_owned();
+        let with_version = time_version_probe(&program, &["version"], 2);
+        let with_flag = time_version_probe(&program, &["--version"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(with_version.len(), 2, "{with_version:?}");
+        assert!(with_flag.is_empty(), "{with_flag:?}");
     }
 
     #[test]

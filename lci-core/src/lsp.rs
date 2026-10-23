@@ -1096,10 +1096,10 @@ pub struct Manager {
     /// `lsp_stuck_seconds`: how long a session may answer nothing but transient
     /// errors before it is replaced. `None` never replaces it.
     stuck_after: Option<Duration>,
-    /// The providers whose binary has answered a version probe (see
+    /// The providers whose binary has passed its readiness probe (see
     /// [`Self::probe_once`]).
     probed: std::sync::Mutex<HashSet<&'static str>>,
-    /// `readiness_timeout_seconds`: the bound of one version probe in an
+    /// `readiness_timeout_seconds`: the bound of one readiness probe in an
     /// unbounded warm-up (see [`Self::prime_languages`]).
     probe_timeout: Duration,
     /// The tree stamp each kept session was last checked against (see
@@ -1352,7 +1352,7 @@ impl Manager {
     /// when its session fails). A failed probe is remembered nowhere and is
     /// run again by the next caller. Concurrent first callers each probe.
     /// The default probe also keeps a process-wide memo of its own (see
-    /// [`adapter::probe_subprocess_version`]), so a second manager in the same
+    /// [`adapter::probe_subprocess`]), so a second manager in the same
     /// process does not run a binary again that has answered.
     ///
     /// Under `[run_profile.lsp] breaker = true` a failed probe opens the
@@ -2344,8 +2344,8 @@ impl Manager {
     /// `timeout` `Some`: the whole call is bounded by it, as in [`Self::prime`].
     /// `None`: nothing but the caller's own cancellation (dropping or aborting
     /// the future) ends the wait for a server to start and prime, which is for
-    /// a background warm-up that has an abort. Each version probe is still
-    /// bounded by `readiness_timeout_seconds`, so a binary whose `--version`
+    /// a background warm-up that has an abort. Each readiness probe is still
+    /// bounded by `readiness_timeout_seconds`, so a binary whose probe
     /// never exits is reported and the next adapter goes on.
     pub async fn prime_languages(
         &self,
@@ -2398,7 +2398,7 @@ impl Manager {
                     outcomes.insert(
                         adapter.provider(),
                         Err(anyhow!(
-                            "the version probe did not answer within {:?}",
+                            "the readiness probe did not answer within {:?}",
                             timeout.unwrap_or(self.probe_timeout)
                         )),
                     );

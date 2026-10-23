@@ -259,3 +259,46 @@ async fn readiness_still_probes_the_embedding_service_when_semantic_search_is_of
     assert_eq!(status["can_create_semantic_index"], true);
     models_task.abort();
 }
+
+/// pyright-langserver exits 1 on `--version` and gopls exits 2: `/ready` runs
+/// the probe of each adapter (a start whose status is ignored; `gopls
+/// version`), so a stock install reports both ready.
+#[cfg(windows)]
+#[tokio::test]
+async fn python_and_go_readiness_use_their_own_probes() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    let pyright = temp.path().join("pyright-langserver.cmd");
+    std::fs::write(&pyright, "@exit /b 1\r\n").unwrap();
+    let gopls = temp.path().join("gopls.cmd");
+    std::fs::write(
+        &gopls,
+        "@if \"%1\"==\"version\" (exit /b 0) else (exit /b 2)\r\n",
+    )
+    .unwrap();
+    config.python.path = Some(pyright.to_string_lossy().into_owned());
+    config.go.path = Some(gopls.to_string_lossy().into_owned());
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
+    let app = App::open(config).await.unwrap();
+    let status = app.service_status().await;
+    for (name, provider) in [
+        ("python_language_server_available", "pyright"),
+        ("go_language_server_available", "gopls"),
+    ] {
+        let component = status
+            .components
+            .iter()
+            .find(|component| component.name == name)
+            .unwrap();
+        assert!(component.ready, "{name}: {:?}", component.detail);
+        assert!(
+            component
+                .detail
+                .as_deref()
+                .unwrap()
+                .starts_with(&format!("configured {provider} command")),
+            "{:?}",
+            component.detail
+        );
+    }
+    models_task.abort();
+}

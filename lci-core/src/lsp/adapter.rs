@@ -40,7 +40,10 @@ pub trait LspAdapter: Send + Sync {
     fn readiness_component_name(&self) -> &'static str;
 
     /// Probe availability without starting an LSP session. Called only when
-    /// enabled; adapters with an installation path override the version probe.
+    /// enabled. The default runs `<command> --version` and wants exit 0; an
+    /// adapter whose binary answers to something else overrides it with
+    /// [`probe_subprocess`] (gopls: `version`; pyright-langserver: a start
+    /// whose status is ignored) or with its own check (jdtls: the launcher jar).
     async fn probe_readiness(&self, timeout: Duration) -> Result<()> {
         if let Some(command) = self.configured_command() {
             probe_subprocess_version(Path::new(&command), timeout).await?;
@@ -684,8 +687,8 @@ pub async fn open_if_changed(
     }))
 }
 
-/// What identifies a binary for the process-wide probe memo. The invocation is
-/// always `--version`, so the arguments are not part of the key. The path is
+/// What identifies a binary for the process-wide probe memo. An adapter probes
+/// its binary one way, so the arguments are not part of the key. The path is
 /// the resolved string as given, not canonicalised: another spelling of the
 /// same file (case or a relative form on Windows) is probed again, and on a
 /// platform without lookup a bare name that matches an entry of the working
@@ -698,7 +701,7 @@ pub(crate) struct ProbeKey {
     len: u64,
 }
 
-/// The binaries whose `--version` has succeeded in this process.
+/// The binaries whose readiness probe has succeeded in this process.
 static PROBED: OnceLock<Mutex<HashSet<ProbeKey>>> = OnceLock::new();
 
 /// Answers `Ok` for a binary that has already passed a probe in this process,
@@ -731,8 +734,8 @@ tokio::task_local! {
     static FRESH: bool;
 }
 
-/// Runs `work` with every [`probe_subprocess_version`] inside it answering from
-/// a real `--version` run, never from the process-wide memo, and without
+/// Runs `work` with every [`probe_subprocess`] inside it answering from
+/// a real run of the binary, never from the process-wide memo, and without
 /// recording it. For a caller that reports the binary's state as it is now, as
 /// `/ready` does.
 pub async fn fresh_probes<F: std::future::Future>(work: F) -> F::Output {
@@ -761,17 +764,45 @@ pub(crate) async fn probe_through(
     }
 }
 
-/// Checks a configured executable with a bounded `--version` invocation. A
-/// binary that has passed it once in this process (same resolved path, same
-/// modification time and size) is not run again, whichever manager asks, so a
-/// test process or a service probes one binary once, not once per manager. A
-/// binary whose file cannot be read is probed every time, and so is every
-/// binary inside [`fresh_probes`].
+/// What a probe wants of the exit status of the binary it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeExit {
+    /// Exit status 0: the binary answered the probe arguments (`--version`,
+    /// gopls's `version`).
+    Zero,
+    /// Any status: the binary started and ended inside the timeout, which is
+    /// all pyright-langserver can show (it has no version flag; any argument
+    /// that is not a transport prints a connection error and exits 1).
+    Any,
+}
+
+/// Checks a configured executable with a bounded `--version` invocation that
+/// must exit 0: [`probe_subprocess`] with those arguments, the default
+/// readiness probe and the ripgrep probe.
 pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> Result<()> {
+    probe_subprocess(executable, &["--version"], ProbeExit::Zero, timeout).await
+}
+
+/// Checks a configured executable with a bounded run of `args`, judged by
+/// `exit`. A binary that has passed once in this process (same resolved path,
+/// same modification time and size) is not run again, whichever manager asks,
+/// so a test process or a service probes one binary once, not once per
+/// manager. A binary whose file cannot be read is probed every time, and so is
+/// every binary inside [`fresh_probes`]. A spawn that fails with `NotFound` is
+/// [`ProbeFailure::Missing`] and a run past `timeout` is
+/// [`ProbeFailure::TimedOut`] under either `exit`; neither opens a breaker
+/// window.
+pub async fn probe_subprocess(
+    executable: &Path,
+    args: &[&str],
+    exit: ProbeExit,
+    timeout: Duration,
+) -> Result<()> {
     let resolved = crate::lsp::transport::resolve_executable(&executable.to_string_lossy());
+    let shown = args.join(" ");
     let run = async {
         let mut command = tokio::process::Command::new(&resolved);
-        command.arg("--version");
+        command.args(args);
         // tokio's `output()` pipes only stdout and stderr, so without this the
         // child inherits our stdin: under the MCP stdio transport that is the
         // client's JSON-RPC stream (N107).
@@ -784,7 +815,7 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
             Err(_) => {
                 return Err(ProbeError::error(
                     ProbeFailure::TimedOut,
-                    format!("timed out running {} --version", executable.display()),
+                    format!("timed out running {} {shown}", executable.display()),
                 ));
             }
             Ok(Err(error)) => {
@@ -800,10 +831,10 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
             }
             Ok(Ok(output)) => output,
         };
-        if !output.status.success() {
+        if exit == ProbeExit::Zero && !output.status.success() {
             return Err(ProbeError::error(
                 ProbeFailure::Failed,
-                format!("subprocess {} --version failed", executable.display()),
+                format!("subprocess {} {shown} failed", executable.display()),
             ));
         }
         Ok(())
@@ -811,7 +842,7 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
     probe_through(&resolved, run).await
 }
 
-/// Why [`probe_subprocess_version`] failed, carried by its [`ProbeError`]
+/// Why [`probe_subprocess`] failed, carried by its [`ProbeError`]
 /// beside the readable text. `[run_profile.lsp] breaker`
 /// opens a window on [`Self::Failed`] only: a window opens on evidence of a
 /// dead server, never on absence or silence (see `Manager::probe_once`).
@@ -819,10 +850,10 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
 pub enum ProbeFailure {
     /// The executable was not found (the spawn failed with `NotFound`).
     Missing,
-    /// `--version` did not answer within the timeout.
+    /// The probe did not end within the timeout.
     TimedOut,
-    /// The binary was found but could not be started, or `--version` exited
-    /// non-zero.
+    /// The binary was found but could not be started, or (under
+    /// [`ProbeExit::Zero`]) exited non-zero.
     Failed,
 }
 
@@ -830,15 +861,15 @@ impl std::fmt::Display for ProbeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Missing => "the binary was not found",
-            Self::TimedOut => "the version probe timed out",
-            Self::Failed => "the version probe failed",
+            Self::TimedOut => "the readiness probe timed out",
+            Self::Failed => "the readiness probe failed",
         })
     }
 }
 
 impl std::error::Error for ProbeFailure {}
 
-/// The error [`probe_subprocess_version`] returns: its readable text (the
+/// The error [`probe_subprocess`] returns: its readable text (the
 /// text before the failure was typed, so notes read as they did) and the
 /// typed [`ProbeFailure`] beside it, which `Manager::probe_once` reads by
 /// downcasting. The failure's own text never joins the chain, so a note
@@ -1040,6 +1071,93 @@ mod tests {
         let shim = dir.path().join("shim.cmd");
         std::fs::write(&shim, body).unwrap();
         fresh_probes(probe_subprocess_version(&shim, timeout)).await
+    }
+
+    /// Like [`probe_cmd_shim`] with the arguments and the exit rule of the probe.
+    #[cfg(windows)]
+    async fn probe_cmd_shim_with(
+        body: &str,
+        args: &[&str],
+        exit: ProbeExit,
+        timeout: Duration,
+    ) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim.cmd");
+        std::fs::write(&shim, body).unwrap();
+        fresh_probes(probe_subprocess(&shim, args, exit, timeout)).await
+    }
+
+    /// A start probe passes whatever the binary's status says: pyright-langserver
+    /// exits 1 on `--version`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_shim_that_exits_non_zero_passes_a_start_probe() {
+        probe_cmd_shim_with(
+            "@exit /b 1\r\n",
+            &["--version"],
+            ProbeExit::Any,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `Any` relaxes the status only: a binary that is not there is still
+    /// `Missing` (which opens no breaker window).
+    #[tokio::test]
+    async fn a_missing_binary_is_missing_under_any_exit() {
+        let error = fresh_probes(probe_subprocess(
+            Path::new("definitely-missing-lsp-binary-k11b5"),
+            &["--version"],
+            ProbeExit::Any,
+            Duration::from_secs(1),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(failure_of(&error), Some(ProbeFailure::Missing), "{error:#}");
+    }
+
+    /// A start probe that never ends is `TimedOut`, not a pass: a `.cmd` shim
+    /// whose server hangs is not a server.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_start_probe_that_hangs_is_timed_out() {
+        let error = probe_cmd_shim_with(
+            "@ping -n 4 127.0.0.1 >nul\r\n",
+            &["--version"],
+            ProbeExit::Any,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            failure_of(&error),
+            Some(ProbeFailure::TimedOut),
+            "{error:#}"
+        );
+    }
+
+    /// The probe runs the arguments it is given, and names them in its note.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_probe_passes_its_arguments() {
+        let body = "@if \"%1\"==\"version\" (exit /b 0) else (exit /b 2)\r\n";
+        probe_cmd_shim_with(body, &["version"], ProbeExit::Zero, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let error = probe_cmd_shim_with(
+            body,
+            &["--version"],
+            ProbeExit::Zero,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure_of(&error), Some(ProbeFailure::Failed), "{error:#}");
+        assert!(
+            format!("{error:#}").ends_with("--version failed"),
+            "{error:#}"
+        );
     }
 
     /// A `.cmd` shim (how npm installs `pyright-langserver` and friends on

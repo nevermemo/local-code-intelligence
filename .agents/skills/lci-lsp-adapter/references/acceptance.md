@@ -28,3 +28,5 @@ Each language's three subcommands run against a real fixture and the real server
 - `c` and `cpp`: real standalone C/C++ fixtures and one shared `clangd` (`--clangd <path>`, for each).
 
 All of them skip gracefully when their server is not found. Prerequisites per tool: `docs/development/live-acceptance-ci.md` "Prerequisites".
+
+The `version_arg` of an acceptance spec (`None` for pyright-langserver, `Some("version")` for gopls) must agree with the adapter's readiness probe: both say what the binary answers to.

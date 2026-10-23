@@ -10,10 +10,13 @@
 //! writes one on the caller's behalf). Like pyright, gopls's background
 //! analysis is asynchronous enough that a freshly opened file benefits from
 //! an explicit `textDocument/didOpen` and a wait for the server's
-//! `publishDiagnostics` for it before a position request.
+//! `publishDiagnostics` for it before a position request. gopls has no
+//! `--version` flag (it exits 2); `gopls version` is its readiness probe.
 
 use crate::config::GoLspConfig;
-use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
+use crate::lsp::adapter::{
+    LspAdapter, MAX_DIAGNOSTICS_WAIT, ProbeExit, SentTexts, open_if_changed, probe_subprocess,
+};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -67,6 +70,15 @@ impl LspAdapter for GoServer {
 
     fn readiness_component_name(&self) -> &'static str {
         "go_language_server_available"
+    }
+
+    /// `gopls version`, which exits 0 (see the module doc: `gopls --version`
+    /// is a flag error and exits 2).
+    async fn probe_readiness(&self, timeout: Duration) -> Result<()> {
+        if let Some(command) = self.configured_command() {
+            probe_subprocess(Path::new(&command), &["version"], ProbeExit::Zero, timeout).await?;
+        }
+        Ok(())
     }
 
     fn transport_config(&self, root: &Path) -> Option<TransportConfig> {
@@ -166,6 +178,38 @@ mod tests {
             disabled,
         };
         GoServer::new(&config, Duration::from_secs(60))
+    }
+
+    /// The readiness probe runs `gopls version`: a shim that answers `version`
+    /// only passes, and one that answers `--version` only fails.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_go_probe_runs_gopls_version() {
+        use crate::lsp::adapter::fresh_probes;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = |name: &str, body: &str| {
+            let shim = dir.path().join(name);
+            std::fs::write(&shim, body).unwrap();
+            let path = shim.to_string_lossy().into_owned();
+            async move {
+                fresh_probes(
+                    server(Some(&path), &[], false).probe_readiness(Duration::from_secs(30)),
+                )
+                .await
+            }
+        };
+        probe(
+            "version-only.cmd",
+            "@if \"%1\"==\"version\" (exit /b 0) else (exit /b 2)\r\n",
+        )
+        .await
+        .unwrap();
+        probe(
+            "flag-only.cmd",
+            "@if \"%1\"==\"--version\" (exit /b 0) else (exit /b 2)\r\n",
+        )
+        .await
+        .unwrap_err();
     }
 
     #[test]
