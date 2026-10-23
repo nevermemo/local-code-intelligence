@@ -263,7 +263,8 @@ pub struct LspCostArgs {
     pub max_quiet_wait_minutes: u64,
     /// `[run_profile.lsp] places` of every arm. `scip` (this harness's default) writes
     /// `places = "scip"` (the key's own default is `auto`); `outline` lets `lsp.live` place symbols from the server's
-    /// outline, which a tree without a SCIP index needs to get any card.
+    /// outline, which a tree without a SCIP index needs to get any card. `auto` is the shipped default (per walk `scip` when the
+    /// index has nodes, else `outline`).
     #[arg(long, value_enum, default_value = "scip")]
     pub places: Places,
 }
@@ -273,6 +274,8 @@ pub struct LspCostArgs {
 pub enum Places {
     Scip,
     Outline,
+    /// The shipped default: per walk `scip` when the SCIP graph has nodes, else `outline`.
+    Auto,
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +422,8 @@ pub struct ConfigCtx {
     /// The measured adapter and its server (`--server`, else the default).
     pub adapter: Adapter,
     pub server: String,
-    /// `--places outline`: every arm writes `places = "outline"`.
-    pub places_outline: bool,
+    /// `--places`: the value every arm writes (`auto` is the key's own default).
+    pub places: Places,
     /// `--extra-maps`: the `explore` policy's `extra_maps` (empty: `lsp.live`).
     pub extra_maps: Vec<String>,
 }
@@ -477,12 +480,11 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
             text.push_str(&line);
             text.push('\n');
         }
-        // Written either way: the default is `auto`, which is not either arm
-        // on a tree with no SCIP index.
-        text.push_str(if ctx.places_outline {
-            "places = \"outline\"\n"
-        } else {
-            "places = \"scip\"\n"
+        // Written explicitly, `auto` included: the harness's default is `scip`.
+        text.push_str(match ctx.places {
+            Places::Auto => "places = \"auto\"\n",
+            Places::Outline => "places = \"outline\"\n",
+            Places::Scip => "places = \"scip\"\n",
         });
     }
     if arm.arbitration {
@@ -1338,7 +1340,7 @@ struct RunContext {
     rust_analyzer: String,
     adapter: Adapter,
     server: String,
-    places_outline: bool,
+    places: Places,
     extra_maps: Vec<String>,
     calls_file: std::fs::File,
 }
@@ -1370,7 +1372,7 @@ async fn run_arm(ctx: &mut RunContext, arm: &Arm, condition: &str) -> Result<Vec
                 deadline_ms: ctx.deadline_ms,
                 adapter: ctx.adapter,
                 server: ctx.server.clone(),
-                places_outline: ctx.places_outline,
+                places: ctx.places,
                 extra_maps: ctx.extra_maps.clone(),
             },
         ),
@@ -2222,6 +2224,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             match args.places {
                 Places::Scip => "scip (this harness's default; written explicitly)",
                 Places::Outline => "outline (`[run_profile.lsp] places`, every arm)",
+                Places::Auto => "auto (`[run_profile.lsp] places`, every arm; the shipped default, written explicitly)",
             }
             .to_owned(),
         ),
@@ -2261,7 +2264,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         rust_analyzer,
         adapter: args.adapter,
         server: server.clone(),
-        places_outline: args.places == Places::Outline,
+        places: args.places,
         extra_maps: args.extra_maps.clone(),
         calls_file,
     };
@@ -2478,7 +2481,7 @@ mod tests {
 
     #[test]
     fn every_arm_config_is_a_valid_service_config() {
-        for places_outline in [false, true] {
+        for places in [Places::Scip, Places::Outline, Places::Auto] {
             let ctx = ConfigCtx {
                 data_dir: std::env::temp_dir().join("lci-lsp-cost-test-data"),
                 scip_index: std::env::temp_dir().join("index.scip"),
@@ -2486,7 +2489,7 @@ mod tests {
                 deadline_ms: 20_000,
                 adapter: Adapter::Rust,
                 server: "rust-analyzer".into(),
-                places_outline,
+                places,
                 extra_maps: Vec::new(),
             };
             for arm in ARMS {
@@ -2511,10 +2514,10 @@ mod tests {
                 assert_eq!(config.run_profile.lsp.implementations, arm.implementations);
                 assert_eq!(
                     config.run_profile.lsp.places,
-                    if places_outline {
-                        lci_core::config::LspPlaces::Outline
-                    } else {
-                        lci_core::config::LspPlaces::Scip
+                    match places {
+                        Places::Auto => lci_core::config::LspPlaces::Auto,
+                        Places::Outline => lci_core::config::LspPlaces::Outline,
+                        Places::Scip => lci_core::config::LspPlaces::Scip,
                     },
                     "{}",
                     arm.name
@@ -2785,7 +2788,7 @@ mod tests {
             deadline_ms: 20_000,
             adapter,
             server: server.into(),
-            places_outline: false,
+            places: Places::Scip,
             extra_maps: Vec::new(),
         }
     }
