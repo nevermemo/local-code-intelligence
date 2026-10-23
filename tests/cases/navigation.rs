@@ -8160,7 +8160,7 @@ async fn the_default_profile_keeps_a_non_watching_server_and_restarts_it_after_a
 
 /// The sync doing real work under the default profile: a file created two
 /// levels below a directory the tree stamp lists (the stamp covers one level of
-/// child directories, README "Sessions") does not move the stamp, so the
+/// child directories, "Language-server sessions of `lsp.live`" in docs/reference/cli.md) does not move the stamp, so the
 /// barrier would keep the server on the old tree. The default `sync = "watch"`
 /// tells the running server, which lists the new declaration on the same
 /// session, with no restart. (The fake applies `didChangeWatchedFiles` by

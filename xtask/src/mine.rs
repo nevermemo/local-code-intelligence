@@ -7,7 +7,7 @@
 //! labels come from merged changes rather than annotators, so a repository
 //! yields hundreds of labelled queries at no annotation cost.
 //!
-//! Two approximations are deliberate and documented in the README:
+//! Two approximations are deliberate and documented in docs/reference/retrieval.md:
 //!
 //! - `expected_paths` keeps only touched files that still exist at `HEAD`,
 //!   because evaluation searches the checked-out tree, not the commit's

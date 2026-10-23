@@ -109,7 +109,7 @@ enum Command {
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
     /// files it touched that still exist at HEAD become its expected paths.
-    /// Reads git history only. See README "Retrieval evaluation".
+    /// Reads git history only. See "Retrieval evaluation" in docs/reference/retrieval.md.
     MineQueries {
         /// Root of the git repository to mine.
         #[arg(long)]
