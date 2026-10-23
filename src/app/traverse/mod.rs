@@ -838,6 +838,78 @@ struct Walked {
     warnings: Vec<String>,
 }
 
+/// Phase B: the start nodes and the registered maps.
+struct Seeded<'p> {
+    found: Seeds,
+    built: maps::Built<'p>,
+    arbitration: Option<Arbitration>,
+}
+
+/// Phase B: the start nodes, the maps of the call, the
+/// arbitration and confirm checks of a handle, and the trait seeds.
+async fn seeds<'p>(
+    p: &'p Prepared<'_>,
+    setup: &WalkSetup,
+    ledger: &mut Ledger,
+    walk_restarts: &'p [lci_core::lsp::Restart],
+    trait_seed_mode: TraitSeedMode,
+) -> Result<Seeded<'p>> {
+    let (call, profile, limits) = (p.call, p.profile, &*p.limits);
+
+    // The start nodes (not on a continuation, which resumes the old ones).
+    let mut found = Seeds::default();
+    if setup.snapshot.is_none() {
+        found = find_seeds(limits, call, &p.loaded, &p.selection.wanted).await?;
+        ledger.notes.append(&mut found.notes);
+        // The deadline is the walk's own: a slow hybrid search (a loaded
+        // embedder) must not spend it before the first pop. The search is
+        // bounded by the embedding and reranker timeouts instead, and the
+        // first stage's git calls below see the moved deadline.
+        ledger.budget.deadline += found.search_time;
+    }
+
+    let cx = maps::Context {
+        call,
+        profile,
+        loaded: &p.loaded,
+        observer: &p.observer,
+        selection: &p.selection,
+        found: &found,
+        walk_restarts,
+    };
+    let built = maps::build(&cx, &mut ledger.notes, &mut ledger.warnings).await?;
+    // `[run_profile.scip] arbitration`: the server's answer overrules the
+    // index maps this call built. A handle made under another arbitration (or
+    // none) is not the walk this call would continue.
+    let arbitration = maps::arbitration(&built, &p.selection, profile);
+    if let Some(snapshot) = &setup.snapshot {
+        snapshot
+            .check_arbitration(arbitration.as_ref().map(Arbitration::identity).as_deref())
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    // `[run_profile.walk] confirm`: the same for the confirm frontier, which
+    // a handle keeps with its `top_k` and the confirmer's identity.
+    let confirm_identity = built.confirmer.as_ref().map(|c| c.identity());
+    if let Some(snapshot) = &setup.snapshot {
+        snapshot
+            .check_confirm(confirm_identity.as_deref().map(|i| (call.top_k, i)))
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    // The trait and trait-method paths of the question join the start nodes
+    // (K39a: this ran inside the `scip.implements` registration).
+    if setup.snapshot.is_none()
+        && let Some(map) = &built.implements
+        && let Some(note) = add_trait_seeds(&mut found, map, call.question, trait_seed_mode)
+    {
+        ledger.notes.push(note);
+    }
+    Ok(Seeded {
+        found,
+        built,
+        arbitration,
+    })
+}
+
 /// Runs one traversal call. Errors are the caller's mistakes (a bad rule, an
 /// unknown handle, a missing index) or the data directory not being writable
 /// for a handle; a failed trace write is a note, not an error.
@@ -882,53 +954,7 @@ pub async fn run_with_trait_seeds(
         ledger.budget.deadline += barrier_started.elapsed();
     }
 
-    // The start nodes (not on a continuation, which resumes the old ones).
-    let mut found = Seeds::default();
-    if setup.snapshot.is_none() {
-        found = find_seeds(limits, call, &p.loaded, &p.selection.wanted).await?;
-        ledger.notes.append(&mut found.notes);
-        // The deadline is the walk's own: a slow hybrid search (a loaded
-        // embedder) must not spend it before the first pop. The search is
-        // bounded by the embedding and reranker timeouts instead, and the
-        // first stage's git calls below see the moved deadline.
-        ledger.budget.deadline += found.search_time;
-    }
-
-    let cx = maps::Context {
-        call,
-        profile,
-        loaded: &p.loaded,
-        observer: &p.observer,
-        selection: &p.selection,
-        found: &found,
-        walk_restarts: &walk_restarts,
-    };
-    let mut built = maps::build(&cx, &mut ledger.notes, &mut ledger.warnings).await?;
-    // `[run_profile.scip] arbitration`: the server's answer overrules the
-    // index maps this call built. A handle made under another arbitration (or
-    // none) is not the walk this call would continue.
-    let arbitration = maps::arbitration(&built, &p.selection, profile);
-    if let Some(snapshot) = &setup.snapshot {
-        snapshot
-            .check_arbitration(arbitration.as_ref().map(Arbitration::identity).as_deref())
-            .map_err(|e| anyhow!("{e}"))?;
-    }
-    // `[run_profile.walk] confirm`: the same for the confirm frontier, which
-    // a handle keeps with its `top_k` and the confirmer's identity.
-    let confirm_identity = built.confirmer.as_ref().map(|c| c.identity());
-    if let Some(snapshot) = &setup.snapshot {
-        snapshot
-            .check_confirm(confirm_identity.as_deref().map(|i| (call.top_k, i)))
-            .map_err(|e| anyhow!("{e}"))?;
-    }
-    // The trait and trait-method paths of the question join the start nodes
-    // (K39a: this ran inside the `scip.implements` registration).
-    if setup.snapshot.is_none()
-        && let Some(map) = &built.implements
-        && let Some(note) = add_trait_seeds(&mut found, map, call.question, trait_seed_mode)
-    {
-        ledger.notes.push(note);
-    }
+    let mut seeded = seeds(&p, &setup, &mut ledger, &walk_restarts, trait_seed_mode).await?;
     let exact_wanted = p.selection.wants(EXACT_CLOSURE_ID) || p.selection.wants(EXACT_PICKAXE_ID);
     let mut stage = FirstStage::off();
     let mut exact_report: Vec<Value> = Vec::new();
@@ -1000,22 +1026,24 @@ pub async fn run_with_trait_seeds(
             stage.first_k = limits.first_k as usize;
             stage.cards = exact.iter().map(|card| card.card.clone()).collect();
             if limits.answer_seeds {
-                stage.cards.extend(seed_cards(&found.nodes, &found.details));
+                stage
+                    .cards
+                    .extend(seed_cards(&seeded.found.nodes, &seeded.found.details));
             }
         }
         if limits.exact_seeds {
             // After the others, and only nodes the graph holds.
-            let aligned = found.details.len() == found.nodes.len();
+            let aligned = seeded.found.details.len() == seeded.found.nodes.len();
             for card in exact.iter().filter(|card| card.in_graph) {
-                if found.nodes.iter().any(|seed| seed.node == card.node) {
+                if seeded.found.nodes.iter().any(|seed| seed.node == card.node) {
                     continue;
                 }
-                found.nodes.push(Seed {
+                seeded.found.nodes.push(Seed {
                     node: card.node.clone(),
                     map: Some(card.op),
                 });
                 if aligned {
-                    found.details.push(json!({
+                    seeded.found.details.push(json!({
                         "node": card.node.to_string(),
                         "kind": "symbol",
                         "how": "exact",
@@ -1025,23 +1053,26 @@ pub async fn run_with_trait_seeds(
                     }));
                 }
             }
-            if matches!(found.source, "" | "none") && !found.nodes.is_empty() {
-                found.source = "exact";
+            if matches!(seeded.found.source, "" | "none") && !seeded.found.nodes.is_empty() {
+                seeded.found.source = "exact";
             }
         }
     }
     // Setup does not run the walk's deadline, but the first stage's git calls
     // do: they were bounded by the deadline and count against it.
-    ledger.budget.deadline += built.setup.elapsed().saturating_sub(stage_time) + built.early;
+    ledger.budget.deadline +=
+        seeded.built.setup.elapsed().saturating_sub(stage_time) + seeded.built.early;
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = setup.handler.as_ref().map(|(_, _, plan)| plan.clone());
     // A continuation runs the weights and switches its handle replays.
     let running_maps = match &setup.snapshot {
-        Some(snapshot) => {
-            presets::restored(&built.plan_maps, &snapshot.weights, &snapshot.switches)
-        }
-        None => built.plan_maps.clone(),
+        Some(snapshot) => presets::restored(
+            &seeded.built.plan_maps,
+            &snapshot.weights,
+            &snapshot.switches,
+        ),
+        None => seeded.built.plan_maps.clone(),
     };
     // The maps this call runs, in registration order, for `maps`.
     let enabled_maps: Vec<String> = running_maps
@@ -1057,7 +1088,7 @@ pub async fn run_with_trait_seeds(
     );
     // The most a state can be corroborated by, which the score bound needs
     // (the seed maps only start the walk; maps over one graph count once).
-    let expanding = built.registry.independent_expanders();
+    let expanding = seeded.built.registry.independent_expanders();
     // A handle made without `card_paths` has no edge kind for the hops of its
     // earlier calls; their path entries say `null`.
     if profile.traverse.card_paths && setup.snapshot.as_ref().is_some_and(|s| !s.card_paths) {
@@ -1080,19 +1111,19 @@ pub async fn run_with_trait_seeds(
                 .collect()
         })
         .unwrap_or_default();
-    let source = OnTheFly::new(&built.registry, &view);
-    let source = match &arbitration {
+    let source = OnTheFly::new(&seeded.built.registry, &view);
+    let source = match &seeded.arbitration {
         Some(a) => source.with_arbitration(a.clone()),
         None => source,
     };
     let traversal = match setup.snapshot {
         Some(snapshot) => Traversal::resumed(source, snapshot, ledger.budget),
         None => {
-            if found.nodes.is_empty() {
-                let mut response = no_seeds_response(call, &found, ledger.notes);
+            if seeded.found.nodes.is_empty() {
+                let mut response = no_seeds_response(call, &seeded.found, ledger.notes);
                 add_first_stage_only(&mut response, &stage, call.top_k, &exact_report);
                 add_policy(&mut response, effective, ledger.warnings);
-                add_trait_seed_count(&mut response, &found);
+                add_trait_seed_count(&mut response, &seeded.found);
                 p.observer.settle(call.seed_search).await;
                 add_maps(
                     &mut response,
@@ -1105,7 +1136,7 @@ pub async fn run_with_trait_seeds(
                     add_answer_labels(
                         &mut response,
                         None,
-                        &built.unavailable,
+                        &seeded.built.unavailable,
                         &[],
                         &HashSet::new(),
                     );
@@ -1116,13 +1147,13 @@ pub async fn run_with_trait_seeds(
                 });
             }
             let plan = StartPlan {
-                maps: std::mem::take(&mut built.plan_maps),
+                maps: std::mem::take(&mut seeded.built.plan_maps),
                 policy: policy.unwrap_or_default(),
                 effective: Some(plan_effective),
-                seed_source: Some(found.source.to_owned()),
-                seed_hits: found.details.clone(),
+                seed_source: Some(seeded.found.source.to_owned()),
+                seed_hits: seeded.found.details.clone(),
             };
-            Traversal::new(source, found.nodes.clone(), ledger.budget)
+            Traversal::new(source, seeded.found.nodes.clone(), ledger.budget)
                 .question(call.question)
                 .plan(plan)
         }
@@ -1147,17 +1178,17 @@ pub async fn run_with_trait_seeds(
             pricing: profile.walk.pricing.into(),
             ..HopPrice::default()
         })
-        .trait_seeds(found.trait_nodes())
-        .expanders(built.registry.expanding_maps());
+        .trait_seeds(seeded.found.trait_nodes())
+        .expanders(seeded.built.registry.expanding_maps());
     let traversal = match &p.rescorer {
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
         None => traversal,
     };
-    let traversal = match &arbitration {
+    let traversal = match &seeded.arbitration {
         Some(a) => traversal.arbitration(a.clone()),
         None => traversal,
     };
-    let traversal = match &built.confirmer {
+    let traversal = match &seeded.built.confirmer {
         Some(c) => traversal.confirm_frontier(Arc::clone(c), call.top_k),
         None => traversal,
     };
@@ -1185,30 +1216,24 @@ pub async fn run_with_trait_seeds(
         notes: ledger.notes,
         warnings: ledger.warnings,
     };
-    finish(
-        &p,
-        &built,
-        &found,
-        &arbitration,
-        &stage,
-        &exact_report,
-        walked,
-    )
-    .await
+    finish(&p, &seeded, &stage, &exact_report, walked).await
 }
 
 /// Phase E: keeps the handle, writes the trace, adds the notes of what the
 /// maps did and builds the response.
 async fn finish(
     p: &Prepared<'_>,
-    built: &maps::Built<'_>,
-    found: &Seeds,
-    arbitration: &Option<Arbitration>,
+    seeded: &Seeded<'_>,
     stage: &FirstStage,
     exact_report: &[Value],
     walked: Walked,
 ) -> Result<Report> {
     let (call, profile, dirs, limits) = (p.call, p.profile, p.dirs, &*p.limits);
+    let Seeded {
+        found,
+        built,
+        arbitration,
+    } = seeded;
     let Walked {
         result,
         effective,
