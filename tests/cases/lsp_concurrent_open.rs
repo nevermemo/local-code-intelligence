@@ -330,15 +330,16 @@ async fn a_dropped_open_leaves_its_diagnostics_wait_to_the_next_caller() {
 }
 
 /// A server that publishes empty diagnostics when it closes a document
-/// (pyright, clangd; the fake with `--close-diagnostics-delay-ms`, the
+/// (pyright, clangd; the fake with `--close-diagnostics-on-reopen`, the
 /// publication carries no version) must not end the diagnostics wait of the
-/// open that follows the close. The 65th file closes the first; once the
-/// first file's own first publication is in (1000 ms), it is asked for again,
-/// while the close's publication (1500 ms after the close) is still on its
-/// way and the re-open's own (1000 ms after the re-open) comes after it. The
-/// wait must end on the latter: three publications counted for the file (open,
-/// close, re-open), not two. Fails when the re-open's wait accepts a
-/// publication that carries no version.
+/// open that follows the close. The 65th file closes the first; the fake holds
+/// the close's publication until the first file's `didOpen` comes again, then
+/// sends it at once and the re-open's own 1000 ms later. The order is made by
+/// the fake's events, not by timing, so it holds under any load: the close's
+/// publication is not in before the re-open is written, and the re-open's own
+/// comes after it. The wait must end on the latter: three publications counted
+/// for the file (open, close, re-open), not two. Fails when the re-open's wait
+/// accepts a publication that carries no version.
 #[tokio::test]
 async fn a_close_publication_does_not_end_a_reopens_diagnostics_wait() {
     tokio::time::timeout(LOADED_BUDGET, async {
@@ -348,8 +349,7 @@ async fn a_close_publication_does_not_end_a_reopens_diagnostics_wait() {
             &[
                 "--diagnostics-delay-ms",
                 "1000",
-                "--close-diagnostics-delay-ms",
-                "1500",
+                "--close-diagnostics-on-reopen",
             ],
         )
         .await;
@@ -388,7 +388,8 @@ async fn a_close_publication_does_not_end_a_reopens_diagnostics_wait() {
             let opened = open(number).await;
             assert!(opened.is_some(), "F{number:03} is sent");
         }
-        // The first file's first publication is in, the close's is not.
+        // The first file's first publication is in; the close's is held by
+        // the fake until the re-open below.
         assert!(
             client
                 .wait_diagnostics(&first_uri, 0, 1, LOADED_BUDGET)
