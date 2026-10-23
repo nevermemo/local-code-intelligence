@@ -1,6 +1,7 @@
 //! The map registry of a traversal: the map ids and the lists of the maps a
 //! call can use, and the helpers the map registration shares (K39a; History:
-//! the registry of `run_with_trait_seeds` in `mod.rs`).
+//! the registry of `run_with_trait_seeds` in `mod.rs`, which is now the
+//! phases `prepare`, `seeds`, `run_first_stage`, `walk` and `finish`; K39b).
 
 use super::{
     Call,
@@ -668,8 +669,9 @@ pub(super) async fn build<'a>(
                 lsp_live_workspace = workspace.id.clone();
                 // The version probe is bounded like the readiness probes. It
                 // runs inside the setup window that `budget.deadline +=
-                // setup.elapsed()` below credits back to the walk deadline, so
-                // a slow probe costs the walk no budget.
+                // setup.elapsed()` in `run_with_trait_seeds` (mod.rs) credits
+                // back to the walk deadline, so a slow probe costs the walk no
+                // budget.
                 let probe =
                     std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
                 let probe_started = Instant::now();
