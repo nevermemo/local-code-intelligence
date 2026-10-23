@@ -187,6 +187,8 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   and sends each batch to the workspace's sessions as `workspace/didChangeWatchedFiles`; `Manager::client` drains
   before every request. The sync starts with the workspace's first session and stops with its last (`release`,
   `shutdown_all`, the idle sweeper). Lock order: drain lock, then the session registry, then `syncs`.
+  `Status.sync` (N118) reports `Manager::sync_status` for the workspace (backend, `failed` when neither watcher started,
+  the counters) only while a sync runs, so a failed or silent watcher is visible; it is a report and changes no answer.
 - **Model clients** (`lci-core` `models`): `embed` POSTs to `<embedding_url>/embeddings` and validates count, index,
   finiteness, non-zero vectors and one dimension; indexing retries up to 3 attempts (`MAX_ATTEMPTS`) with doubling
   backoff, `query` makes one attempt. Any refused connection trips a breaker for 30 s (`EMBEDDER_DOWN_WINDOW`): `query` and `embed_once` then skip at once

@@ -3406,6 +3406,115 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
     models_task.abort();
 }
 
+/// `Status.sync` (N118): under `[run_profile.lsp] sync = "watch"` the status
+/// of a workspace with a session carries the sync's backend, `failed` flag and
+/// counters, and an edit to a source file moves them; it is absent before the
+/// session and after the release. With `sync = "off"` the status has no `sync`
+/// key at all, so the wire form is what it was before. Unit coverage of
+/// `failed` (both watchers refusing a root) is in `lsp::sync`: a live manager
+/// has no hook to make its watcher fail.
+#[tokio::test]
+async fn status_reports_the_sync_of_a_workspace_with_a_session_only() {
+    use local_code_intelligence::config::LspSync;
+    for (sync, expect_report) in [(LspSync::Watch, true), (LspSync::Off, false)] {
+        let (temp, mut config, _fake, models_task) = fixture().await;
+        config.run_profile.lsp.sync = sync;
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("workspace");
+        write_csharp_workspace(&workspace);
+        let app = App::open(with_fake_csharp_server(
+            config,
+            &state,
+            &[],
+            LOADED_BUDGET_SECONDS,
+        ))
+        .await
+        .unwrap();
+        app.index(&workspace).await.unwrap();
+
+        let before = app.status(&workspace).await.unwrap();
+        assert!(before.sync.is_none(), "no session yet: {before:?}");
+        assert!(serde_json::to_value(&before).unwrap()["sync"].is_null());
+
+        app.symbols(&workspace, "Calculator").await.unwrap();
+        let during = app.status(&workspace).await.unwrap();
+        let wire = serde_json::to_value(&during).unwrap();
+        if !expect_report {
+            assert!(during.sync.is_none(), "{wire}");
+            assert!(
+                !wire.as_object().unwrap().contains_key("sync"),
+                "sync off adds no key: {wire}"
+            );
+            models_task.abort();
+            continue;
+        }
+
+        // The first walk (and with it the backend) is reported once the sync
+        // task has run.
+        wait_until(
+            "the sync's first walk",
+            Duration::from_secs(30),
+            async || {
+                app.status(&workspace)
+                    .await
+                    .unwrap()
+                    .sync
+                    .is_some_and(|sync| sync.walks >= 1)
+            },
+        )
+        .await;
+        let started = app.status(&workspace).await.unwrap().sync.unwrap();
+        assert!(!started.failed, "{started:?}");
+        assert!(started.backend.is_some(), "{started:?}");
+        assert_eq!(started.rescans, 0, "{started:?}");
+        let wire = serde_json::to_value(app.status(&workspace).await.unwrap()).unwrap();
+        assert_eq!(wire["sync"]["failed"], false, "{wire}");
+        assert!(
+            matches!(wire["sync"]["backend"].as_str(), Some("notify" | "poll")),
+            "{wire}"
+        );
+        for key in ["events", "batches", "forwarded", "walks", "rescans"] {
+            assert!(wire["sync"][key].is_u64(), "{key}: {wire}");
+        }
+
+        // An edit to a source file moves the counters.
+        let events = started.events;
+        std::fs::write(
+            workspace.join("src/Calculator.cs"),
+            "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; public int Mul(int a, int b) => a * b; }\n",
+        )
+        .unwrap();
+        wait_until(
+            "the sync to report the edit",
+            Duration::from_secs(30),
+            async || {
+                app.status(&workspace)
+                    .await
+                    .unwrap()
+                    .sync
+                    .is_some_and(|sync| sync.events > events && sync.forwarded >= 1)
+            },
+        )
+        .await;
+
+        // Per workspace, and gone with the session.
+        let other = temp.path().join("other-workspace");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(app.status(&other).await.unwrap().sync.is_none());
+        app.release_language_servers(&workspace).await.unwrap();
+        let after = app.status(&workspace).await.unwrap();
+        assert!(after.sync.is_none(), "{after:?}");
+        assert!(
+            !serde_json::to_value(&after)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("sync")
+        );
+        models_task.abort();
+    }
+}
+
 /// A workspace that mixes C# and TypeScript, so `App::symbols` asks both
 /// csharp-ls and typescript-language-server, each replaced by the fake server
 /// in the given mode (see `fake_lsp.rs`). Each fake records what it saw under

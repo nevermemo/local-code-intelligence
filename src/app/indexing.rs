@@ -161,6 +161,17 @@ pub struct Status {
     /// `primed`, and counters and ages in milliseconds. A report only: it
     /// does not keep a session alive and changes no answer.
     pub analyzers: BTreeMap<String, Option<crate::lsp::ServerReadiness>>,
+    /// The language servers' view of the tree kept current for this workspace
+    /// (`[run_profile.lsp] sync = "watch"`, the default), present only while
+    /// its sync runs, so absent with `sync = "off"` or without a session. The
+    /// watcher in use (`backend`: `notify`, `poll` after the platform watcher
+    /// failed to start, `null` while it is still opening), `failed` when
+    /// neither watcher could start (the servers are told nothing), and the
+    /// counters `events`, `batches`, `forwarded`, `walks` and `rescans`. A
+    /// watcher that stops silently (roadmap N102) shows as `events` that stop
+    /// growing after edits. A report only: it changes no answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<crate::lsp::sync::SyncStatus>,
     /// One entry per registered language server, sorted by provider: what it
     /// can serve, which of those languages this index holds, whether it is
     /// configured and enabled, whether its binary has answered a version
@@ -847,6 +858,7 @@ impl App {
         servers.sort_by(|a, b| a.provider.cmp(&b.provider));
         let languages_without_server =
             languages_without_server(self.analyzer.adapters(), &in_index);
+        let sync = self.analyzer.sync_status(&workspace.id);
         // The deprecated per-server booleans read the same map, so they can
         // never disagree with it.
         let running = |provider: &str| analyzers_running.get(provider).copied().unwrap_or(false);
@@ -882,6 +894,7 @@ impl App {
             clangd_analyzer_running,
             analyzers_running,
             analyzers,
+            sync,
             servers,
             languages_without_server,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
