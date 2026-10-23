@@ -287,7 +287,8 @@ pub struct Call<'a> {
     /// sessions = "shared"` (the default): the MCP and REST server's own, one
     /// per process for `lci traverse`. Used only under `shared`, and only for
     /// a server that sees an edit on its own (`LspAdapter::watches_workspace`)
-    /// or when `sync = "watch"`, and lists its tree stamp's configuration files
+    /// or when `sync = "watch"` (the default), and lists its tree stamp's
+    /// configuration files
     /// (`LspAdapter::keeps_session`); every other server starts on the call's own
     /// manager, as under `per_call`. `None` there (a caller with no manager of
     /// its own, the recipes) starts all the call's servers as under `per_call`.

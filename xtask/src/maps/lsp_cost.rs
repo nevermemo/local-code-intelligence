@@ -378,7 +378,10 @@ pub fn select_arms(names: &[String]) -> Result<Vec<Arm>> {
 
 /// The `[run_profile.lsp]` leaf lines of an arm: `sessions` always (the
 /// default is `shared`, so `base` and `per_call+sync` must say `per_call` to
-/// measure it), then exactly the other keys it turns on.
+/// measure it), then exactly the other keys it turns on, then `sync` always
+/// (the default is `watch` since K11b-4, so an arm without the sync must say
+/// `off` to keep meaning the old stock: `shared` is the pre-K11b-4 default and
+/// `shared+sync` is the stock now).
 pub fn arm_overlay_lines(arm: &Arm) -> Vec<String> {
     let mut lines = vec![format!(
         "sessions = \"{}\"",
@@ -390,9 +393,10 @@ pub fn arm_overlay_lines(arm: &Arm) -> Vec<String> {
     if arm.implementations {
         lines.push("implementations = true".to_owned());
     }
-    if arm.sync_watch {
-        lines.push("sync = \"watch\"".to_owned());
-    }
+    lines.push(format!(
+        "sync = \"{}\"",
+        if arm.sync_watch { "watch" } else { "off" }
+    ));
     lines
 }
 
@@ -2408,15 +2412,23 @@ mod tests {
     #[test]
     fn arm_overlay_lines_are_exactly_the_keys_an_arm_turns_on() {
         let lines = |name: &str| arm_overlay_lines(ARMS.iter().find(|a| a.name == name).unwrap());
-        assert_eq!(lines("base"), ["sessions = \"per_call\""]);
-        assert_eq!(lines("shared"), ["sessions = \"shared\""]);
+        assert_eq!(lines("base"), ["sessions = \"per_call\"", "sync = \"off\""]);
+        assert_eq!(lines("shared"), ["sessions = \"shared\"", "sync = \"off\""]);
         assert_eq!(
             lines("shared+cache"),
-            ["sessions = \"shared\"", "outline_cache = true"]
+            [
+                "sessions = \"shared\"",
+                "outline_cache = true",
+                "sync = \"off\""
+            ]
         );
         assert_eq!(
             lines("shared+impl"),
-            ["sessions = \"shared\"", "implementations = true"]
+            [
+                "sessions = \"shared\"",
+                "implementations = true",
+                "sync = \"off\""
+            ]
         );
         assert_eq!(
             lines("shared+sync"),
@@ -2754,7 +2766,8 @@ mod tests {
     #[test]
     fn arm_config_is_unchanged_for_rust() {
         // The text of the `base` arm as written before `--adapter` existed,
-        // plus the explicit `places = "scip"` since `auto` became the default.
+        // plus the explicit `places = "scip"` since `auto` became the default
+        // and the explicit `sync = "off"` since `watch` became the default.
         let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
         let expected = format!(
             "data_dir = '{}'\n{}",
@@ -2768,7 +2781,7 @@ mod tests {
                 "\n[index]\nfreshness = \"manual\"\n",
                 "\n[traverse]\nenabled = true\nscip_index = '@SCIP@'\ndeadline_ms = 20000\n",
                 "\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n",
-                "\n[run_profile.lsp]\nsessions = \"per_call\"\nplaces = \"scip\"\n",
+                "\n[run_profile.lsp]\nsessions = \"per_call\"\nsync = \"off\"\nplaces = \"scip\"\n",
             )
         )
         .replace("@SCIP@", &toml_path(&ctx.scip_index));
