@@ -126,8 +126,10 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   server dies with the map; under `"shared"` (default) it uses `Call.lsp_sessions` as `shared` and a per-call manager as `own`, so a server that lists no configuration files for the tree stamp (jdtls, marksman), or that neither sees an edit on its own nor is told by the sync (`sync = "off"`; the default is `"watch"`), starts per call, and a reused server is never staler than `per_call` for any change inside the tree stamp's coverage (its residuals are in the README; the walk labels a reused server's answer with a `kept session` note); `Call.lsp_sessions` is the `Arc<Manager>` that `App::language_servers()`
   hands out (the service's own, so a server started by navigation, search or a kept traverse server serves the others; the CLI
   `traverse` builds one per process and shuts it down after the walk), and a kept server's lifetime is the manager's (idle
-  sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful version probe per provider for
-  the manager's life. Under `[run_profile.lsp] breaker = true` (the default) a manager also holds `lsp::LspBreakers`, one 30 s
+  sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful readiness probe per provider for
+  the manager's life (the probe is per adapter, `adapter::probe_subprocess`: `<server> --version` that exits 0 by default, `gopls version`,
+  and for pyright a start whose exit status is ignored, since `pyright-langserver` has no version flag and exits 1; so a dead pyright
+  shows first at the session start, not at the probe). Under `[run_profile.lsp] breaker = true` (the default) a manager also holds `lsp::LspBreakers`, one 30 s
   window per provider (`LSP_DOWN_WINDOW`, the `ConnectBreaker` of the model clients): a failed probe in `probe_once`
   (`adapter::ProbeFailure::Failed`, or an adapter's own readiness error; a missing binary or a probe that timed out opens
   no window, since it is no evidence of a dead server: the miss costs under a millisecond and its note is the same on every

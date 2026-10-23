@@ -16,6 +16,8 @@ Where things live: one adapter module per server under `lci-core/src/lsp/` (`rus
 5. Recover from a failed request without leaving a poisoned client.
 6. Read [the acceptance contract](references/acceptance.md) before claiming support.
 
+Readiness probe: the default `probe_readiness` runs `<command> --version` and wants exit 0. A new adapter states what its binary answers to by hand first (print the exit code) and overrides `probe_readiness` with `adapter::probe_subprocess` when `--version` is not it (gopls: `version`; pyright-langserver: a start whose exit status is ignored, `ProbeExit::Any`); the acceptance spec's `version_arg` must agree with it (`references/acceptance.md`).
+
 Fast loop: `cargo test -p lci-core --lib lsp::` for adapter logic, `cargo xtask test --suite Lsp` for the fake-server navigation cases, `cargo xtask test --suite Full` once per completed slice. Real-server evidence: `cargo xtask acceptance <lang>-lsp` / `<lang>-missing` / `<lang>-recovery`; each prints `PREREQUISITE_UNAVAILABLE` and skips when its executable is absent, which is a limitation to report, not a pass.
 
 Do not infer LSP support from Tree-sitter parsing, and do not put editor-specific protocol assumptions in the service.
