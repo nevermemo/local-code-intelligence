@@ -9,14 +9,14 @@ Roadmap item: <id or title>
 Goal: <one sentence; the observable behavior that changes>
 Not in scope: <what this slice deliberately leaves alone>
 Allowed files: <explicit list; tests included>
-Contracts to read first: <AGENTS.md sections, skill references, README section>
+Contracts to read first: <AGENTS.md sections, skill references, README section or docs/reference guide>
 Acceptance:
   - <behavior 1, how it is observed>
   - <behavior 2>
 Tests to add or change: <file and case names>
 Gate: cargo xtask test --suite <focused>; then --suite Full
 Live evaluation: <none | evaluation-workflow.md steps 3-9, rerank on/off, workspaces>
-Docs to update: <README section, config.example.toml, skill reference, none>
+Docs to update: <README section, docs/reference guide, config.example.toml, skill reference, none>
 Revert condition: <what result means the slice is reverted, not fixed>
 ```
 
@@ -48,7 +48,7 @@ a one-line reason. Check in this order:
      freshness semantics, no client-specific code, no new service.
   3. Tests: honest (no weakened assertions, no #[ignore], no vacuous
      suite filters), cover the changed behavior and its failure path.
-  4. Doc drift: README tables and prose, config.example.toml, skill
+  4. Doc drift: README tables and prose, docs/reference guides, config.example.toml, skill
      references, MCP tool descriptions, evaluations/core.toml comments.
   5. Scope: files outside the allowed list, unrelated refactors.
 Say explicitly if you found nothing in a category. Do not edit files.
@@ -86,7 +86,7 @@ The diff is the deliverable; keep prose short.
 
 ```text
 Reviewer: slice <ID>. Read <plans_dir>/<plan file>, then `git diff <base>..<head>` and <evidence paths>. Do not edit.
-Check in order: correctness against the acceptance; AGENTS.md "Hard rules"; test honesty; doc drift (README, config.example.toml, skill references, decision line in `docs/decisions.md` if a default moved); scope.
+Check in order: correctness against the acceptance; AGENTS.md "Hard rules"; test honesty; doc drift (README, docs/reference guides, config.example.toml, skill references, decision line in `docs/decisions.md` if a default moved); scope.
 Report file:line, severity (blocker | should-fix | nit), one line each; say "none" for an empty category.
 lci MCP: <connected | not connected; use Grep/Read>.
 Do not run live evaluations or start services.

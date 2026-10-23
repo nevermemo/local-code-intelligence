@@ -9,7 +9,7 @@ Choose rows affected by the change; a release candidate should cover the full ma
 | Persistence | temporary LanceDB, manifest compatibility, restart reuse, failed-update preservation (`--suite Indexing`, `--suite Watching`) | external data directory survives process restart |
 | Retrieval | mock semantic/lexical/LSP/fusion/reranker and filter coverage (`--suite Filter`, `--suite Evaluation`) | `evaluate ./evaluations/core.toml` against 8766/8767 with auditable source results |
 | Languages | parser/chunk/update/delete/restart tests per adapter (`--suite Chunk`, `--suite Indexing`) | `cargo xtask acceptance multilingual`; production-versus-decoy query per added language |
-| LSP | protocol/lifecycle/location tests (`--suite Lsp`) | `cargo xtask acceptance <lang>-lsp` / `-missing` / `-recovery` per language |
+| LSP | protocol/lifecycle/location tests (`--suite Lsp`) | `cargo xtask acceptance <lang>-lsp` / `-missing` / `-recovery` per language (markdown: no `-recovery`) |
 | Windows tools | resolver unit/integration tests | resolved `rg.exe`, optional language-server executables |
 | Packaging | staged-file and artifact scan | clean extraction and smoke test when distributing |
 

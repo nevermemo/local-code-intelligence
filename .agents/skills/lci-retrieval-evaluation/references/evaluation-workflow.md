@@ -32,7 +32,7 @@ Scope: the embedder-plus-reranker sets (`evaluations/core.toml`, the mined sets)
 
 ## Replaying a dump instead of running live
 
-For a live service rather than an evaluation run, `LCI_CANDIDATE_DUMP=<file>` (README) appends the same pool per search to a JSON Lines file.
+For a live service rather than an evaluation run, `LCI_CANDIDATE_DUMP=<file>` ([retrieval reference](../../../../docs/reference/retrieval.md), "Offline scoring") appends the same pool per search to a JSON Lines file.
 
 `evaluate --dump-candidates` records every query's whole fused candidate pool, the dumped configuration (`arm`), and the reranker's scores; `<bin> replay dump.json --output <file> [options]` then scores other settings from that file in seconds, offline (no services, config, or index), through the unchanged metrics. Its output is an evaluate-shaped report, so `<bin> compare dump.json <file>` pairs it with real reports and with other replays. Run one dump live; replay the grid.
 

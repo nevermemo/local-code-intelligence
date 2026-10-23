@@ -1,7 +1,6 @@
 # Agent payload and tool-text notes
 
-Status: dated record of the U1 study; the figures are not re-measured. N28 to N31 landed in `0aa374c` on 2026-10-14
-(`spike/v2`); N32 to N34 are open in [roadmap.md](roadmap.md). The per-tool figures below cover the 10 tools the
+Status: dated record of the U1 study; the figures are not re-measured. N28 to N31 landed in `0aa374c` on 2026-10-14; N32 to N34 are open in [roadmap.md](roadmap.md). The per-tool figures below cover the 10 tools the
 study measured; a server with `[recipes]` and `[compose]` enabled lists 16 (see [architecture.md](../architecture.md#mcp-rest-and-cli-surfaces)).
 
 Background for roadmap items N28 to N34: how large the MCP tool list and the `search_code` result are for an agent, what was

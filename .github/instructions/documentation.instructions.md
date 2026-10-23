@@ -1,7 +1,7 @@
 ---
 name: LCI documentation
-description: Accuracy rules for README, evaluation definitions, configuration examples, and MCP descriptions.
-applyTo: "{README.md,config.example.toml,evaluations/**/*,src/server.rs}"
+description: Accuracy rules for README, the docs/reference guides, evaluation definitions, configuration examples, and MCP descriptions.
+applyTo: "{README.md,docs/reference/*.md,config.example.toml,evaluations/**/*,src/server.rs}"
 ---
 
 - Describe current behavior and independently verified evidence. Label unavailable live prerequisites and fail-open fallbacks precisely.

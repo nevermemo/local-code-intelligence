@@ -7,7 +7,8 @@ Agents read these files without chat context and pay for every token, so the fil
 2. One place per fact. A fact has one home; every other file points to that home instead of restating it.
    Homes: setup, configuration and server behaviour in `README.md`; MCP and REST surfaces in `docs/reference/mcp-and-rest.md`; the CLI in
    `docs/reference/cli.md`; retrieval behaviour and evaluation in `docs/reference/retrieval.md`; module structure in
-   `docs/architecture.md`; module boundaries in `docs/development/module-boundaries.md`; build and test in
+   `docs/architecture.md`; the code-level picture of language-server sessions, breakers, readiness and sync in `docs/lsp-channel.md`; the code
+   flow of one traverse call in `docs/traverse-flow.md` (answer-key behaviour and defaults stay in `docs/reference/cli.md`); module boundaries in `docs/development/module-boundaries.md`; build and test in
    `docs/development/testing.md`; language scope in `docs/languages.md`; machine values in `docs/development/machine-values.md`; traversal engine in
    `docs/spike/multimap/engine.md`; measurement method in `docs/spike/multimap/evaluation.md`; plans in
    `docs/development/roadmap.md`; decisions, findings and history in `docs/decisions.md`.
