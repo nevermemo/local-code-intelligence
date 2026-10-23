@@ -648,7 +648,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Rescorer::is_default")]
     pub rescorer: Rescorer,
     /// `[run_profile]`: the home of the switches that name a run's
-    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`,
+    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`, `walk.confirm`,
     /// `traverse.map_freshness`, `traverse.answer_labels`, `traverse.card_paths`, `scip.mode`, `scip.arbitration`, `lsp.sessions`,
     /// `lsp.outline_cache`, `lsp.implementations`, `lsp.call_hierarchy`, `lsp.sync`,
     /// `lsp.places`, `lsp.breaker`, `lsp.live`, `freshness.verify_on_read`, `freshness.stat_gate`, `seeds.bm25`, `seeds.literal`, `seeds.repo_map` and `grep.structural`). Always

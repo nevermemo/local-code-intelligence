@@ -10097,3 +10097,427 @@ async fn only_the_registered_and_built_maps_are_arbitrated() {
     );
     assert!(!unbuilt.to_string().contains("arbitration"), "{unbuilt}");
 }
+
+// ---- `[run_profile.walk] confirm` (K26-2) -------------------------------------
+
+const GREP_LIVE: &str = lci_maps::live_grep::GREP_LIVE_MAP_ID;
+const GRAPH_SCIP: &str = "graph.scip";
+/// `src/Mult.cs`: `Multiply`, a function whose name is long enough for
+/// `grep.live` (names under four bytes make no edges, so `Add` makes none).
+const MULT_SEED: &str = "sym:rust:Mult.cs::Multiply/fn";
+const APPLY_SEED: &str = "sym:rust:Use.cs::Apply/fn";
+
+/// The trace of a walk, as events.
+fn events_of(report: &local_code_intelligence::app::traverse::Report) -> Vec<Value> {
+    lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap()
+}
+
+/// Whether any event of the walk's trace mentions the confirm frontier (the
+/// `start` field, an `expand` field or the `end` totals).
+fn trace_mentions_confirm(report: &local_code_intelligence::app::traverse::Report) -> bool {
+    events_of(report)
+        .iter()
+        .any(|event| event.to_string().contains("confirm"))
+}
+
+/// The Calculator/CallSite workspace plus `src/Mult.cs` (defines `Multiply`)
+/// and `src/Use.cs` (`Apply` calls it), and an index (beside the workspace)
+/// that defines both functions and says `Apply` uses `Multiply`. A walk of
+/// `Multiply` over `grep.live` and `lsp.live` reaches `Apply` through both
+/// (the server names the function, the text names it too) and the file
+/// `Use.cs` through the text alone: that file hop is a text proposal.
+fn confirm_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (config, workspace, state, _) = shared_sessions_fixture(temp);
+    write(
+        &workspace.path,
+        "src/Mult.cs",
+        "namespace Acceptance;\npublic sealed class Mult { public int Multiply(int a, int b) => a * b; }\n",
+    );
+    write(
+        &workspace.path,
+        "src/Use.cs",
+        "namespace Acceptance;\npublic static class Use { public static int Apply(Mult value) => value.Multiply(2, 3); }\n",
+    );
+    let index = csharp_scip_index_with_references(
+        &temp.path().join("confirm.scip"),
+        &workspace,
+        &[("src/Mult.cs", 1, "Multiply"), ("src/Use.cs", 1, "Apply")],
+        &[("src/Use.cs", 1, "Multiply")],
+    );
+    (config, workspace, state, index)
+}
+
+/// One walk of `Multiply` over `maps` to depth 2 (so that a pause at one pop
+/// leaves work), under the default profile adjusted by `tweak`, with the
+/// loaded-machine budget; the walk's own server (no shared manager), like
+/// [`traverse_arbitrated`]. The error is the call's, as text.
+async fn traverse_confirmed(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    maps: &[&str],
+    (pops, handle): (Option<u32>, Option<&str>),
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Result<local_code_intelligence::app::traverse::Report, String> {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: LOADED_BUDGET_SECONDS * 1000,
+        ..TraverseConfig::default()
+    };
+    let mut profile = RunProfileConfig::default();
+    tweak(&mut profile);
+    let (budget, steer) = (
+        BudgetArgs {
+            pops,
+            max_depth: Some(2),
+            deadline_ms: Some(LOADED_BUDGET_SECONDS * 1000),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let seeds = [MULT_SEED.to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "who uses Multiply",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle,
+        lsp: Some(config),
+        lsp_sessions: None,
+    };
+    run(&limits, &profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a card of the answer names `grep.live` among its maps.
+fn has_grep_live_card(answer: &Value) -> bool {
+    answer["results"].as_array().is_some_and(|cards| {
+        cards
+            .iter()
+            .any(|card| card["maps"].to_string().contains("grep.live"))
+    })
+}
+
+/// The confirm frontier on the walk of `Multiply`: `grep.live` proposes the
+/// file `Use.cs` on text alone (`lsp.live` names the function `Apply` there,
+/// not the file), the key on asks the fake server where the name at the site
+/// is defined, the fake defines `Multiply` at `Mult.cs`, which is the expanded
+/// node, so the hop is confirmed. The server and the walk are the walk's own
+/// (no shared manager), as in the arbitration tests above: the fixture sets
+/// `sync = "off"`, the contract these tests need, not main's `watch` default.
+///
+/// `Refuted` is not reachable with this fake: it answers `definition` with
+/// every declaration of the identifier's name, so the seed's own declaration is
+/// always among the answers (the engine's unit tests cover it:
+/// `lci-maps/src/traverse/tests/confirm.rs`). Fails if the confirmer is never
+/// attached (`confirm_calls` absent).
+#[tokio::test]
+async fn walk_confirm_asks_the_fake_server_for_the_grep_sites() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE, LSP_LIVE];
+
+    // Key off first: the server's definition requests (if any) are the walk's
+    // own, so the count the key adds is the difference.
+    let off = traverse_confirmed(&config, &workspace, &index, &maps, (None, None), |_| {})
+        .await
+        .unwrap();
+    let before = requests_of(&state, "textDocument/definition");
+
+    let on = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| profile.walk.confirm = true,
+    )
+    .await
+    .unwrap();
+    let after = requests_of(&state, "textDocument/definition");
+    let response = &on.response;
+    assert!(
+        after > before,
+        "the key asks the server ({before} -> {after}): {response}"
+    );
+    // The counts are the trace's `end` totals (the answer's `totals` object
+    // does not carry them) and the note below.
+    let events = events_of(&on);
+    let totals = &events
+        .iter()
+        .find(|e| e["ev"] == "end")
+        .unwrap_or_else(|| panic!("an end event: {events:?}"))["totals"];
+    assert!(totals["confirm_calls"].as_u64() >= Some(1), "{totals}");
+    assert!(totals["confirm_confirmed"].as_u64() >= Some(1), "{totals}");
+    assert_eq!(totals["confirm_refuted"].as_u64(), Some(0), "{totals}");
+    assert_eq!(totals["confirm_failures"].as_u64(), Some(0), "{totals}");
+    // The server's calls are the walk's external calls.
+    assert!(
+        response["totals"]["external_calls"].as_u64()
+            > off.response["totals"]["external_calls"].as_u64(),
+        "{response}"
+    );
+    let notes = notes_of(response);
+    assert!(
+        notes
+            .contains("walk.confirm: 1 grep.live hops proposed, 1 confirmed, 0 refuted, 0 unknown"),
+        "{notes}"
+    );
+    assert!(notes.contains("confirmer calls (places scip)"), "{notes}");
+    assert!(!notes.contains("walk.confirm is off"), "{notes}");
+    // A confirmed text hop is a server answer: its card says so.
+    let card = response["results"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|c| c["node"] == "file:src/Use.cs"))
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(card["witness"], "lsp", "{card}");
+
+    let start = events.iter().find(|e| e["ev"] == "start").unwrap();
+    assert_eq!(start["confirm"]["top_k"], 8, "{start}");
+    let expand = events
+        .iter()
+        .find(|e| e["ev"] == "expand" && e["confirm"].is_object())
+        .unwrap_or_else(|| panic!("an expand event with a confirm object: {events:?}"));
+    assert!(
+        expand["confirm"]["proposals"].as_u64() >= Some(1),
+        "{expand}"
+    );
+    assert!(
+        expand["confirm"]["confirmed"].as_u64() >= Some(1),
+        "{expand}"
+    );
+    // The key off: no count, no event field.
+    assert!(
+        !off.response.to_string().contains("confirm"),
+        "{}",
+        off.response
+    );
+    assert!(
+        !trace_mentions_confirm(&off),
+        "no trace event mentions confirm"
+    );
+    // The text hop stays a whole-word text match without the key.
+    let text = off.response["results"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|c| c["node"] == "file:src/Use.cs"))
+        .unwrap_or_else(|| panic!("{}", off.response));
+    assert_eq!(text["witness"], "exact", "{text}");
+}
+
+/// Without `lsp.live` (or `grep.live`) in the call the key cannot confirm
+/// anything: the walk runs unconfirmed with one note that names the missing
+/// map, and its results are those of the key off. Fails if the confirmer is
+/// built without the map (`start.confirm` appears).
+#[tokio::test]
+async fn walk_confirm_without_lsp_live_runs_unconfirmed_with_a_note() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE];
+    let off = traverse_confirmed(&config, &workspace, &index, &maps, (None, None), |_| {})
+        .await
+        .unwrap();
+    let on = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| profile.walk.confirm = true,
+    )
+    .await
+    .unwrap();
+    let notes = notes_of(&on.response);
+    assert!(
+        notes.contains(
+            "walk.confirm is off for this call: it needs grep.live and lsp.live (lsp.live not named)"
+        ),
+        "{notes}"
+    );
+    assert!(
+        !notes_of(&off.response).contains("walk.confirm"),
+        "{}",
+        off.response
+    );
+    // The text hop is there to be proposed, and is left as it was.
+    assert!(has_grep_live_card(&on.response), "{}", on.response);
+    assert!(
+        !trace_mentions_confirm(&on),
+        "no trace event carries a confirm field or total"
+    );
+    assert_eq!(
+        on.response["results"].to_string(),
+        off.response["results"].to_string(),
+        "the results are those of the key off"
+    );
+
+    // The same for a call that names `lsp.live` but not `grep.live`.
+    let no_grep = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &[GRAPH_SCIP, LSP_LIVE],
+        (None, None),
+        |profile| profile.walk.confirm = true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        notes_of(&no_grep.response).contains("(grep.live not named)"),
+        "{}",
+        no_grep.response
+    );
+    assert!(
+        !trace_mentions_confirm(&no_grep),
+        "no trace event mentions confirm"
+    );
+}
+
+/// Key off (the default), all three maps, with a text hop in the walk: nothing
+/// about the confirm frontier is in the answer or the trace. Fails without the
+/// `profile.walk.confirm` guard around the confirmer (the note or the totals
+/// appear).
+#[tokio::test]
+async fn walk_confirm_off_changes_no_byte() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE, LSP_LIVE];
+    let report = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| assert!(!profile.walk.confirm, "the default"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !report.response.to_string().contains("confirm"),
+        "{}",
+        report.response
+    );
+    assert!(
+        events_of(&report)
+            .iter()
+            .all(|e| !e.to_string().contains("confirm")),
+        "no trace event mentions confirm"
+    );
+    // The walk reached `Apply` through the server and the text, and the text
+    // hop to the file is in the answer, as before.
+    let apply = report.response["results"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|c| c["node"] == APPLY_SEED))
+        .unwrap_or_else(|| panic!("{}", report.response));
+    assert!(apply["maps"].to_string().contains("lsp.live"), "{apply}");
+    assert!(has_grep_live_card(&report.response), "{}", report.response);
+}
+
+/// A handle records the confirm frontier it was made under, with the places
+/// arm: a resume without the key, or under another places arm, is refused with
+/// the handle's text; the same settings go on. Fails if the identity lacks the
+/// places kind (the second resume is accepted).
+#[tokio::test]
+async fn a_handle_made_with_the_confirm_frontier_is_refused_without_it_and_under_other_places() {
+    use local_code_intelligence::config::LspPlaces;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = confirm_fixture(&temp);
+    let maps = [GRAPH_SCIP, GREP_LIVE, LSP_LIVE];
+    let first = traverse_confirmed(&config, &workspace, &index, &maps, (Some(1), None), |p| {
+        p.walk.confirm = true
+    })
+    .await
+    .unwrap()
+    .response;
+    let handle = first["handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("one pop leaves work: {first}"))
+        .to_owned();
+
+    let refused = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |_| {},
+    )
+    .await
+    .err()
+    .expect("the key is off in the resume");
+    assert!(
+        refused.contains(&format!(
+            "handle {handle} was made with the confirm frontier on at top_k 8 with \"lsp.live definition places scip\", this call has off"
+        )),
+        "{refused}"
+    );
+
+    let refused = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |p| {
+            p.walk.confirm = true;
+            p.lsp.places = LspPlaces::Outline;
+        },
+    )
+    .await
+    .err()
+    .expect("the places arm is another one in the resume");
+    assert!(
+        refused.contains("with \"lsp.live definition places scip\", this call has on at top_k 8 with \"lsp.live definition places outline\""),
+        "{refused}"
+    );
+
+    let resumed = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |p| p.walk.confirm = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(resumed.get("results").is_some(), "{resumed}");
+
+    // The other way: a handle made with the key off refuses the key on.
+    let plain = traverse_confirmed(&config, &workspace, &index, &maps, (Some(1), None), |_| {})
+        .await
+        .unwrap()
+        .response;
+    let plain_handle = plain["handle"].as_str().unwrap().to_owned();
+    let refused = traverse_confirmed(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&plain_handle)),
+        |p| p.walk.confirm = true,
+    )
+    .await
+    .err()
+    .expect("the key is on in the resume");
+    assert!(
+        refused.contains("was made with the confirm frontier off, this call has on at top_k 8"),
+        "{refused}"
+    );
+}

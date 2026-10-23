@@ -338,6 +338,19 @@ pub struct WalkProfile {
     /// profile it is given, like `gate` and `beam`, so a walk can mix pricings
     /// across resumes.
     pub pricing: WalkPricing,
+    /// `false` (default): a text hop stays as `grep.live` found it. `true`:
+    /// the hops a walk keeps whose only witnesses are `grep.live` text
+    /// proposals, the best `top_k` of each expansion by hop value, are
+    /// confirmed in one call through `lsp.live`'s definition at the hop's
+    /// site: a definition that is the expanded node keeps the hop as a
+    /// server answer, one that is another node drops it, and no answer (none,
+    /// an error, the deadline, no call left) leaves it as it was. Each
+    /// proposal costs at most one external call, counted in
+    /// `max_external_calls`, and a failure never ends a walk. It needs
+    /// `grep.live` and `lsp.live` in the call; without either the walk runs
+    /// unconfirmed and says so. A handle keeps it and refuses a resume that
+    /// gives another value.
+    pub confirm: bool,
 }
 
 impl Default for WalkProfile {
@@ -346,6 +359,7 @@ impl Default for WalkProfile {
             groups: WalkGroups::Tool,
             grep_corroboration: 1.0,
             pricing: WalkPricing::Rank,
+            confirm: false,
         }
     }
 }
@@ -871,6 +885,7 @@ mod tests {
         config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
         config.run_profile.walk.grep_corroboration = 0.5;
         config.run_profile.walk.pricing = crate::config::WalkPricing::Relative;
+        config.run_profile.walk.confirm = true;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Authoritative;
         config.run_profile.scip.arbitration = true;
         config.run_profile.lsp.sessions = LspSessions::PerCall;
@@ -1067,6 +1082,38 @@ mode = \"off\"
         assert!(
             toml::from_str::<Config>(&format!(
                 "{}[run_profile.scip]\narbitration = \"yes\"\n",
+                base_toml()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn walk_confirm_is_off_by_default_and_changes_the_profile_hash() {
+        let off = Config::default();
+        assert!(!off.run_profile.walk.confirm);
+        let base = off.run_profile();
+        assert_eq!(base.value["run_profile"]["walk"]["confirm"], false);
+        assert!(
+            base.keys
+                .iter()
+                .any(|key| key == "run_profile.walk.confirm")
+        );
+        // The file reads the key.
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.walk]\nconfirm = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.walk.confirm);
+        let on = on.run_profile();
+        assert_eq!(on.value["run_profile"]["walk"]["confirm"], true);
+        // It changes what a traverse answer holds, so it changes the hash.
+        assert_ne!(base.hash, on.hash);
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{}[run_profile.walk]\nconfirm = \"yes\"\n",
                 base_toml()
             ))
             .is_err()
