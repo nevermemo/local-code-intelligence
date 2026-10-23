@@ -4,6 +4,7 @@
 //! Stub maps that count their calls; no sleeps, no clocks.
 
 use super::*;
+use crate::traverse::handle::{HandleError, Snapshot};
 use crate::traverse::{
     merged::{MergedAdjacency, PreMerged},
     source::{
@@ -574,4 +575,124 @@ fn arbitrate_leaves_the_order_of_the_edges_it_keeps() {
     assert_eq!(dsts, vec![n("fn:B"), n("fn:B")]);
     assert_eq!(raw[0].map, "lsp.live");
     assert_eq!(raw[1].map, "scip.impact");
+}
+
+/// The maps of the handle tests: the server names B at `a`, the index names B
+/// and C, and at B the server names X and the index X and Y.
+fn handle_maps() -> Registry<'static> {
+    registry_of(vec![
+        Scripted::server(&[("a", "fn:B", REFERS), ("fn:B", "fn:X", REFERS)]),
+        Scripted::index(
+            "scip.impact",
+            &[
+                ("a", "fn:B", REFERS),
+                ("a", "fn:C", REFERS),
+                ("fn:B", "fn:X", REFERS),
+                ("fn:B", "fn:Y", REFERS),
+            ],
+        ),
+    ])
+}
+
+/// A walk under `arbitration` (or none); `resume_from` continues a snapshot.
+async fn walk_arbitrated(
+    reg: &Registry<'static>,
+    arbitration: Option<Arbitration>,
+    pops: u32,
+    resume_from: Option<Snapshot>,
+) -> TraversalResult {
+    let view = view();
+    let source = OnTheFly::new(reg, &view);
+    let source = match &arbitration {
+        Some(a) => source.with_arbitration(a.clone()),
+        None => source,
+    };
+    let traversal = match resume_from {
+        Some(snapshot) => Traversal::resumed(source, snapshot, budget(pops)),
+        None => Traversal::new(source, vec![seed("a")], budget(pops)),
+    };
+    match arbitration {
+        Some(a) => traversal.arbitration(a),
+        None => traversal,
+    }
+    .run()
+    .await
+}
+
+#[tokio::test]
+async fn a_resume_under_another_arbitration_is_refused() {
+    let reg = handle_maps();
+    let identity = arbitration().identity();
+    assert_eq!(
+        identity,
+        "lsp.live over scip.impact:refers,structure.contains:structure for fn,method"
+    );
+    let first = walk_arbitrated(&reg, Some(arbitration()), 1, None).await;
+    let snapshot = first.snapshot.expect("the pop cap left work");
+    assert_eq!(snapshot.arbitration.as_deref(), Some(identity.as_str()));
+    assert_eq!(Snapshot::from_json(&snapshot.to_json()).unwrap(), snapshot);
+    assert_eq!(snapshot.to_json()["arbitration"], identity.as_str());
+
+    snapshot.check_arbitration(Some(&identity)).unwrap();
+    let mut fewer = arbitration();
+    fewer.subordinate.pop();
+    let mut other_kinds = arbitration();
+    other_kinds.kinds.push(SymbolKind::Struct);
+    for (what, other) in [
+        ("none", None),
+        ("another subordinate list", Some(fewer.identity())),
+        ("another kinds list", Some(other_kinds.identity())),
+    ] {
+        let error = snapshot.check_arbitration(other.as_deref()).unwrap_err();
+        assert!(
+            matches!(error, HandleError::WrongArbitration { .. }),
+            "{what}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("was made with the arbitration"),
+            "{what}: {text}"
+        );
+        assert!(text.contains(&snapshot.handle()), "{what}: {text}");
+    }
+
+    // A handle made without one refuses one, and carries no key: it is the
+    // handle it was before the key existed, and a handle without the key reads
+    // as made without one.
+    let off = walk_arbitrated(&reg, None, 1, None)
+        .await
+        .snapshot
+        .expect("work left");
+    assert_eq!(off.arbitration, None);
+    off.check_arbitration(None).unwrap();
+    assert!(off.check_arbitration(Some(&identity)).is_err());
+    assert!(off.to_json().get("arbitration").is_none());
+    let mut stripped = snapshot.to_json();
+    stripped.as_object_mut().unwrap().remove("arbitration");
+    assert_eq!(Snapshot::from_json(&stripped).unwrap().arbitration, None);
+
+    // A resume under the same arbitration is the straight run.
+    let straight = walk_arbitrated(&reg, Some(arbitration()), 10, None).await;
+    let second = walk_arbitrated(&reg, Some(arbitration()), 10, Some(snapshot)).await;
+    assert_eq!(second.states, straight.states);
+    assert_eq!(second.popped, straight.popped);
+    let reached: Vec<NodeId> = second.states.iter().map(|s| s.node.clone()).collect();
+    assert!(reached.contains(&n("fn:X")) && !reached.contains(&n("fn:Y")));
+}
+
+#[tokio::test]
+async fn the_start_event_names_the_arbitration_only_when_attached() {
+    let reg = handle_maps();
+    let on = walk_arbitrated(&reg, Some(arbitration()), 10, None).await;
+    let start = events_of(&on, "start");
+    assert_eq!(
+        start[0]["arbitration"],
+        serde_json::json!({
+            "authority": "lsp.live",
+            "subordinate": [["scip.impact", "refers"], ["structure.contains", "structure"]],
+            "kinds": ["fn", "method"],
+        })
+    );
+    let off = walk_arbitrated(&reg, None, 10, None).await;
+    assert!(events_of(&off, "start")[0].get("arbitration").is_none());
 }

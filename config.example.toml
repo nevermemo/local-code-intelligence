@@ -616,8 +616,17 @@ pricing = "rank"
 # each with a note. A handle made with a graph does not resume under "off".
 # Part of the run-profile hash. Recipes read the index under "cache" when it is
 # there and refuse under "off" or without it.
+# arbitration = false (default): nothing is arbitrated and no output changes.
+# true: with lsp.live in the call and mode not "authoritative", a language
+# server's answer at a node overrules the index's scip.impact, scip.implements
+# (with [run_profile.lsp] implementations = true) and structure.contains edges
+# to functions and methods that it did not name, in a claim family it answered
+# at that node. graph.scip is never arbitrated. The counts are in the trace,
+# totals.arbitration, per_map and one note. A handle made with it does not
+# resume without it, nor the reverse.
 [run_profile.scip]
 mode = "cache"
+arbitration = false
 
 # [run_profile.lsp]: whose language servers the lsp.live map asks (on by default
 # where a server is installed and the service keeps it: see `live` below).
