@@ -177,7 +177,7 @@ async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>
 /// for the matching MCP tool's arguments in `server.rs`, so the documented
 /// request contract cannot silently drift from what a handler actually
 /// deserializes. Response bodies are intentionally left as an open
-/// `object` that requires only `profile_hash` -- see README.md's "MCP tools" table for the exact shape each
+/// `object` that requires only `profile_hash` -- see docs/reference/mcp-and-rest.md's "MCP tools" table for the exact shape each
 /// endpoint returns, since committing a second, hand-maintained copy of
 /// those result schemas here would just be one more place for them to go
 /// stale.
@@ -199,7 +199,7 @@ fn openapi_document(config: &Config, port: u16) -> Value {
 
     let result_schema = json!({
         "type": "object",
-        "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+        "description": "Identical JSON to the matching MCP tool's structured result; see docs/reference/mcp-and-rest.md's \"MCP tools\" table for the exact shape.",
         "properties": {
             "profile_hash": {
                 "type": "string",
@@ -318,7 +318,7 @@ fn openapi_document(config: &Config, port: u16) -> Value {
         "info": {
             "title": "local-code-intelligence",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Plain JSON-over-HTTP mirror of LCI's MCP tools, for clients that don't speak MCP. Every endpoint below wraps exactly the same application logic as the matching MCP tool of the same name -- see README.md for full semantics; this document only describes the wire shape. The one exception is /v1/release_workspace, which has no MCP tool."
+            "description": "Plain JSON-over-HTTP mirror of LCI's MCP tools, for clients that don't speak MCP. Every endpoint below wraps exactly the same application logic as the matching MCP tool of the same name -- see docs/reference/mcp-and-rest.md for full semantics; this document only describes the wire shape. The one exception is /v1/release_workspace, which has no MCP tool."
         },
         "servers": [{"url": format!("http://127.0.0.1:{port}")}],
         "paths": {

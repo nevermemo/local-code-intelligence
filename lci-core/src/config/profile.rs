@@ -107,7 +107,7 @@ pub struct RunProfileFreshness {
     /// reports a `freshness` block and `file_changed` per hit. It reads and
     /// labels; it never refreshes the index and never changes
     /// `[index].freshness`. It costs one read of the tree's source files per
-    /// call. See the README "Verify on read".
+    /// call. See "Verify on read" in `docs/reference/cli.md`.
     pub verify_on_read: bool,
     /// Skip re-reading files whose modified time and length have not changed
     /// when `map_freshness` or `verify_on_read` reads the tree. `false` (the
@@ -197,7 +197,7 @@ pub struct RunProfileTraverse {
     /// is as without the key. `true` counts the tree's source files that are
     /// newer than the index file or changed since the process first saw its
     /// stamp (a read of the tree's source files once per call) and adds the
-    /// result to every response. See the README "Map freshness" for what
+    /// result to every response. See "Map freshness" in `docs/reference/cli.md` for what
     /// `observed`, `stale` and `lag` mean.
     pub map_freshness: bool,
     /// Label every traverse answer (a walk, a continuation, an answer with no
@@ -239,7 +239,7 @@ pub struct RunProfileTraverse {
     /// says so). A continuation with the key off drops the kinds an on-handle
     /// carried (its handle has none), so a later call with the key on shows
     /// `null` for those hops too, with the note. The answer grows by roughly one entry of about 25 tokens per
-    /// hop of each card; the README "Paths on cards" has the measured sizes.
+    /// hop of each card; "Paths on cards" in `docs/reference/cli.md` has the measured sizes.
     pub card_paths: bool,
 }
 
