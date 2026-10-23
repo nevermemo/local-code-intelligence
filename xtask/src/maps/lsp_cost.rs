@@ -197,11 +197,17 @@ pub struct LspCostArgs {
     /// JSON list of `{id, question}` (default: the committed list).
     #[arg(long)]
     pub questions: Option<PathBuf>,
-    /// Arms, comma separated (default: all):
-    /// base, shared, shared+cache, shared+impl, shared+sync, per_call+sync, lifecycle
+    /// Arms, comma separated (default: all but `shared+sync+arb`):
+    /// base, shared, shared+cache, shared+impl, shared+sync, per_call+sync, lifecycle,
+    /// shared+sync+arb (`shared+sync` plus `[run_profile.scip] arbitration = true`)
     /// (`base` and `per_call+sync` write `sessions = "per_call"`: the default is `shared`).
     #[arg(long, value_delimiter = ',')]
     pub arms: Vec<String>,
+    /// Maps the `explore` policy adds to the walk, comma separated (default
+    /// `lsp.live`). The arbitration arm needs a SCIP map beside it, e.g.
+    /// `lsp.live,scip.impact`.
+    #[arg(long, value_delimiter = ',')]
+    pub extra_maps: Vec<String>,
     /// Calls per question per arm, round-robin over the questions.
     #[arg(long, default_value_t = 5)]
     pub repeat: usize,
@@ -272,15 +278,18 @@ pub struct Arm {
     pub outline_cache: bool,
     pub implementations: bool,
     pub sync_watch: bool,
+    /// `[run_profile.scip] arbitration = true` (the key's default is `false`).
+    pub arbitration: bool,
 }
 
-pub const ARMS: [Arm; 7] = [
+pub const ARMS: [Arm; 8] = [
     Arm {
         name: "base",
         shared: false,
         outline_cache: false,
         implementations: false,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared",
@@ -288,6 +297,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: false,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared+cache",
@@ -295,6 +305,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: true,
         implementations: false,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared+impl",
@@ -302,6 +313,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: true,
         sync_watch: false,
+        arbitration: false,
     },
     Arm {
         name: "shared+sync",
@@ -309,6 +321,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: false,
         sync_watch: true,
+        arbitration: false,
     },
     Arm {
         name: "per_call+sync",
@@ -316,6 +329,7 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: false,
         implementations: false,
         sync_watch: true,
+        arbitration: false,
     },
     Arm {
         name: "lifecycle",
@@ -323,13 +337,28 @@ pub const ARMS: [Arm; 7] = [
         outline_cache: true,
         implementations: true,
         sync_watch: true,
+        arbitration: false,
+    },
+    Arm {
+        name: "shared+sync+arb",
+        shared: true,
+        outline_cache: false,
+        implementations: false,
+        sync_watch: true,
+        arbitration: true,
     },
 ];
 
 /// The arms named by `--arms` (all when none), in the order given.
 pub fn select_arms(names: &[String]) -> Result<Vec<Arm>> {
+    // The arbitration arm only runs when named: it measures a key that is off
+    // by default, and a default run is the seven arms it always was.
     if names.is_empty() {
-        return Ok(ARMS.to_vec());
+        return Ok(ARMS
+            .iter()
+            .filter(|arm| !arm.arbitration)
+            .copied()
+            .collect());
     }
     names
         .iter()
@@ -383,6 +412,8 @@ pub struct ConfigCtx {
     pub server: String,
     /// `--places outline`: every arm writes `places = "outline"`.
     pub places_outline: bool,
+    /// `--extra-maps`: the `explore` policy's `extra_maps` (empty: `lsp.live`).
+    pub extra_maps: Vec<String>,
 }
 
 fn toml_path(path: &Path) -> String {
@@ -410,7 +441,19 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
         toml_path(&ctx.scip_index),
         ctx.deadline_ms
     );
-    text.push_str("\n[traverse.policies.explore]\nextra_maps = [\"lsp.live\"]\n");
+    let extra_maps = if ctx.extra_maps.is_empty() {
+        "\"lsp.live\"".to_owned()
+    } else {
+        ctx.extra_maps
+            .iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = write!(
+        text,
+        "\n[traverse.policies.explore]\nextra_maps = [{extra_maps}]\n"
+    );
     if let Some(section) = ctx.adapter.section() {
         let _ = write!(
             text,
@@ -432,6 +475,9 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
         } else {
             "places = \"scip\"\n"
         });
+    }
+    if arm.arbitration {
+        text.push_str("\n[run_profile.scip]\narbitration = true\n");
     }
     text
 }
@@ -1267,6 +1313,7 @@ struct RunContext {
     adapter: Adapter,
     server: String,
     places_outline: bool,
+    extra_maps: Vec<String>,
     calls_file: std::fs::File,
 }
 
@@ -1298,6 +1345,7 @@ async fn run_arm(ctx: &mut RunContext, arm: &Arm, condition: &str) -> Result<Vec
                 adapter: ctx.adapter,
                 server: ctx.server.clone(),
                 places_outline: ctx.places_outline,
+                extra_maps: ctx.extra_maps.clone(),
             },
         ),
     )?;
@@ -2187,6 +2235,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         adapter: args.adapter,
         server: server.clone(),
         places_outline: args.places == Places::Outline,
+        extra_maps: args.extra_maps.clone(),
         calls_file,
     };
     let conditions: Vec<(&str, bool)> = match args.load {
@@ -2411,6 +2460,7 @@ mod tests {
                 adapter: Adapter::Rust,
                 server: "rust-analyzer".into(),
                 places_outline,
+                extra_maps: Vec::new(),
             };
             for arm in ARMS {
                 let text = arm_config(&arm, &ctx);
@@ -2709,6 +2759,7 @@ mod tests {
             adapter,
             server: server.into(),
             places_outline: false,
+            extra_maps: Vec::new(),
         }
     }
 
@@ -2735,6 +2786,61 @@ mod tests {
         )
         .replace("@SCIP@", &toml_path(&ctx.scip_index));
         assert_eq!(arm_config(&ARMS[0], &ctx), expected);
+    }
+
+    #[test]
+    fn the_arbitration_arm_adds_exactly_its_key_to_shared_sync() {
+        let ctx = test_ctx(Adapter::Rust, "rust-analyzer");
+        let arm = |name: &str| *ARMS.iter().find(|a| a.name == name).unwrap();
+        let (base, arb) = (arm("shared+sync"), arm("shared+sync+arb"));
+        assert_eq!(arm_overlay_lines(&arb), arm_overlay_lines(&base));
+        assert_eq!(
+            arm_config(&arb, &ctx),
+            format!(
+                "{}\n[run_profile.scip]\narbitration = true\n",
+                arm_config(&base, &ctx)
+            )
+        );
+        // The only arm with the key, and it parses as the key on.
+        assert_eq!(ARMS.iter().filter(|a| a.arbitration).count(), 1);
+        let config: lci_core::config::Config =
+            toml::from_str(&arm_config(&arb, &ctx)).expect("a valid config");
+        assert!(config.run_profile.scip.arbitration);
+        let config: lci_core::config::Config =
+            toml::from_str(&arm_config(&base, &ctx)).expect("a valid config");
+        assert!(!config.run_profile.scip.arbitration);
+        // A default run leaves the arm out; naming it brings it in.
+        assert!(select_arms(&[]).unwrap().iter().all(|a| !a.arbitration));
+        assert_eq!(
+            select_arms(&["shared+sync+arb".to_owned()]).unwrap()[0].name,
+            "shared+sync+arb"
+        );
+    }
+
+    #[test]
+    fn extra_maps_change_the_extra_maps_line_only() {
+        let default = test_ctx(Adapter::Rust, "rust-analyzer");
+        let named = ConfigCtx {
+            extra_maps: vec!["lsp.live".into(), "scip.impact".into()],
+            ..default.clone()
+        };
+        for arm in ARMS {
+            let (plain, extra) = (arm_config(&arm, &default), arm_config(&arm, &named));
+            assert_eq!(
+                plain.replace(
+                    "extra_maps = [\"lsp.live\"]\n",
+                    "extra_maps = [\"lsp.live\", \"scip.impact\"]\n"
+                ),
+                extra,
+                "{}",
+                arm.name
+            );
+            let config: lci_core::config::Config = toml::from_str(&extra).unwrap();
+            assert_eq!(
+                config.traverse.policies["explore"].extra_maps.as_deref(),
+                Some(&["lsp.live".to_owned(), "scip.impact".to_owned()][..])
+            );
+        }
     }
 
     #[test]

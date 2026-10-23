@@ -5571,11 +5571,25 @@ pub(super) fn csharp_scip_index(
 
 /// A SCIP index at `index` that defines each `(file, zero-based line, name)`
 /// as a function whose body is that whole line, as the tree is now.
-#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
 fn csharp_scip_index_of(
     index: &std::path::Path,
     workspace: &Workspace,
     functions: &[(&str, usize, &str)],
+) -> std::path::PathBuf {
+    csharp_scip_index_with_references(index, workspace, functions, &[])
+}
+
+/// [`csharp_scip_index_of`] plus one reference occurrence (role 0) of a defined
+/// function per `(file, zero-based line, callee name)`: the unit whose body is
+/// that line then uses the callee, as far as `scip.impact` can tell. The
+/// occurrence sits where the callee's name is in the line, else at its first
+/// character (an index older than the text: the line no longer mentions it).
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn csharp_scip_index_with_references(
+    index: &std::path::Path,
+    workspace: &Workspace,
+    functions: &[(&str, usize, &str)],
+    references: &[(&str, usize, &str)],
 ) -> std::path::PathBuf {
     use scip::types::{Document, Index, Occurrence, SymbolInformation, symbol_information::Kind};
     let symbol = |name: &str| format!("rust-analyzer cargo demo 0.1.0 acceptance/{name}().");
@@ -5603,6 +5617,24 @@ fn csharp_scip_index_of(
         };
         document.occurrences.push(definition);
         document.symbols.push(info);
+    }
+    for (file, line_number, callee) in references {
+        let text = std::fs::read_to_string(workspace.path.join(file)).unwrap();
+        let line = text.lines().nth(*line_number).unwrap();
+        let col = line
+            .find(callee)
+            .or_else(|| line.find(|c: char| !c.is_whitespace()))
+            .unwrap_or(0) as i32;
+        let mut reference = Occurrence::default();
+        reference.range = vec![*line_number as i32, col, col + callee.len() as i32];
+        reference.symbol = symbol(callee);
+        reference.symbol_roles = 0;
+        documents
+            .iter_mut()
+            .find(|d| d.relative_path == *file)
+            .expect("a reference sits in a file that defines a function")
+            .occurrences
+            .push(reference);
     }
     let mut message = Index::default();
     message.documents = documents;
@@ -8324,7 +8356,10 @@ fn outline_profile(
 ) -> local_code_intelligence::config::RunProfileConfig {
     use local_code_intelligence::config::{LspProfile, RunProfileConfig, profile::ScipProfile};
     RunProfileConfig {
-        scip: ScipProfile { mode },
+        scip: ScipProfile {
+            mode,
+            ..ScipProfile::default()
+        },
         lsp: LspProfile {
             places,
             implementations: true,
@@ -9623,4 +9658,442 @@ async fn an_unchanged_request_refreshes_a_files_place_in_the_open_set() {
         numbered("didOpen", 65, Some(1)),
     ]);
     assert_eq!(events, expected);
+}
+
+// ---- `[run_profile.scip] arbitration` (K20c-2) --------------------------------
+
+/// `src/Old.cs`: a function the stale index below says uses `Add` and whose
+/// text no longer does.
+const OLD_CS: &str =
+    "namespace Acceptance;\npublic static class Legacy { public static int Old() => 3; }\n";
+const OLD_SEED: &str = "sym:rust:Old.cs::Old/fn";
+
+/// The Calculator/CallSite workspace plus `src/Old.cs`, and an index (beside
+/// the workspace) that says both `Run` and `Old` use `Add`: the server, which
+/// reads the text, names `Run` only.
+fn arbitration_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (config, workspace, state, _) = shared_sessions_fixture(temp);
+    write(&workspace.path, "src/Old.cs", OLD_CS);
+    let index = csharp_scip_index_with_references(
+        &temp.path().join("arbitration.scip"),
+        &workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+            ("src/Old.cs", 1, "Old"),
+        ],
+        &[("src/CallSite.cs", 1, "Add"), ("src/Old.cs", 1, "Add")],
+    );
+    (config, workspace, state, index)
+}
+
+/// One walk of `ADD_SEED` over `maps` to depth 2 (so that a pause at one pop
+/// leaves work), under the default profile adjusted by `tweak`, with the
+/// loaded-machine budget; the walk's own server (no shared manager). The error
+/// is the call's, as text.
+async fn traverse_arbitrated(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    maps: &[&str],
+    (pops, handle): (Option<u32>, Option<&str>),
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Result<local_code_intelligence::app::traverse::Report, String> {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: LOADED_BUDGET_SECONDS * 1000,
+        ..TraverseConfig::default()
+    };
+    let mut profile = RunProfileConfig::default();
+    tweak(&mut profile);
+    let (budget, steer) = (
+        BudgetArgs {
+            pops,
+            max_depth: Some(2),
+            deadline_ms: Some(LOADED_BUDGET_SECONDS * 1000),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let seeds = [ADD_SEED.to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "who uses Add",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle,
+        lsp: Some(config),
+        lsp_sessions: None,
+    };
+    run(&limits, &profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a card of the answer is at `node`.
+fn reached_node(answer: &Value, node: &str) -> bool {
+    answer["results"]
+        .as_array()
+        .is_some_and(|cards| cards.iter().any(|card| card["node"].as_str() == Some(node)))
+}
+
+/// The `maps[]` entry of the freshness report for `id`.
+fn freshness_entry<'a>(answer: &'a Value, id: &str) -> &'a Value {
+    answer["maps"]
+        .as_array()
+        .and_then(|maps| maps.iter().find(|entry| entry["id"] == id))
+        .unwrap_or_else(|| panic!("no maps[] entry for {id}: {answer}"))
+}
+
+const SCIP_IMPACT: &str = lci_maps::scip_impact::SCIP_IMPACT_ID;
+const LSP_LIVE: &str = lci_maps::lsp_live::LSP_LIVE_ID;
+
+/// The row's ceiling check (K20c): a caller the index names and the server's
+/// answer does not (its text no longer calls `Add`) is overruled, a live one is
+/// confirmed, and the counts are in the trace, `per_map`, `totals` and one
+/// note. Off (the default) and under `scip.mode = "authoritative"` the same
+/// walk reaches the stale caller and prints no count anywhere.
+#[tokio::test]
+async fn a_stale_scip_caller_the_server_does_not_see_is_overruled_and_a_live_one_confirmed() {
+    use local_code_intelligence::config::{RunProfileConfig, profile::ScipMode};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let maps = [LSP_LIVE, SCIP_IMPACT];
+    let walk = |tweak: fn(&mut RunProfileConfig)| {
+        traverse_arbitrated(&config, &workspace, &index, &maps, (None, None), tweak)
+    };
+
+    let report = walk(|profile| profile.scip.arbitration = true)
+        .await
+        .unwrap();
+    let on = &report.response;
+    assert!(reached_run_through_lsp_live(on), "{on}");
+    assert!(reached_node(on, RUN_SEED), "{on}");
+    assert!(!reached_node(on, OLD_SEED), "the stale caller stands: {on}");
+    let counts = json!({"confirmed": 1, "overruled": 1});
+    assert_eq!(on["totals"]["arbitration"], counts, "{on}");
+    assert_eq!(
+        on["totals"]["per_map"][SCIP_IMPACT]["arbitration"], counts,
+        "{on}"
+    );
+    assert!(
+        on["totals"]["per_map"][LSP_LIVE]
+            .get("arbitration")
+            .is_none(),
+        "{on}"
+    );
+    let notes = notes_of(on);
+    assert!(
+        notes.contains(
+            "scip.arbitration: lsp.live judged scip.impact (function and method destinations, places scip) in this call: 1 edges confirmed, 1 overruled"
+        ),
+        "{notes}"
+    );
+    // The seed's expand event: the `scip.impact` call carries the counts, the
+    // server's call none.
+    let events = lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap();
+    let start = events.iter().find(|e| e["ev"] == "start").unwrap();
+    assert_eq!(start["arbitration"]["authority"], LSP_LIVE);
+    assert_eq!(
+        start["arbitration"]["subordinate"],
+        json!([[SCIP_IMPACT, "refers"]])
+    );
+    assert_eq!(start["arbitration"]["kinds"], json!(["fn", "method"]));
+    let expand = events
+        .iter()
+        .find(|e| e["ev"] == "expand" && e["node"] == ADD_SEED)
+        .expect("the seed is expanded");
+    let call_of = |map: &str| {
+        expand["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["map"] == map)
+            .unwrap_or_else(|| panic!("no call of {map}: {expand}"))
+    };
+    assert_eq!(call_of(SCIP_IMPACT)["arbitration"], counts, "{expand}");
+    assert!(call_of(LSP_LIVE).get("arbitration").is_none(), "{expand}");
+
+    // Off (the default): nothing is arbitrated, nothing is printed.
+    let off = walk(|_| {}).await.unwrap().response;
+    assert!(reached_node(&off, RUN_SEED), "{off}");
+    assert!(reached_node(&off, OLD_SEED), "{off}");
+    assert!(!off.to_string().contains("arbitration"), "{off}");
+
+    // `authoritative` with the key on: the same as off.
+    let authoritative = walk(|profile| {
+        profile.scip.arbitration = true;
+        profile.scip.mode = ScipMode::Authoritative;
+    })
+    .await
+    .unwrap()
+    .response;
+    assert!(reached_node(&authoritative, OLD_SEED), "{authoritative}");
+    assert!(
+        !authoritative.to_string().contains("arbitration"),
+        "{authoritative}"
+    );
+}
+
+/// `role` is in the `maps[]` of the freshness report only while an arbitration
+/// ran: the authority and the judged index map, never a map the arbitration
+/// does not judge (`graph.scip`).
+#[tokio::test]
+async fn the_freshness_maps_carry_roles_only_under_an_arbitration() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let maps = ["graph.scip", SCIP_IMPACT, LSP_LIVE];
+    let on = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| {
+            profile.traverse.map_freshness = true;
+            profile.scip.arbitration = true;
+        },
+    )
+    .await
+    .unwrap()
+    .response;
+    assert_eq!(freshness_entry(&on, LSP_LIVE)["role"], "authority", "{on}");
+    assert_eq!(freshness_entry(&on, SCIP_IMPACT)["role"], "cache", "{on}");
+    assert!(
+        freshness_entry(&on, "graph.scip").get("role").is_none(),
+        "{on}"
+    );
+
+    // Key off: no entry has a role.
+    let off = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, None),
+        |profile| {
+            profile.traverse.map_freshness = true;
+        },
+    )
+    .await
+    .unwrap()
+    .response;
+    assert_eq!(off["maps"].as_array().map(Vec::len), Some(3), "{off}");
+    assert!(!off.to_string().contains("\"role\""), "{off}");
+
+    // Key on without the server: no arbitration, no role.
+    let alone = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &["graph.scip"],
+        (None, None),
+        |profile| {
+            profile.traverse.map_freshness = true;
+            profile.scip.arbitration = true;
+        },
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(!freshness_entry(&alone, "graph.scip").is_null(), "{alone}");
+    assert!(!alone.to_string().contains("\"role\""), "{alone}");
+}
+
+/// Fail-open: a server that starts and exits (N106) answers nothing, so the
+/// index's edges stand. The arbitration is attached (the map is registered)
+/// and judged nothing: counts 0 and 0, and the stale caller is reached.
+#[tokio::test]
+async fn a_server_that_answers_nothing_leaves_the_index_edges_standing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state, index) = arbitration_fixture(&temp);
+    config.csharp.args.push("--exit-at-start".to_owned());
+    let answer = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &[LSP_LIVE, SCIP_IMPACT],
+        (None, None),
+        |profile| profile.scip.arbitration = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(reached_node(&answer, OLD_SEED), "{answer}");
+    assert!(reached_node(&answer, RUN_SEED), "{answer}");
+    assert!(!reached_run_through_lsp_live(&answer), "{answer}");
+    let counts = json!({"confirmed": 0, "overruled": 0});
+    assert_eq!(answer["totals"]["arbitration"], counts, "{answer}");
+    assert_eq!(
+        answer["totals"]["per_map"][SCIP_IMPACT]["arbitration"], counts,
+        "{answer}"
+    );
+    assert!(
+        notes_of(&answer).contains("in this call: 0 edges confirmed, 0 overruled"),
+        "{answer}"
+    );
+    assert!(
+        notes_of(&answer).contains("lsp.live reported an error"),
+        "{answer}"
+    );
+}
+
+/// A handle records the arbitration it was made under: a resume under another
+/// (here: none) is refused with the handle's text, one under the same goes on.
+#[tokio::test]
+async fn a_handle_made_with_the_arbitration_is_refused_without_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let maps = [LSP_LIVE, SCIP_IMPACT];
+    let first = traverse_arbitrated(&config, &workspace, &index, &maps, (Some(1), None), |p| {
+        p.scip.arbitration = true
+    })
+    .await
+    .unwrap()
+    .response;
+    let handle = first["handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("one pop leaves work: {first}"))
+        .to_owned();
+
+    let refused = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |_| {},
+    )
+    .await
+    .err()
+    .expect("the key is off in the resume");
+    assert!(
+        refused.contains(&format!(
+            "handle {handle} was made with the arbitration lsp.live over scip.impact:refers for fn,method, this call has none"
+        )),
+        "{refused}"
+    );
+
+    let resumed = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&handle)),
+        |p| p.scip.arbitration = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(reached_node(&resumed, RUN_SEED), "{resumed}");
+    assert!(!reached_node(&resumed, OLD_SEED), "{resumed}");
+
+    // The other way: a handle made with the key off refuses the key on.
+    let plain = traverse_arbitrated(&config, &workspace, &index, &maps, (Some(1), None), |_| {})
+        .await
+        .unwrap()
+        .response;
+    let plain_handle = plain["handle"].as_str().unwrap().to_owned();
+    let refused = traverse_arbitrated(
+        &config,
+        &workspace,
+        &index,
+        &maps,
+        (None, Some(&plain_handle)),
+        |p| p.scip.arbitration = true,
+    )
+    .await
+    .err()
+    .expect("the key is on in the resume");
+    assert!(
+        refused.contains("was made with the arbitration none, this call has lsp.live over"),
+        "{refused}"
+    );
+}
+
+/// Only registered, wanted and built maps are judged (S4): the judged pairs
+/// are in the `start` event of the trace, and an arbitration with nothing to
+/// judge is not attached at all.
+#[tokio::test]
+async fn only_the_registered_and_built_maps_are_arbitrated() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = arbitration_fixture(&temp);
+    let subordinate = |report: &local_code_intelligence::app::traverse::Report| {
+        let events = lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap();
+        let start = events.iter().find(|e| e["ev"] == "start").unwrap().clone();
+        start["arbitration"]["subordinate"].clone()
+    };
+
+    // `scip.implements` is judged only with `implementations = true`, and
+    // `structure.contains` only when the call names it.
+    let walk = |maps: &'static [&'static str], implementations: bool| {
+        let (config, workspace, index) = (&config, &workspace, &index);
+        async move {
+            traverse_arbitrated(config, workspace, index, maps, (None, None), |profile| {
+                profile.scip.arbitration = true;
+                profile.lsp.implementations = implementations;
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let without = walk(&[LSP_LIVE, "scip.implements"], false).await;
+    assert!(!without.response.to_string().contains("arbitration"));
+    let with = walk(&[LSP_LIVE, "scip.implements"], true).await;
+    assert_eq!(
+        subordinate(&with),
+        json!([["scip.implements", "implements"]])
+    );
+    let both = walk(&[LSP_LIVE, SCIP_IMPACT, "structure.contains"], false).await;
+    assert_eq!(
+        subordinate(&both),
+        json!([
+            ["scip.impact", "refers"],
+            ["structure.contains", "structure"]
+        ])
+    );
+    // Both judged maps have counts (what `structure.contains` confirms is the
+    // server's file outline, which the fake answers).
+    for map in [SCIP_IMPACT, "structure.contains"] {
+        assert!(
+            both.response["totals"]["per_map"][map]["arbitration"].is_object(),
+            "{map}: {}",
+            both.response
+        );
+    }
+
+    // A map the call could not build is not judged: with no index to read,
+    // `scip.impact` is unavailable and nothing is left to arbitrate.
+    let missing = temp.path().join("missing.scip");
+    let unbuilt = traverse_arbitrated(
+        &config,
+        &workspace,
+        &missing,
+        &[LSP_LIVE, SCIP_IMPACT],
+        (None, None),
+        |profile| profile.scip.arbitration = true,
+    )
+    .await
+    .unwrap()
+    .response;
+    assert!(
+        notes_of(&unbuilt).contains("scip.impact has no edges"),
+        "{unbuilt}"
+    );
+    assert!(!unbuilt.to_string().contains("arbitration"), "{unbuilt}");
 }

@@ -120,7 +120,7 @@ use lci_maps::{
         priors::HopPriors,
         rescore::FrontierRescorer,
         rules::RuleList,
-        source::OnTheFly,
+        source::{Arbitration, OnTheFly},
         steer::Steer,
         tiebreak::TieBreak,
         trace::{self, PlanPolicy, StartPlan},
@@ -814,6 +814,15 @@ pub async fn run_with_trait_seeds(
         walk_restarts: &walk_restarts,
     };
     let built = maps::build(&cx, &mut notes, &mut warnings).await?;
+    // `[run_profile.scip] arbitration`: the server's answer overrules the
+    // index maps this call built. A handle made under another arbitration (or
+    // none) is not the walk this call would continue.
+    let arbitration = maps::arbitration(&built, &selection, profile);
+    if let Some(snapshot) = &snapshot {
+        snapshot
+            .check_arbitration(arbitration.as_ref().map(Arbitration::identity).as_deref())
+            .map_err(|e| anyhow!("{e}"))?;
+    }
     // The trait and trait-method paths of the question join the start nodes
     // (K39a: this ran inside the `scip.implements` registration).
     if snapshot.is_none()
@@ -970,10 +979,13 @@ pub async fn run_with_trait_seeds(
                 .collect()
         })
         .unwrap_or_default();
+    let source = OnTheFly::new(&built.registry, &view);
+    let source = match &arbitration {
+        Some(a) => source.with_arbitration(a.clone()),
+        None => source,
+    };
     let traversal = match snapshot {
-        Some(snapshot) => {
-            Traversal::resumed(OnTheFly::new(&built.registry, &view), snapshot, budget)
-        }
+        Some(snapshot) => Traversal::resumed(source, snapshot, budget),
         None => {
             if found.nodes.is_empty() {
                 let mut response = no_seeds_response(call, &found, notes);
@@ -983,7 +995,8 @@ pub async fn run_with_trait_seeds(
                 observer.settle(call.seed_search).await;
                 add_maps(
                     &mut response,
-                    observer.report(enabled_maps.iter().map(String::as_str)),
+                    // No walk ran, so no arbitration did either: no roles.
+                    observer.report(enabled_maps.iter().map(String::as_str), |_| None),
                 );
                 add_file_changed(&mut response, &observer);
                 if profile.traverse.answer_labels {
@@ -1007,13 +1020,9 @@ pub async fn run_with_trait_seeds(
                 seed_source: Some(found.source.to_owned()),
                 seed_hits: found.details.clone(),
             };
-            Traversal::new(
-                OnTheFly::new(&built.registry, &view),
-                found.nodes.clone(),
-                budget,
-            )
-            .question(call.question)
-            .plan(plan)
+            Traversal::new(source, found.nodes.clone(), budget)
+                .question(call.question)
+                .plan(plan)
         }
     };
     let traversal = traversal
@@ -1040,6 +1049,10 @@ pub async fn run_with_trait_seeds(
         .expanders(built.registry.expanding_maps());
     let traversal = match &rescorer {
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
+        None => traversal,
+    };
+    let traversal = match &arbitration {
+        Some(a) => traversal.arbitration(a.clone()),
         None => traversal,
     };
     // The cap on model calls covers the reranker frontier's calls.
@@ -1113,6 +1126,18 @@ pub async fn run_with_trait_seeds(
     }
     if let Some(error) = built.lsp_live.as_ref().and_then(|map| map.last_error()) {
         notes.push(format!("lsp.live reported an error for a node: {error}"));
+    }
+    // What the arbitration did in this call (counts are per call).
+    if let (Some(a), Some(counts)) = (&arbitration, result.arbitration) {
+        let judged: Vec<MapId> = a.subordinate.iter().map(|(map, _)| *map).collect();
+        notes.push(format!(
+            "scip.arbitration: {} judged {} (function and method destinations, places {}) in this call: {} edges confirmed, {} overruled",
+            a.authority,
+            judged.join(", "),
+            if built.outline { "outline" } else { "scip" },
+            counts.confirmed,
+            counts.overruled
+        ));
     }
     // A server that is not ready when the walk ends says why a node may have
     // had no edges; a ready one adds nothing, so a walk whose servers are
@@ -1198,9 +1223,20 @@ pub async fn run_with_trait_seeds(
         add_commits(&mut response, history);
     }
     observer.settle(call.seed_search).await;
+    // The roles of an arbitration that ran in this call.
+    let role_of = |id: &str| -> Option<&'static str> {
+        let arbitration = arbitration.as_ref()?;
+        if id == arbitration.authority {
+            Some("authority")
+        } else if arbitration.is_subordinate(id) {
+            Some("cache")
+        } else {
+            None
+        }
+    };
     add_maps(
         &mut response,
-        observer.report(enabled_maps.iter().map(String::as_str)),
+        observer.report(enabled_maps.iter().map(String::as_str), role_of),
     );
     add_file_changed(&mut response, &observer);
     if profile.traverse.answer_labels {
@@ -1285,4 +1321,4 @@ pub async fn search(
 }
 
 /// Text for the server instructions when the mode is on.
-pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode reads the index.scip in the workspace as a cache: when the file is missing or unreadable it walks an empty SCIP graph and says so in a note ([run_profile.scip] mode authoritative makes that an error, off never reads the file), when a language server for the workspace's languages is installed and the service keeps it the walk also asks it (lsp.live) and says in notes when it could not, and the search that finds the start nodes uses the same index and model services as the normal mode.";
+pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode reads the index.scip in the workspace as a cache: when the file is missing or unreadable it walks an empty SCIP graph and says so in a note ([run_profile.scip] mode authoritative makes that an error, off never reads the file; [run_profile.scip] arbitration = true, default false, lets a language server's answer overrule index edges it does not name and puts the counts in the trace), when a language server for the workspace's languages is installed and the service keeps it the walk also asks it (lsp.live) and says in notes when it could not, and the search that finds the start nodes uses the same index and model services as the normal mode.";

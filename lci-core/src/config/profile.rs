@@ -178,6 +178,13 @@ pub struct ScipProfile {
     /// `"cache"` (default: read the index when it is there), `"authoritative"`
     /// (the index is required) or `"off"` (never read it).
     pub mode: ScipMode,
+    /// `true`: with `lsp.live` registered and `mode != "authoritative"`, a
+    /// language server's answer at a node overrules the index's `scip.impact`,
+    /// `scip.implements` and file-level `structure.contains` edges to
+    /// functions and methods it did not name; counts are in the trace,
+    /// `totals.arbitration`, `per_map` and one note. `false` (the default):
+    /// nothing is arbitrated and no output changes.
+    pub arbitration: bool,
 }
 
 /// `[run_profile.traverse]`.
@@ -865,6 +872,7 @@ mod tests {
         config.run_profile.walk.grep_corroboration = 0.5;
         config.run_profile.walk.pricing = crate::config::WalkPricing::Relative;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Authoritative;
+        config.run_profile.scip.arbitration = true;
         config.run_profile.lsp.sessions = LspSessions::PerCall;
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.freshness.stat_gate = true;
@@ -1002,7 +1010,10 @@ mod tests {
     #[test]
     fn scip_mode_changes_the_profile_hash() {
         let base = Config::default().run_profile();
-        assert!(base.canonical.contains(r#""scip":{"mode":"cache"}"#));
+        assert!(
+            base.canonical
+                .contains(r#""scip":{"arbitration":false,"mode":"cache"}"#)
+        );
         let hashes: Vec<String> = [ScipMode::Cache, ScipMode::Authoritative, ScipMode::Off]
             .into_iter()
             .map(|mode| {
@@ -1027,6 +1038,39 @@ mode = \"off\"
         read.validate().unwrap();
         assert_eq!(read.run_profile.scip.mode, ScipMode::Off);
         assert_eq!("cache".parse::<ScipMode>(), Ok(ScipMode::Cache));
+    }
+
+    #[test]
+    fn scip_arbitration_is_off_by_default_and_changes_the_profile_hash() {
+        let off = Config::default();
+        assert!(!off.run_profile.scip.arbitration);
+        let base = off.run_profile();
+        assert_eq!(base.value["run_profile"]["scip"]["arbitration"], false);
+        assert!(
+            base.keys
+                .iter()
+                .any(|key| key == "run_profile.scip.arbitration")
+        );
+        // The file reads the key.
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.scip]\narbitration = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.scip.arbitration);
+        assert_eq!(on.run_profile.scip.mode, ScipMode::Cache);
+        let on = on.run_profile();
+        assert_eq!(on.value["run_profile"]["scip"]["arbitration"], true);
+        // It changes what a traverse answer holds, so it changes the hash.
+        assert_ne!(base.hash, on.hash);
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{}[run_profile.scip]\narbitration = \"yes\"\n",
+                base_toml()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1382,6 +1426,7 @@ mode = \"sometimes\"
             "run_profile.traverse.answer_labels",
             "run_profile.traverse.card_paths",
             "run_profile.scip.mode",
+            "run_profile.scip.arbitration",
             "run_profile.lsp.sessions",
             "run_profile.freshness.verify_on_read",
             "run_profile.freshness.stat_gate",
