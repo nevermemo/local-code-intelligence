@@ -1215,8 +1215,24 @@ fn probe_program(server: &str) -> String {
     )
 }
 
+/// The timed probe as the report prints it, `<server> <args>` of the adapter
+/// named by the report's "adapter" summary entry (rust when absent or unknown),
+/// from [`Adapter::probe_args`]; a generic name when the adapter has none.
+fn probe_label(summary: &[(String, String)]) -> String {
+    let key = summary
+        .iter()
+        .find(|(key, _)| key == "adapter")
+        .map_or("rust", |(_, value)| value.as_str());
+    let adapter = Adapter::from_str(key, false).unwrap_or(Adapter::Rust);
+    match adapter.probe_args() {
+        Some(args) => format!("<server> {}", args.join(" ")),
+        None => "<server> (readiness probe)".to_owned(),
+    }
+}
+
 /// Times `<server> <args>` (the adapter's [`Adapter::probe_args`]) `runs`
-/// times, ms; a run that does not exit 0 has no sample.
+/// times, ms; a run that does not exit 0 has no sample. The runs are not
+/// bounded by a timeout.
 fn time_version_probe(binary: &str, args: &[&str], runs: usize) -> Vec<f64> {
     (0..runs)
         .filter_map(|_| {
@@ -1770,11 +1786,12 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
             ))
         );
         if result.version_probe.is_empty() {
-            out.push_str("`<server> --version`: no timing (the adapter has no `--version` flag, or the run did not time it).\n\n");
+            out.push_str("Readiness probe: no timing (the adapter has no timed probe, or the run did not time it).\n\n");
         } else {
             let _ = writeln!(
                 out,
-                "`<server> --version`, {} runs: p50 {} ms, p95 {} ms, max {} ms (limit 5000 ms).\n",
+                "`{}`, {} runs: p50 {} ms, p95 {} ms, max {} ms (no time limit is imposed on these runs).\n",
+                probe_label(&meta.summary),
                 result.version_probe.len(),
                 fmt_opt(percentile(&result.version_probe, 50.0)),
                 fmt_opt(percentile(&result.version_probe, 95.0)),
@@ -2234,7 +2251,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
             Vec::new()
         };
         println!(
-            "[{condition}] --version p50 {} ms p95 {} ms",
+            "[{condition}] readiness probe p50 {} ms p95 {} ms",
             fmt_opt(percentile(&version_probe, 50.0)),
             fmt_opt(percentile(&version_probe, 95.0))
         );
@@ -2872,6 +2889,47 @@ mod tests {
         assert_eq!(adapter_key(&meta), "rust");
         meta.summary.push(("adapter".to_owned(), "go".to_owned()));
         assert_eq!(adapter_key(&meta), "go");
+    }
+
+    /// The report names the probe it timed: `gopls version` for go, not
+    /// `--version`, and no invented limit.
+    #[test]
+    fn the_report_labels_the_probe_the_adapter_runs() {
+        let label = |adapter: &str| {
+            let summary = vec![("adapter".to_owned(), adapter.to_owned())];
+            probe_label(&summary)
+        };
+        assert_eq!(label("go"), "<server> version");
+        assert_eq!(label("rust"), "<server> --version");
+        assert_eq!(probe_label(&[]), "<server> --version");
+        assert_eq!(label("python"), "<server> (readiness probe)");
+        for adapter in Adapter::ALL {
+            let expected = adapter
+                .probe_args()
+                .map_or_else(|| "(readiness probe)".to_owned(), |a| a.join(" "));
+            assert_eq!(label(adapter.name()), format!("<server> {expected}"));
+        }
+        let go = ReportMeta {
+            stamp: "s".into(),
+            summary: vec![("adapter".to_owned(), "go".to_owned())],
+            ..ReportMeta::default()
+        };
+        let result = ConditionResult {
+            condition: "quiet".into(),
+            version_probe: vec![10.0, 20.0],
+            ..ConditionResult::default()
+        };
+        let report = render_report(&go, &[result]);
+        assert!(
+            report.contains("`<server> version`, 2 runs: p50"),
+            "{report}"
+        );
+        assert!(!report.contains("`<server> --version`"), "{report}");
+        assert!(!report.contains("limit 5000"), "{report}");
+        assert!(
+            report.contains("no time limit is imposed on these runs"),
+            "{report}"
+        );
     }
 
     /// The harness times the probe the adapter runs: gopls answers `version`

@@ -1352,7 +1352,7 @@ impl Manager {
     /// when its session fails). A failed probe is remembered nowhere and is
     /// run again by the next caller. Concurrent first callers each probe.
     /// The default probe also keeps a process-wide memo of its own (see
-    /// [`adapter::probe_subprocess_version`]), so a second manager in the same
+    /// [`adapter::probe_subprocess`]), so a second manager in the same
     /// process does not run a binary again that has answered.
     ///
     /// Under `[run_profile.lsp] breaker = true` a failed probe opens the
