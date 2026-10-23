@@ -5,7 +5,7 @@ Agents read these files without chat context and pay for every token, so the fil
 
 1. Facts first. State what the code does today, in the present tense, before any history or rationale.
 2. One place per fact. A fact has one home; every other file points to that home instead of restating it.
-   Homes: behaviour and surfaces in `README.md`; MCP and REST surfaces in `docs/reference/mcp-and-rest.md`; the CLI in
+   Homes: setup, configuration and server behaviour in `README.md`; MCP and REST surfaces in `docs/reference/mcp-and-rest.md`; the CLI in
    `docs/reference/cli.md`; retrieval behaviour and evaluation in `docs/reference/retrieval.md`; module structure in
    `docs/architecture.md`; module boundaries in `docs/development/module-boundaries.md`; build and test in
    `docs/development/testing.md`; language scope in `docs/languages.md`; machine values in `docs/development/machine-values.md`; traversal engine in
