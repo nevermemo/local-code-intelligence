@@ -7,10 +7,15 @@
 //! rule 1): a consumer that wants a different order computes it at walk time.
 
 use crate::{
-    Cost, EdgeKind, MapDescriptor, MapId, MapResponse, MapStatus, NodeKind, Observed, SourceLabel,
+    Cost, EdgeKind, Evidence, MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus,
+    NodeKind, Observed, SnapshotView, SourceLabel,
 };
 use lci_core::node::NodeId;
-use std::{cmp::Reverse, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 /// How far a witness can be trusted, from the strongest to the weakest
 /// source. Consumers read `Compiler` and `Exact` by default and report
@@ -230,6 +235,66 @@ pub fn sort_edges(edges: &mut [Edge]) {
 pub fn cap_edges(edges: &mut Vec<Edge>, cap: usize) {
     sort_edges(edges);
     edges.truncate(cap);
+}
+
+/// The seeded answer of a map whose edges carry a SCIP site: every seed's
+/// capped edges (`edges_of` gives them and how many there were before the
+/// cap), merged, sorted, one hit per destination, cut to the request's limit.
+/// Hits score `conf` as a unit interval and cite the site through `detail`.
+/// `cap` is only reported, not applied here (`edges_of` applies it): a cap
+/// that dropped edges makes the status `Partial`, its note naming `noun` and
+/// `cap`.
+pub fn scip_ranked_hits(
+    descriptor: &MapDescriptor,
+    request: &MapRequest<'_>,
+    view: &SnapshotView<'_>,
+    cap: usize,
+    noun: &str,
+    edges_of: impl Fn(&NodeId) -> (Expanded, usize),
+    detail: impl Fn(Site) -> String,
+) -> MapResponse {
+    let started = Instant::now();
+    let mut edges = Vec::new();
+    let mut dropped = 0;
+    for (seed, _) in request.seeds {
+        let (found, total) = edges_of(seed);
+        dropped += total - found.edges.len();
+        edges.extend(found.edges);
+    }
+    cap_edges(&mut edges, usize::MAX);
+    let mut seen = HashSet::new();
+    edges.retain(|edge| seen.insert(edge.dst.clone()));
+    edges.truncate(request.limit);
+    let mut response = MapResponse::empty(descriptor, view, MapStatus::Ok);
+    if dropped > 0 {
+        response.status = MapStatus::Partial {
+            note: Some(format!(
+                "{dropped} more {noun} than the cap of {cap} were not offered"
+            )),
+            warning: None,
+        };
+    }
+    response.cost = Cost {
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        nodes_touched: edges.len() as u64,
+        ..Cost::default()
+    };
+    response.hits = edges
+        .into_iter()
+        .zip(1..)
+        .map(|(edge, rank)| MapHit {
+            node: edge.dst,
+            rank,
+            score: Some(f32::from(edge.conf) / f32::from(CONF_MAX)),
+            evidence: vec![Evidence {
+                via: Some(edge.src),
+                edge: edge.kind,
+                label: SourceLabel::Scip,
+                detail: edge.site.map(&detail),
+            }],
+        })
+        .collect();
+    response
 }
 
 /// The edges a seeded query's answer stands for, as [`crate::Map::expand`]'s

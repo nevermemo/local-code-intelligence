@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    SnapshotRef,
+    MapStatus, SnapshotRef,
     kit_c3::check_expand,
     scip_graph::{DirSource, Range, RawDocument, RawOccurrence, SourceText},
 };
@@ -287,6 +287,77 @@ fn the_card_is_dependent_and_good_for_impact_and_flow() {
         card.good_for,
         vec![QuestionType::Impact, QuestionType::Flow]
     );
+}
+
+// ---- pins: the seeded `query` output -------------------------------------------------
+
+async fn ask(map: &ImplementsMap, seeds: &[(NodeId, f32)], limit: usize) -> MapResponse {
+    let params = serde_json::Value::Null;
+    map.query(
+        &MapRequest {
+            text: None,
+            seeds,
+            limit,
+            budget: budget(),
+            params: &params,
+            as_of: None,
+        },
+        &view(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn query_pins_the_partial_note_and_the_first_hit() {
+    let map = map(1);
+    let response = ask(&map, &[(tr(), 1.0)], 10).await;
+    assert_eq!(
+        response.status,
+        MapStatus::Partial {
+            note: Some("1 more implementations than the cap of 1 were not offered".to_string()),
+            warning: None,
+        }
+    );
+    assert_eq!(response.hits.len(), 1);
+    let hit = &response.hits[0];
+    assert_eq!(hit.rank, 1);
+    assert_eq!(hit.score, Some(1.0));
+    assert_eq!(hit.node, a());
+    assert_eq!(hit.evidence.len(), 1);
+    let evidence = &hit.evidence[0];
+    assert_eq!(evidence.via, Some(tr()));
+    assert_eq!(evidence.edge, EdgeKind::Implements);
+    assert_eq!(evidence.label, crate::SourceLabel::Scip);
+    assert_eq!(evidence.detail.as_deref(), Some("implements at a.rs:6"));
+}
+
+#[tokio::test]
+async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
+    let map = map(64);
+    // A and B both reach `Tr` (A at a.rs:6, B at a.rs:9): one hit, from A.
+    // The seed whose edge wins is listed second, so only the global sort by
+    // site keeps it.
+    let both = ask(&map, &[(b(), 1.0), (a(), 1.0)], 10).await;
+    assert_eq!(both.status, MapStatus::Ok);
+    assert_eq!(both.hits.len(), 1, "{:?}", both.hits);
+    assert_eq!(both.hits[0].node, tr());
+    assert_eq!(both.hits[0].rank, 1);
+    assert_eq!(both.hits[0].evidence[0].via, Some(a()));
+    assert_eq!(
+        both.hits[0].evidence[0].detail.as_deref(),
+        Some("implements at a.rs:6")
+    );
+
+    // With `Tr` as a third seed the edges to A and B join it: three hits, cut to one.
+    let seeds = [(b(), 1.0), (a(), 1.0), (tr(), 1.0)];
+    let all = ask(&map, &seeds, 10).await;
+    let nodes: Vec<&NodeId> = all.hits.iter().map(|h| &h.node).collect();
+    assert_eq!(nodes, vec![&a(), &b(), &tr()]);
+    let one = ask(&map, &seeds, 1).await;
+    assert_eq!(one.hits.len(), 1);
+    assert_eq!(one.hits[0].rank, 1);
+    assert_eq!(one.hits[0].node, a());
+    assert_eq!(one.status, MapStatus::Ok);
 }
 
 #[test]
