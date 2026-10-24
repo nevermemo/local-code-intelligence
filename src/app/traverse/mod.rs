@@ -1516,23 +1516,45 @@ async fn finish(
     })
 }
 
+/// The per-call arguments of [`search`] (`search_code` with
+/// `mode = "traverse"`): what the caller of the tool supplies, and the
+/// endpoint's retriever profile.
+#[derive(Debug, Clone, Copy)]
+pub struct TraverseRequest<'a> {
+    /// The workspace to walk, as the caller wrote it; it must be a directory.
+    pub workspace_path: &'a str,
+    /// The question: the start nodes come from the hybrid search for it (or
+    /// the name-matching stand-in when that search finds nothing).
+    pub query: &'a str,
+    /// How many results to return, 1 through 40; `None` takes `default_top_k`.
+    pub top_k: Option<usize>,
+    /// Limits of this walk; `None` takes the defaults.
+    pub budget: Option<&'a BudgetArgs>,
+    /// Rules and actions for this walk; `None` takes none.
+    pub steer: Option<&'a SteerArgs>,
+    /// The handle of an earlier walk to continue; `None` starts a new one.
+    pub handle: Option<&'a str>,
+    /// The endpoint's `[search_profiles]` entry whose retrievers find the
+    /// start nodes; `None` takes the default retrievers.
+    pub profile: Option<&'a str>,
+}
+
 /// `search_code` with `mode = "traverse"`: the workspace's SCIP index
 /// (`traverse.scip_index`, relative to the workspace), the data directory
 /// for traces and handles, the limits of `[traverse]` and, for the start
 /// nodes, the hybrid search of `app` over the workspace with the retrievers
 /// of `profile` (the endpoint's `[search_profiles]` entry, if any). An error
 /// while the mode is off.
-#[allow(clippy::too_many_arguments)]
-pub async fn search(
-    app: &App,
-    workspace_path: &str,
-    query: &str,
-    top_k: Option<usize>,
-    budget: Option<&BudgetArgs>,
-    steer: Option<&SteerArgs>,
-    handle: Option<&str>,
-    profile: Option<&str>,
-) -> Result<Value> {
+pub async fn search(app: &App, request: TraverseRequest<'_>) -> Result<Value> {
+    let TraverseRequest {
+        workspace_path,
+        query,
+        top_k,
+        budget,
+        steer,
+        handle,
+        profile,
+    } = request;
     let config = &app.config;
     let limits = &config.traverse;
     if !limits.enabled {

@@ -417,15 +417,18 @@ const RUST_WALK_RESTARTED: &str =
 /// One default traverse walk (`mode = "traverse"` of the service) of `query`:
 /// no maps are named, so `lsp.live` runs through `[run_profile.lsp] live`.
 async fn default_walk(app: &App, workspace: &Workspace, query: &str) -> Value {
-    local_code_intelligence::app::traverse::search(
+    use local_code_intelligence::app::traverse::{TraverseRequest, search};
+    search(
         app,
-        &workspace.path.to_string_lossy(),
-        query,
-        Some(8),
-        None,
-        None,
-        None,
-        None,
+        TraverseRequest {
+            workspace_path: &workspace.path.to_string_lossy(),
+            query,
+            top_k: Some(8),
+            budget: None,
+            steer: None,
+            handle: None,
+            profile: None,
+        },
     )
     .await
     .unwrap()
