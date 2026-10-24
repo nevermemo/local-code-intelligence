@@ -417,13 +417,15 @@ impl McpServer {
             return self.answer(
                 traverse::search(
                     &self.app,
-                    &args.workspace_path,
-                    &args.query,
-                    args.top_k,
-                    budget.as_ref(),
-                    steer.as_ref(),
-                    handle.as_deref(),
-                    self.search_profile.as_deref(),
+                    traverse::TraverseRequest {
+                        workspace_path: &args.workspace_path,
+                        query: &args.query,
+                        top_k: args.top_k,
+                        budget: budget.as_ref(),
+                        steer: steer.as_ref(),
+                        handle: handle.as_deref(),
+                        profile: self.search_profile.as_deref(),
+                    },
                 )
                 .await,
             );
