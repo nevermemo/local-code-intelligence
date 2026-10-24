@@ -335,7 +335,9 @@ async fn query_pins_the_partial_note_and_the_first_hit() {
 async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
     let map = map(64);
     // A and B both reach `Tr` (A at a.rs:6, B at a.rs:9): one hit, from A.
-    let both = ask(&map, &[(a(), 1.0), (b(), 1.0)], 10).await;
+    // The seed whose edge wins is listed second, so only the global sort by
+    // site keeps it.
+    let both = ask(&map, &[(b(), 1.0), (a(), 1.0)], 10).await;
     assert_eq!(both.status, MapStatus::Ok);
     assert_eq!(both.hits.len(), 1, "{:?}", both.hits);
     assert_eq!(both.hits[0].node, tr());
@@ -347,13 +349,14 @@ async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
     );
 
     // With `Tr` as a third seed the edges to A and B join it: three hits, cut to one.
-    let seeds = [(a(), 1.0), (b(), 1.0), (tr(), 1.0)];
+    let seeds = [(b(), 1.0), (a(), 1.0), (tr(), 1.0)];
     let all = ask(&map, &seeds, 10).await;
-    assert_eq!(all.hits.len(), 3, "{:?}", all.hits);
+    let nodes: Vec<&NodeId> = all.hits.iter().map(|h| &h.node).collect();
+    assert_eq!(nodes, vec![&a(), &b(), &tr()]);
     let one = ask(&map, &seeds, 1).await;
     assert_eq!(one.hits.len(), 1);
     assert_eq!(one.hits[0].rank, 1);
-    assert_eq!(one.hits[0].node, all.hits[0].node);
+    assert_eq!(one.hits[0].node, a());
     assert_eq!(one.status, MapStatus::Ok);
 }
 

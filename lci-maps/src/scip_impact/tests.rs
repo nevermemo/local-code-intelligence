@@ -597,12 +597,21 @@ async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
     let foo = map.node_of(&sym("a/Foo#")).unwrap().clone();
     let run = method("run");
     // Both seeds reach `use_foo` (Foo at a.rs:3 col 15, run at a.rs:3 col 20);
-    // only Foo reaches the enum E.
-    let seeds = [(foo.clone(), 1.0), (run, 1.0)];
+    // only Foo reaches the enum E. The seed whose edge wins the dedupe is listed
+    // second, so only the global sort by site keeps it.
+    let seeds = [(run, 1.0), (foo.clone(), 1.0)];
+    let enum_e = NodeId::Symbol(SymbolKey {
+        language: "rust".into(),
+        module_path: rust_module_path("a.rs"),
+        container: Vec::new(),
+        name: "E".into(),
+        kind: SymbolKind::Enum,
+        disambiguator: 0,
+    });
     let all = ask(&map, &seeds, 10).await;
     assert_eq!(all.status, MapStatus::Ok);
     let dsts: Vec<&NodeId> = all.hits.iter().map(|h| &h.node).collect();
-    assert_eq!(dsts.len(), 2, "{dsts:?}");
+    assert_eq!(dsts, vec![&enum_e, &function("use_foo")]);
     let use_foo = all
         .hits
         .iter()
@@ -622,6 +631,6 @@ async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
     let one = ask(&map, &seeds, 1).await;
     assert_eq!(one.hits.len(), 1);
     assert_eq!(one.hits[0].rank, 1);
-    assert_eq!(one.hits[0].node, all.hits[0].node);
+    assert_eq!(one.hits[0].node, enum_e);
     assert_eq!(one.status, MapStatus::Ok);
 }

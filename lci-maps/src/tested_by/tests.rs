@@ -371,11 +371,13 @@ async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
     let foo = shared.node_of(&foo).unwrap().clone();
     let bar = shared.node_of(&bar).unwrap().clone();
     // Both seeds reach t_both (foo at tests/a_test.rs:1 col 12, bar at col 20);
-    // only foo reaches t_foo.
-    let seeds = [(foo.clone(), 1.0), (bar, 1.0)];
+    // only foo reaches t_foo. The seed whose edge wins the dedupe is listed
+    // second, so only the global sort by site keeps it.
+    let seeds = [(bar, 1.0), (foo.clone(), 1.0)];
     let all = ask(&map, &seeds, 10).await;
     assert_eq!(all.status, MapStatus::Ok);
-    assert_eq!(all.hits.len(), 2, "{:?}", all.hits);
+    let hit_names: Vec<&str> = all.hits.iter().map(|h| name_of(&h.node)).collect();
+    assert_eq!(hit_names, ["t_both", "t_foo"]);
     assert_eq!(
         all.hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
         vec![1, 2]
@@ -395,7 +397,7 @@ async fn query_dedupes_a_shared_destination_and_truncates_to_the_limit() {
     let one = ask(&map, &seeds, 1).await;
     assert_eq!(one.hits.len(), 1);
     assert_eq!(one.hits[0].rank, 1);
-    assert_eq!(one.hits[0].node, all.hits[0].node);
+    assert_eq!(name_of(&one.hits[0].node), "t_both");
     assert_eq!(one.status, MapStatus::Ok);
 }
 
