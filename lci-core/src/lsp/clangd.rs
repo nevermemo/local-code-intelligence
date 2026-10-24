@@ -17,12 +17,15 @@
 //! (`--compile-commands-dir=...`); this adapter does not generate one.
 
 use crate::config::ClangdLspConfig;
-use crate::lsp::adapter::{LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, open_if_changed};
+use crate::lsp::adapter::{
+    InitializeVariant, LspAdapter, MAX_DIAGNOSTICS_WAIT, SentTexts, initialize_params_for,
+    open_if_changed,
+};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use crate::path::has_extension_ignore_case;
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{path::Path, time::Duration};
 
 /// Every Tree-sitter language identifier one clangd instance navigates.
@@ -98,30 +101,7 @@ impl LspAdapter for ClangdServer {
         if !self.enabled() {
             return None;
         }
-        let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
-        let name = root
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("workspace")
-            .to_string();
-        Some(json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "definition": {},
-                    "references": {},
-                    "synchronization": {}
-                },
-                "workspace": {
-                    "symbol": {},
-                    "workspaceFolders": true,
-                    "configuration": true
-                }
-            },
-            "workspaceFolders": [{ "uri": root_uri, "name": name }],
-            "initializationOptions": {}
-        }))
+        initialize_params_for(root, InitializeVariant::Base)
     }
 
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
@@ -193,6 +173,7 @@ fn language_id_for(relative: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::lsp::adapter::contract;
+    use serde_json::json;
 
     fn server(path: Option<&str>, args: &[&str], disabled: bool) -> ClangdServer {
         let config = ClangdLspConfig {
@@ -201,6 +182,33 @@ mod tests {
             disabled,
         };
         ClangdServer::new(&config, Duration::from_secs(60))
+    }
+
+    #[test]
+    fn the_clangd_initialize_params_are_pinned() {
+        let (root, uri) = contract::pin_root();
+        let params = server(Some("clangd"), &[], false).initialize_params(root);
+        assert_eq!(
+            params,
+            Some(json!({
+                "processId": std::process::id(),
+                "rootUri": uri,
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {},
+                        "synchronization": {}
+                    },
+                    "workspace": {
+                        "symbol": {},
+                        "workspaceFolders": true,
+                        "configuration": true
+                    }
+                },
+                "workspaceFolders": [{ "uri": uri, "name": "proj" }],
+                "initializationOptions": {}
+            }))
+        );
     }
 
     #[test]
